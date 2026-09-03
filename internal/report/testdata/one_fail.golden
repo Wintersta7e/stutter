@@ -1,0 +1,15 @@
+Scanned 40 consumers over 12,400 recorded messages.
+Gates held: determinism, differential re-keying.
+
+FAIL  reserve_stock          duplicate delivery       stock decremented twice
+      minimal repro: order.created#8891 delivered at T+0 and T+0.4s
+      clean run:   stock 14 -> 13
+      mutated run: stock 14 -> 12
+      legal because: AckPolicy: explicit with MaxDeliver 5 — an unacknowledged message is redelivered
+
+WARN  send_receipt           duplicate delivery       2 outbound emails
+      minimal repro: order.paid#41 delivered at T+0 and T+1.2s
+      legal because: AckPolicy: explicit with MaxDeliver 5 — an unacknowledged message is redelivered
+      a repeated mail submission is annoying rather than corrupting — declare an invariant to silence it, or to promote it
+
+PASS  38 other consumers

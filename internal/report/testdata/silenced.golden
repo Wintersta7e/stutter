@@ -1,0 +1,4 @@
+Scanned 5 consumers over 1 recorded message.
+Gates held: determinism, differential re-keying.
+
+PASS  5 consumers (1 divergence silenced by a declared invariant)

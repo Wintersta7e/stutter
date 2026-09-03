@@ -1,0 +1,3 @@
+Setup failed: start service under test: connection refused
+
+Nothing was replayed, so no gate ran and no findings were computed.

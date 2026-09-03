@@ -1,0 +1,15 @@
+Scanned 3 consumers over 900 recorded messages.
+Gates held: determinism, differential re-keying.
+
+WARN  charge_customer        crash before ack         customer charged twice  [guard-dependent]
+      minimal repro: payment.requested#3120, ack withheld after the side effect
+      clean run:   1 charge
+      mutated run: 2 charges
+      legal because: AckPolicy: explicit with MaxDeliver unlimited — an unacknowledged message is redelivered
+      guard-dependent: the handler read a stubbed dependency at effect 1, before its first divergent effect at 3
+      a frozen reply may have decided this — override that endpoint's stub to get a firm verdict
+
+NOTE  1 warning is guard-dependent: Stutter could not decide, rather than deciding the
+      divergence was acceptable. Override the stub named above to get a firm verdict.
+
+PASS  2 other consumers

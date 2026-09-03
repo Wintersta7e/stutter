@@ -1,0 +1,9 @@
+Scanned 40 consumers over 12,400 recorded messages.
+
+GATE  determinism            violated
+      different effects at position 3 — the service under test is not deterministic:
+        want: pg.query UPDATE stock SET qty = <n>
+         got: pg.query DELETE FROM stock
+
+No findings were computed. Every comparison downstream of a violated gate is noise, so the
+report is withheld rather than qualified. This is not a test failure.
