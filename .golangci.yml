@@ -1,5 +1,5 @@
 # Strictest-available posture: every linter on by default, each exception justified inline.
-# Adopted before the first line of code — see .dev/docs/ for why retrofitting was not an option.
+# Adopted before the first line of code: retrofitting strict tooling costs more than living with it.
 version: "2"
 
 run:
@@ -41,7 +41,7 @@ linters:
       line-length: 120
     godox:
       # TODO/FIXME in committed code is exactly the tech debt this project refuses to start with.
-      # Unfinished work belongs in .dev/plans/, not in a comment.
+      # Unfinished work belongs in an issue or a plan, never in a comment that ships.
       keywords: [TODO, FIXME, HACK, XXX, BUG, OPTIMIZE]
     ireturn:
       allow: [anon, error, empty, stdlib]
@@ -86,7 +86,7 @@ linters:
             - pkg: math/rand
               desc: >-
                 Non-cryptographic. Pseudonymisation keys and HMAC material must come from
-                crypto/rand — see .dev/specs/SPEC-REDACTION.md.
+                crypto/rand.
             - pkg: github.com/pkg/errors
               desc: Superseded by stdlib errors wrapping; use fmt.Errorf with %w.
             - pkg: io/ioutil
