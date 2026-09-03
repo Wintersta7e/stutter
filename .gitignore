@@ -1,0 +1,33 @@
+# Local-only working area: specs, plans, docs, convenience scripts. Never committed.
+.dev/
+
+# Agent control surface.
+CLAUDE.md
+.serena/
+
+# Recorded traffic is personal data under SPEC-REDACTION.md. NEVER commit a corpus.
+/corpus/
+*.corpus
+*.manifest.yaml
+
+# Secrets.
+.env
+.env.*
+*.pem
+*.key
+*.p12
+
+# Build output.
+/bin/
+/dist/
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# OS.
+.DS_Store
+Thumbs.db
+
+# Agent config and subagent worktrees. Local only.
+.claude/
