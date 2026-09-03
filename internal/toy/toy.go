@@ -65,21 +65,56 @@ func Setup(ctx context.Context, directDSN, sku string) error {
 
 	defer func() { _ = conn.Close(ctx) }()
 
-	schema := []string{
-		`CREATE TABLE IF NOT EXISTS stock (sku TEXT PRIMARY KEY, qty INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, order_id TEXT NOT NULL, at TIMESTAMPTZ NOT NULL)`,
-	}
-
-	for _, statement := range schema {
-		if _, err := conn.Exec(ctx, statement); err != nil {
-			return fmt.Errorf("setup statement %q: %w", statement, err)
-		}
+	if err := createSchema(ctx, conn); err != nil {
+		return err
 	}
 
 	if _, err := conn.Exec(ctx,
 		`INSERT INTO stock (sku, qty) VALUES ($1, $2)
 		 ON CONFLICT (sku) DO UPDATE SET qty = EXCLUDED.qty`, sku, StartingQty); err != nil {
 		return fmt.Errorf("reset stock for %q: %w", sku, err)
+	}
+
+	return nil
+}
+
+// schemaLock serialises schema creation across concurrent setups.
+//
+// CREATE TABLE IF NOT EXISTS is NOT atomic in Postgres: it checks the catalogue and then inserts, so
+// two sessions running it at the same moment race and the loser fails with a duplicate key on
+// pg_type_typname_nsp_index. Serial local runs never hit it; parallel tests against one database do.
+const schemaLock int64 = 0x57_49_44_47 // "WIDG"
+
+func createSchema(ctx context.Context, conn *pgx.Conn) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin schema transaction: %w", err)
+	}
+
+	defer func() {
+		// After a successful commit this returns ErrTxClosed, which is the normal path, and a
+		// deferred call has nowhere to report anything to in any case.
+		_ = tx.Rollback(ctx) //nolint:errcheck // expected ErrTxClosed once committed.
+	}()
+
+	// Released automatically when the transaction ends, however it ends.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, schemaLock); err != nil {
+		return fmt.Errorf("take the schema lock: %w", err)
+	}
+
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS stock (sku TEXT PRIMARY KEY, qty INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, order_id TEXT NOT NULL, at TIMESTAMPTZ NOT NULL)`,
+	}
+
+	for _, statement := range schema {
+		if _, err := tx.Exec(ctx, statement); err != nil {
+			return fmt.Errorf("setup statement %q: %w", statement, err)
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit schema transaction: %w", err)
 	}
 
 	return nil
