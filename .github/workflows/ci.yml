@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default; jobs that need more say so themselves.
 permissions:
   contents: read
 
@@ -16,27 +17,44 @@ env:
   GO_VERSION: "1.27.1"
   GOLANGCI_LINT_VERSION: "v2.13.2"
   GOVULNCHECK_VERSION: "v1.7.0"
+  GITLEAKS_VERSION: "8.30.1"
+  ACTIONLINT_VERSION: "v1.7.7"
+  # Total statement coverage the suite must not fall below. Raise it when it is
+  # comfortably exceeded; never lower it to make a red build green.
+  COVERAGE_FLOOR: "65"
 
+# Actions are pinned to commit SHAs, not tags: a tag can be moved to point at
+# different code after review, a SHA cannot.
 jobs:
   lint:
-    name: Lint and format
+    name: Lint, format and workflows
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - uses: golangci/golangci-lint-action@v9.3.0
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
         with:
           version: ${{ env.GOLANGCI_LINT_VERSION }}
+          # Never truncate: a capped report hides issues behind the ones it shows.
+          args: --max-issues-per-linter=0 --max-same-issues=0
       - name: Formatting is clean
         run: golangci-lint fmt --diff
+      - name: Workflows are valid
+        run: |
+          go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
+          actionlint
 
   test:
     name: Test
     runs-on: ubuntu-latest
-    # The replay tests drive the real Postgres wire protocol against a real server. Without one they
-    # skip, which would quietly reduce CI to unit tests only.
+    timeout-minutes: 20
+    # The replay suite drives the real Postgres wire protocol against a real
+    # server. Without one it SKIPS and still prints "ok", which is a false green.
     services:
       postgres:
         image: postgres:18-alpine
@@ -54,31 +72,174 @@ jobs:
     env:
       STUTTER_TEST_POSTGRES: postgres://stutter:stutter@127.0.0.1:5432/stutter?sslmode=disable
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Build
-        run: go build ./...
-      - name: Test
-        run: go test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
-      - uses: actions/upload-artifact@v7.0.1
+
+      - name: Test with race detection
+        # -count=1 defeats the test cache: a cached pass proves nothing about this commit.
+        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Prove the database suite actually ran
+        # A skipped integration suite prints the same "ok" as one that ran. Assert
+        # that the tests needing a database really executed.
+        run: |
+          go test -run 'TestCheckAgainstAReferenceConsumer' -count=1 -v ./internal/cli/ | tee run.log
+          if grep -q -- '--- SKIP' run.log; then
+            echo "::error::the database-backed suite skipped; CI proved nothing"
+            exit 1
+          fi
+
+      - name: Coverage floor
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {print substr($3, 1, length($3)-1)}')
+          echo "total coverage: ${total}% (floor ${COVERAGE_FLOOR}%)"
+          awk -v t="$total" -v f="$COVERAGE_FLOOR" \
+            'BEGIN { if (t+0 < f+0) { print "::error::coverage " t "% is below the floor " f "%"; exit 1 } }'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage
           path: coverage.out
           if-no-files-found: error
 
-  hygiene:
-    name: Dependencies
+  flake:
+    name: Flake hunt
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The unit suite runs repeatedly under shuffling. A test that passes once and
+    # fails on the third shuffle is a test that will waste somebody's afternoon.
     steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Repeat the database-free suite
+        run: |
+          go test -race -shuffle=on -count=5 \
+            ./internal/effect/... ./internal/gate/... ./internal/policy/... \
+            ./internal/shrink/... ./internal/report/... ./internal/check/... \
+            ./internal/proxy/... ./internal/version/...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Cross-compile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: go build -trimpath -o /dev/null ./...
+
+  smoke:
+    name: Binary smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Building is not running. These assert the binary starts and that its exit
+    # codes mean what the README says they mean.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - run: go build -trimpath -o stutter ./cmd/stutter
+      - name: version and help succeed
+        run: |
+          ./stutter version
+          ./stutter help > /dev/null
+      - name: a missing database is a setup error, not a verdict
+        run: |
+          set +e
+          ./stutter check > /dev/null 2>&1
+          code=$?
+          set -e
+          [ "$code" -eq 3 ] || { echo "::error::expected exit 3, got $code"; exit 1; }
+      - name: an unknown command does not exit clean
+        run: |
+          set +e
+          ./stutter wibble > /dev/null 2>&1
+          code=$?
+          set -e
+          [ "$code" -ne 0 ] || { echo "::error::unknown command exited 0"; exit 1; }
+
+  security:
+    name: Dependencies and secrets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
       - name: go.mod is tidy
         run: go mod tidy -diff
+      - name: Module checksums verify
+        run: go mod verify
       - name: No known vulnerabilities
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+          go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
           govulncheck ./...
+      - name: No secrets, across the whole history
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks detect --source . --no-banner --redact
+
+  commits:
+    name: Conventional commits
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Subjects follow Conventional Commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9/._-]+\))?!?: .+'
+          status=0
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            if ! printf '%s' "$subject" | grep -qE "$pattern"; then
+              echo "::error::not a conventional commit subject: $subject"
+              status=1
+            fi
+            if [ "${#subject}" -gt 72 ]; then
+              echo "::error::subject longer than 72 characters: $subject"
+              status=1
+            fi
+          done < <(git log --no-merges --format='%s' "$BASE..$HEAD")
+          exit $status
