@@ -218,7 +218,6 @@ jobs:
     name: Conventional commits
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -226,20 +225,50 @@ jobs:
           persist-credentials: false
       - name: Subjects follow Conventional Commits
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
         run: |
+          set -u
+          empty=0000000000000000000000000000000000000000
+
+          # A pull request checks its own commits. A push checks what it added —
+          # falling back to the whole history when the previous tip is unknown,
+          # which is the case on a new branch or after a force push.
+          if [ "$EVENT" = "pull_request" ]; then
+            range="${PR_BASE}..${PR_HEAD}"
+          elif [ -n "${PUSH_BEFORE}" ] && [ "${PUSH_BEFORE}" != "$empty" ] \
+               && git cat-file -e "${PUSH_BEFORE}^{commit}" 2>/dev/null; then
+            range="${PUSH_BEFORE}..${HEAD_SHA}"
+          else
+            range="${HEAD_SHA}"
+          fi
+
+          echo "checking range: ${range}"
+
+          # Written to a file rather than a variable: a subject may contain $ or a
+          # backslash, and a heredoc would expand them before they were checked.
+          git log --no-merges --format='%s' "${range}" > subjects.txt
+          if [ ! -s subjects.txt ]; then
+            echo "no commits in range; nothing to check"
+            exit 0
+          fi
+
           pattern='^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([a-z0-9/._-]+\))?!?: .+'
           status=0
           while IFS= read -r subject; do
             [ -z "$subject" ] && continue
-            if ! printf '%s' "$subject" | grep -qE "$pattern"; then
-              echo "::error::not a conventional commit subject: $subject"
+            if printf '%s' "$subject" | grep -qE "$pattern"; then
+              printf '  ok    %s\n' "$subject"
+            else
+              echo "::error::not a conventional commit subject: ${subject}"
               status=1
             fi
             if [ "${#subject}" -gt 72 ]; then
-              echo "::error::subject longer than 72 characters: $subject"
+              echo "::error::subject longer than 72 characters: ${subject}"
               status=1
             fi
-          done < <(git log --no-merges --format='%s' "$BASE..$HEAD")
+          done < subjects.txt
           exit $status
