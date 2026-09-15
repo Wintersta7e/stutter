@@ -113,6 +113,27 @@ func TestCompareDistinguishesProtocols(t *testing.T) {
 	}
 }
 
+func TestCompareIgnoresStubMetadata(t *testing.T) {
+	t.Parallel()
+
+	reference := []effect.Effect{{
+		Kind:       effect.KindHTTP,
+		Canonical:  "GET api.example.test/claimed",
+		MessageSeq: 1,
+	}}
+	compared := []effect.Effect{{
+		Kind:       effect.KindHTTP,
+		Canonical:  "GET api.example.test/claimed",
+		MessageSeq: 1,
+		Stubbed:    true,
+		OffScript:  true,
+	}}
+
+	if got := gate.NewComparer().Compare(reference, compared); !got.OK() {
+		t.Errorf("Compare() = %#v, want stub metadata excluded from divergence", got)
+	}
+}
+
 func TestDescribeNamesThePosition(t *testing.T) {
 	t.Parallel()
 

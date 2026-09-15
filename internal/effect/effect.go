@@ -48,7 +48,25 @@ type Effect struct {
 	MessageSeq uint64
 	// Seq is the ordinal of this effect within its run, starting at zero.
 	Seq int
+	// Stubbed marks a dependency call whose reply came from Stutter rather than a real dependency.
+	// It never participates in comparison; it qualifies how confidently a divergence can be ruled.
+	Stubbed bool
+	// OffScript marks a stubbed call absent from the clean run. It received the default response.
+	OffScript bool
 	// Late marks an effect that arrived after its message's quiesce window closed. Late effects are
 	// a determinism hazard and are reported as an anomaly, never as a divergence.
 	Late bool
+}
+
+// Observation is the protocol-neutral input a proxy gives the recorder.
+//
+// Raw is canonicalised and hashed. Printable is kept for a human report. Stub metadata never enters
+// the comparable form, because a stub is evidence about confidence rather than service behaviour.
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type Observation struct {
+	Raw       string
+	Printable string
+	Kind      Kind
+	Stubbed   bool
+	OffScript bool
 }

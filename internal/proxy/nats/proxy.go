@@ -52,7 +52,7 @@ var errEncrypted = errors.New("client negotiated TLS with the bus; " +
 
 // Sink receives the effects the proxy observes.
 type Sink interface {
-	Record(kind effect.Kind, raw, printable string)
+	Record(observed effect.Observation)
 }
 
 // Proxy accepts NATS client connections and forwards them to an upstream server.
@@ -131,7 +131,11 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	if err := current.negotiate(); err != nil {
 		if errors.Is(err, errEncrypted) {
-			p.sink.Record(effect.KindNATS, errEncrypted.Error(), errEncrypted.Error())
+			p.sink.Record(effect.Observation{
+				Raw:       errEncrypted.Error(),
+				Printable: errEncrypted.Error(),
+				Kind:      effect.KindNATS,
+			})
 		}
 
 		return
@@ -245,7 +249,7 @@ func (s *session) inspect(current *frame) {
 
 	text := render(current.args, headers, current.body[current.args.headerLen:])
 
-	s.sink.Record(effect.KindNATS, text, text)
+	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindNATS})
 }
 
 // forward writes bytes on to the upstream, reporting whether the connection is still usable.

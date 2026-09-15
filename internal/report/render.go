@@ -186,6 +186,10 @@ func findingLines(f Finding) []string {
 	lines = appendDetail(lines, mutatedLabel, f.Mutated)
 	lines = appendDetail(lines, "legal because: ", f.Clause)
 
+	for _, note := range f.Notes {
+		lines = append(lines, detailIndent+note)
+	}
+
 	for _, note := range f.Reservations {
 		lines = append(lines, detailIndent+note)
 	}

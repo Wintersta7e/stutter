@@ -45,7 +45,7 @@ var errEncrypted = errors.New("client negotiated TLS with the database; " +
 
 // Sink receives the effects the proxy observes.
 type Sink interface {
-	Record(kind effect.Kind, raw, printable string)
+	Record(observed effect.Observation)
 }
 
 // Proxy accepts Postgres connections and forwards them to an upstream server.
@@ -124,7 +124,11 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	if err := current.negotiate(); err != nil {
 		if errors.Is(err, errEncrypted) {
-			p.sink.Record(effect.KindPostgres, errEncrypted.Error(), errEncrypted.Error())
+			p.sink.Record(effect.Observation{
+				Raw:       errEncrypted.Error(),
+				Printable: errEncrypted.Error(),
+				Kind:      effect.KindPostgres,
+			})
 		}
 
 		return
@@ -318,7 +322,7 @@ func (s *session) emit(sql string, params []string) {
 	}
 
 	text := render(sql, params)
-	s.sink.Record(effect.KindPostgres, text, text)
+	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindPostgres})
 }
 
 func (s *session) forwardUntyped() ([]byte, error) {

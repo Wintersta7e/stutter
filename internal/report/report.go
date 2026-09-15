@@ -15,6 +15,7 @@ import (
 	"cmp"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/gate"
@@ -39,7 +40,7 @@ const (
 const (
 	// guardOverrideNote names the way out of a guard-dependent verdict, so the marking is a next
 	// step rather than a shrug.
-	guardOverrideNote = "a frozen reply may have decided this — " +
+	guardOverrideNote = "a stubbed reply may have decided this — " +
 		"override that endpoint's stub to get a firm verdict"
 	// missingReproNote states the design invariant that a finding without a minimal repro is not a
 	// finding.
@@ -91,7 +92,7 @@ const (
 	// ConfidenceFirm means nothing in the run undermines the comparison behind this finding.
 	ConfidenceFirm Confidence = "firm"
 	// ConfidenceGuardDependent means the handler read a stubbed dependency before it diverged, so a
-	// frozen reply may have manufactured the divergence, or hidden one.
+	// synthetic reply may have manufactured the divergence, or hidden one.
 	ConfidenceGuardDependent Confidence = "guard-dependent"
 )
 
@@ -163,9 +164,12 @@ type Divergence struct {
 	// DivergedAt. It supplies the default impact when nobody has classified the divergence, and is
 	// separated from DivergedAt here only to satisfy fieldalignment.
 	DivergedKind effect.Kind
-	// StubReads are the ordinals, within the mutated run's effect sequence, of effects answered
-	// from a frozen stub rather than by a real dependency. They decide guard-dependence.
+	// StubReads are the ordinals, within this message's mutated effect sequence, of calls answered
+	// by a synthetic stub rather than a real dependency. They decide guard-dependence.
 	StubReads []int
+	// OffScript are the ordinals, in the same per-message sequence, of calls absent from the clean
+	// run. Each received the default stub and is rendered as signal without changing the verdict.
+	OffScript []int
 	// DivergedAt is the ordinal of the first effect that differed from the reference run, which is
 	// gate.Result.Index from the comparison that found it. Negative means the position is unknown.
 	DivergedAt int
@@ -175,6 +179,8 @@ type Divergence struct {
 //
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type Finding struct {
+	// Notes carry observed signal that does not itself raise or lower the verdict.
+	Notes []string
 	// Consumer is the NATS consumer the finding attributes to.
 	Consumer string
 	// Fault is the delivery fault that provoked the divergence.
@@ -298,6 +304,7 @@ func gatesHeld(gates []GateCheck) bool {
 func (d Divergence) rule() Finding {
 	ruled := Finding{
 		Reservations: d.reservations(),
+		Notes:        d.notes(),
 		Consumer:     d.Consumer,
 		Fault:        d.Fault,
 		Clause:       d.Clause,
@@ -318,6 +325,31 @@ func (d Divergence) rule() Finding {
 	}
 
 	return ruled
+}
+
+func (d Divergence) notes() []string {
+	if len(d.OffScript) == 0 {
+		return nil
+	}
+
+	positions := slices.Clone(d.OffScript)
+	slices.Sort(positions)
+
+	parts := make([]string, 0, len(positions))
+	for _, position := range positions {
+		parts = append(parts, strconv.Itoa(position))
+	}
+
+	label := "effect "
+	verb := "was"
+
+	if len(parts) > 1 {
+		label = "effects "
+		verb = "were"
+	}
+
+	return []string{"off-script: " + label + strings.Join(parts, ", ") + " " + verb +
+		" absent from the clean run and received the default stub"}
 }
 
 // reservations lists every reason this divergence warns rather than fails.

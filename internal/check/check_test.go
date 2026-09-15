@@ -24,6 +24,7 @@ var errSessionBroken = errors.New("the sandbox never came up")
 type session struct {
 	names         []string
 	nonIdempotent map[uint64]bool
+	stubbedGuard  map[uint64]bool
 	messages      []uint64
 	resets        int
 	unstable      bool
@@ -57,6 +58,15 @@ func (s *session) Run(
 	var effects []effect.Effect
 
 	for _, seq := range s.scope(retain) {
+		if s.stubbedGuard[seq] {
+			effects = append(effects, effect.Effect{
+				Kind:       effect.KindHTTP,
+				Canonical:  "GET guard.example.test/claimed",
+				MessageSeq: seq,
+				Stubbed:    mutation.Fault() != policy.FaultNone,
+			})
+		}
+
 		effects = append(effects, write(seq))
 
 		if s.repeats(mutation, seq) {
@@ -163,6 +173,33 @@ func TestCheckFindsTheNonIdempotentMessage(t *testing.T) {
 	// The shrink must reduce three messages to the one that actually matters.
 	if want := "messages #1"; found.Repro != want {
 		t.Errorf("Repro = %q, want %q", found.Repro, want)
+	}
+}
+
+// TestCheckPropagatesAStubbedGuard proves the report's guard-dependent rule is reached from live
+// replay effects. Report unit tests that hand-build StubReads do not catch a missing producer here.
+func TestCheckPropagatesAStubbedGuard(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.stubbedGuard = map[uint64]bool{1: true}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(result.Findings) == 0 {
+		t.Fatal("no findings")
+	}
+
+	found := result.Findings[0]
+	if found.Confidence != report.ConfidenceGuardDependent {
+		t.Errorf("Confidence = %q, want %q", found.Confidence, report.ConfidenceGuardDependent)
+	}
+
+	if found.Status != report.StatusWarn {
+		t.Errorf("Status = %q, want WARN (reservations: %v)", found.Status, found.Reservations)
 	}
 }
 

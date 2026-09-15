@@ -126,6 +126,12 @@ linters:
         linters:
           - revive
         text: (function-length|cyclomatic|cognitive-complexity)
+      # Protocol packages intentionally use the protocol name. Here the import path keeps this
+      # package distinct from net/http, while renaming it would make every caller less clear.
+      - path: ^internal/proxy/http/
+        linters:
+          - revive
+        text: package-naming
       # The CLI is the one place stdout is the product.
       - path: ^cmd/
         linters:

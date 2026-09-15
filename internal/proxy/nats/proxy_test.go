@@ -40,15 +40,15 @@ type recorder struct {
 	mu      sync.Mutex
 }
 
-func (r *recorder) Record(kind effect.Kind, raw, printable string) {
+func (r *recorder) Record(item effect.Observation) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if raw != printable {
+	if item.Raw != item.Printable {
 		panic("the readable form and the comparable form were expected to match")
 	}
 
-	r.entries = append(r.entries, observed{kind: kind, text: raw})
+	r.entries = append(r.entries, observed{kind: item.Kind, text: item.Raw})
 }
 
 func (r *recorder) texts() []string {

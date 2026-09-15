@@ -61,11 +61,22 @@ func (r *Recorder) Open(consumer string, messageSeq uint64, payload []byte) {
 	}
 }
 
+// Canonicalise returns the comparable form raw would receive if it were recorded in the current
+// attribution window. Stub scripts use it as their lookup key so generated identifiers and message
+// provenance do not turn a repeated request into a false off-script call.
+func (r *Recorder) Canonicalise(raw string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.canon.Canonicalise(raw, r.window.prov)
+}
+
 // Record adds one observed side effect, canonicalising it against the open window's provenance.
 //
-// printable is the human-readable rendering; raw is the text that gets canonicalised. They are
-// usually the same, and differ only where a protocol's readable form is not its comparable form.
-func (r *Recorder) Record(kind Kind, raw, printable string) {
+// Observation.Printable is the human-readable rendering; Observation.Raw is the text that gets
+// canonicalised. They are usually the same, and differ only where a protocol's readable form is
+// not its comparable form.
+func (r *Recorder) Record(observed Observation) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -87,13 +98,15 @@ func (r *Recorder) Record(kind Kind, raw, printable string) {
 
 	r.effects = append(r.effects, Effect{
 		Consumer:   r.window.consumer,
-		Kind:       kind,
-		Canonical:  r.canon.Canonicalise(raw, r.window.prov),
-		Printable:  printable,
-		RawHash:    r.hash(raw),
+		Kind:       observed.Kind,
+		Canonical:  r.canon.Canonicalise(observed.Raw, r.window.prov),
+		Printable:  observed.Printable,
+		RawHash:    r.hash(observed.Raw),
 		Provenance: mode,
 		MessageSeq: r.window.messageSeq,
 		Seq:        len(r.effects),
+		Stubbed:    observed.Stubbed,
+		OffScript:  observed.OffScript,
 		Late:       !r.window.open,
 	})
 }

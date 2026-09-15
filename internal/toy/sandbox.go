@@ -56,13 +56,13 @@ func SandboxConfig(store *corpus.Corpus, directDSN, sku string, config policy.Co
 			return guard.Reset(ctx)
 		},
 
-		Connect: func(ctx context.Context, postgresDSN, natsURL string) (harness.Service, error) {
-			consumer, err := Connect(ctx, postgresDSN)
+		Connect: func(ctx context.Context, at harness.Addresses) (harness.Service, error) {
+			consumer, err := Connect(ctx, at.Postgres)
 			if err != nil {
 				return nil, err
 			}
 
-			guard, err := NewGuard(ctx, natsURL)
+			guard, err := NewGuard(ctx, at.NATS)
 			if err != nil {
 				consumer.Close(ctx)
 

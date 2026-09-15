@@ -76,8 +76,18 @@ outside that will be poor.
   where the recorded consumer configuration permits it
 - A legality table read off the consumer's own config, including the backoff
   curve that overrides the declared ack wait
-- Effect observation for **both** dependencies — the database *and* the bus, so a
-  key/value idempotency claim is visible rather than invisible
+- Effect observation for **every** kind of egress — the database, the bus,
+  outbound HTTP, and any dependency on a protocol it cannot parse — so a
+  key/value idempotency claim, or one held behind an API call, is visible
+  rather than invisible
+- An opaque fallback for the rest: a request to an unparsed dependency is the
+  run of bytes that ends when the dependency answers, which detects a repeated
+  request without claiming to understand it. A finding built on one says in the
+  report that it is not actionable as it stands
+- HTTP dependencies answered by a stub whose replies are frozen from the clean
+  run, so only the fault can change what the handler sees. A call the clean run
+  never made gets the default reply and is flagged, and a finding that read a
+  stub before it diverged is marked `guard-dependent` rather than trusted
 - A determinism gate: no findings are reported until two unmutated runs agree
   byte for byte
 - Delta-debugging shrink to a minimal reproducing message set
@@ -87,10 +97,13 @@ outside that will be poor.
 **Rough edges / not done:**
 - **Only the built-in reference consumer.** Pointing it at your own service needs
   compose provisioning, which is not built
-- Postgres only for datastore effects — there is no proxy for any other engine,
-  so a service using one is not observed at all rather than partially
-- No HTTP effect source yet, so a handler whose guard is an API call is judged on
-  partial evidence
+- Postgres is the only datastore whose effects are read as statements. Any other
+  engine goes through the opaque fallback, which notices a repeated request but
+  cannot say what it was
+- Stub replies are configured in Go, so without provisioning every HTTP endpoint
+  answers an empty JSON object. A service that pins certificates or ships its own
+  certificate pool cannot reach the stub at all; that stops the run loudly rather
+  than being recorded as a handler that did nothing
 - The differential re-keying gate is designed but not built; it arrives with the
   redaction pipeline
 - `concurrent` delivery is refused rather than injected — it needs per-connection

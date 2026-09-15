@@ -177,6 +177,9 @@ func (c *check) attempt(
 		return report.Divergence{}, false, err
 	}
 
+	messageEffects := forMessage(mutated.Effects, outcome.Message)
+	metadata := metadataPositions(messageEffects)
+
 	return report.Divergence{
 		Consumer:     c.opts.Consumer,
 		Fault:        fault,
@@ -185,7 +188,9 @@ func (c *check) attempt(
 		Repro:        repro,
 		Clean:        outcome.Want,
 		Mutated:      outcome.Got,
-		DivergedKind: kindAt(forMessage(mutated.Effects, outcome.Message), outcome.Index),
+		DivergedKind: kindAt(messageEffects, outcome.Index),
+		StubReads:    metadata.stubbed,
+		OffScript:    metadata.offScript,
 		DivergedAt:   outcome.Index,
 	}, true, nil
 }
@@ -298,6 +303,29 @@ func kindAt(effects []effect.Effect, index int) effect.Kind {
 	}
 
 	return effects[index].Kind
+}
+
+// metadataPositions keeps stub metadata in the same per-message coordinate system as the gate's
+// divergence index. Effect.Seq is run-global, so copying it here would compare unrelated ordinals.
+type effectMetadata struct {
+	stubbed   []int
+	offScript []int
+}
+
+func metadataPositions(effects []effect.Effect) effectMetadata {
+	var metadata effectMetadata
+
+	for index, item := range effects {
+		if item.Stubbed {
+			metadata.stubbed = append(metadata.stubbed, index)
+		}
+
+		if item.OffScript {
+			metadata.offScript = append(metadata.offScript, index)
+		}
+	}
+
+	return metadata
 }
 
 func summarise(outcome gate.Result) string {

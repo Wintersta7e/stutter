@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -350,6 +351,29 @@ func TestGuardDependentNamesTheEarliestRead(t *testing.T) {
 	joined := strings.Join(finding.Reservations, "\n")
 	if !strings.Contains(joined, want) {
 		t.Errorf("reservations = %q, want them to contain %q", joined, want)
+	}
+}
+
+func TestOffScriptCallsAreReportedWithoutChangingTheVerdict(t *testing.T) {
+	t.Parallel()
+
+	divergence := corruptingStock()
+	divergence.OffScript = []int{5, 2}
+
+	built := report.New(wideScan(), heldGates(), []report.Divergence{divergence})
+	finding := onlyFinding(t, built)
+
+	if finding.Status != report.StatusFail {
+		t.Errorf("Status = %q, want FAIL (reservations: %v)", finding.Status, finding.Reservations)
+	}
+
+	const want = "off-script: effects 2, 5 were absent from the clean run and received the default stub"
+	if !slices.Contains(finding.Notes, want) {
+		t.Errorf("Notes = %q, want %q", finding.Notes, want)
+	}
+
+	if !strings.Contains(built.String(), want) {
+		t.Errorf("rendered report omitted off-script signal:\n%s", built)
 	}
 }
 
