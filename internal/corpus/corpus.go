@@ -169,12 +169,7 @@ func connect(ctx context.Context, natsServer *server.Server) (*Corpus, error) {
 		return nil, fmt.Errorf("open jetstream context: %w", err)
 	}
 
-	created, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
-		Name:      StreamName,
-		Subjects:  []string{subjectFilter},
-		Storage:   jetstream.FileStorage,
-		Retention: jetstream.LimitsPolicy,
-	})
+	created, err := stream.CreateOrUpdateStream(ctx, streamConfig())
 	if err != nil {
 		conn.Close()
 

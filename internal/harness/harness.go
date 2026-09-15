@@ -30,8 +30,10 @@ import (
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
-// errNoConnect means the sandbox was built without a way to reach the service under test.
-var errNoConnect = errors.New("no connect function: the sandbox has no service to drive")
+// errNoService means the sandbox was built with no service to observe, or with both run models at
+// once — a service that consumes for itself AND is dispatched to would see every message twice.
+var errNoService = errors.New("exactly one of Connect and Start must be set: " +
+	"Connect dispatches to the service, Start lets it consume for itself")
 
 // defaultHTTPHost is stable across runs while the listener's kernel-assigned port is not. The
 // reserved .invalid suffix makes it impossible to mistake this local stub identity for a real host.
@@ -78,8 +80,12 @@ type Connect func(ctx context.Context, at Addresses) (Service, error)
 type Config struct {
 	// Corpus is the recorded traffic and the bus the service talks to.
 	Corpus *corpus.Corpus
-	// Connect builds the service under test.
+	// Connect builds a service Stutter dispatches to. Exactly one of Connect and Start is set.
 	Connect Connect
+	// Start builds a service that pulls from the bus for itself, as a provisioned container does.
+	// Stutter then has nothing to dispatch and no acknowledgement of its own to withhold, so the run
+	// is watched and faulted on the wire instead.
+	Start Start
 	// Reset returns every dependency to the starting position — datastore AND bus-side state. A
 	// claim left in a key/value bucket corrupts the next run exactly as leftover rows would.
 	Reset func(ctx context.Context) error
@@ -103,6 +109,10 @@ type Config struct {
 	Policy policy.Config
 	// Quiesce is how long an attribution window stays open after a handler returns.
 	Quiesce time.Duration
+	// Drain is how long an observed run waits for the bus to stay silent before calling the corpus
+	// drained. Zero derives one from the recorded configuration's redelivery deadlines. It is unused
+	// when Stutter dispatches, because there the driver knows when it has stopped delivering.
+	Drain time.Duration
 	// HTTPTLS serves the stub over TLS instead of cleartext, for a service that will not talk to a
 	// dependency any other way. Addresses.HTTPCACert is then what the service must trust.
 	HTTPTLS bool
@@ -116,14 +126,18 @@ type Sandbox struct {
 	// certificates is nil unless the stub serves TLS. It is minted once per sandbox, so every run in
 	// a comparison presents the same certificate.
 	certificates *authority
-	upstream     string
-	cfg          Config
+	// recorded is the corpus held outside the stream, taken before the first observed run. Staging
+	// destroys everything it does not republish, so the messages a later whole-corpus run needs have
+	// to be in hand before the first subset run reduces the stream.
+	recorded []corpus.Message
+	upstream string
+	cfg      Config
 }
 
 // New builds a sandbox.
 func New(cfg Config) (*Sandbox, error) {
-	if cfg.Connect == nil {
-		return nil, errNoConnect
+	if (cfg.Connect == nil) == (cfg.Start == nil) {
+		return nil, errNoService
 	}
 
 	var upstream string
@@ -180,13 +194,27 @@ func (s *Sandbox) Run(
 	mutation replay.Mutation,
 	retain []uint64,
 ) (replay.Result, error) {
+	if s.cfg.Start != nil {
+		return s.runObserved(ctx, name, mutation, retain)
+	}
+
+	return s.runDriven(ctx, name, mutation, retain)
+}
+
+// runDriven replays the corpus into a service Stutter dispatches to, injecting the fault itself.
+func (s *Sandbox) runDriven(
+	ctx context.Context,
+	name string,
+	mutation replay.Mutation,
+	retain []uint64,
+) (replay.Result, error) {
 	runner := replay.NewRunner(s.cfg.Corpus, s.cfg.HashKey, s.cfg.Policy, replay.Options{
 		Retain:  retain,
 		Quiesce: s.cfg.Quiesce,
 	})
 	recorder := runner.NewRecorder()
 
-	observed, err := s.observe(ctx, recorder)
+	observed, err := s.observe(ctx, recorder, natsproxy.Options{})
 	if err != nil {
 		return replay.Result{}, err
 	}
@@ -200,29 +228,17 @@ func (s *Sandbox) Run(
 		)
 	}
 
-	result, err := runner.Run(ctx, name, mutation, service.Handle, recorder)
+	result, runErr := runner.Run(ctx, name, mutation, service.Handle, recorder)
+	if runErr != nil {
+		runErr = fmt.Errorf("replay %q: %w", name, runErr)
+	}
+
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
 	// holding an idle connection open would make teardown hang rather than fail.
 	service.Close(ctx)
-	closeErr := observed.close(ctx)
 
-	if err != nil {
-		return replay.Result{}, errors.Join(
-			fmt.Errorf("replay %q: %w", name, err),
-			closeErr,
-			observed.httpRun.Abort(),
-		)
-	}
-
-	if closeErr != nil {
-		return replay.Result{}, errors.Join(
-			fmt.Errorf("close observed egress: %w", closeErr),
-			observed.httpRun.Abort(),
-		)
-	}
-
-	if err := observed.httpRun.Commit(); err != nil {
-		return replay.Result{}, fmt.Errorf("freeze HTTP responses: %w", err)
+	if err := observed.settle(ctx, runErr); err != nil {
+		return replay.Result{}, err
 	}
 
 	return result, nil
@@ -250,6 +266,29 @@ func (e *egress) start(
 	go func() { e.served <- serve(ctx) }()
 }
 
+// settle tears the proxies down and decides the run's fate.
+//
+// The captured HTTP replies are frozen only when the run actually finished: a failed run saw part of
+// a clean run at best, and freezing that would pin later runs to answers the service never really
+// settled on.
+func (e *egress) settle(ctx context.Context, runErr error) error {
+	closeErr := e.close(ctx)
+
+	if runErr != nil {
+		return errors.Join(runErr, closeErr, e.httpRun.Abort())
+	}
+
+	if closeErr != nil {
+		return errors.Join(fmt.Errorf("close observed egress: %w", closeErr), e.httpRun.Abort())
+	}
+
+	if err := e.httpRun.Commit(); err != nil {
+		return fmt.Errorf("freeze HTTP responses: %w", err)
+	}
+
+	return nil
+}
+
 // close tears the proxies down. A proxy that died mid-run would otherwise present as a handler that
 // simply stopped producing effects, so its error is surfaced rather than discarded.
 func (e *egress) close(ctx context.Context) error {
@@ -268,7 +307,7 @@ func (e *egress) close(ctx context.Context) error {
 
 // observe puts a proxy in front of each dependency, all recording into the same sink so one
 // ordered effect sequence covers the whole run.
-func (s *Sandbox) observe(ctx context.Context, sink *effect.Recorder) (*egress, error) {
+func (s *Sandbox) observe(ctx context.Context, sink *effect.Recorder, bus natsproxy.Options) (*egress, error) {
 	observed := &egress{
 		served: make(chan error, s.proxyCount()),
 		at:     Addresses{Opaque: make(map[string]string, len(s.cfg.Opaque))},
@@ -282,7 +321,7 @@ func (s *Sandbox) observe(ctx context.Context, sink *effect.Recorder) (*egress, 
 		return nil, errors.Join(err, observed.close(ctx))
 	}
 
-	if err := s.observeBus(ctx, sink, observed); err != nil {
+	if err := s.observeBus(ctx, sink, observed, bus); err != nil {
 		return fail(err)
 	}
 
@@ -311,13 +350,20 @@ func (s *Sandbox) proxyCount() int {
 	return count
 }
 
-func (s *Sandbox) observeBus(ctx context.Context, sink *effect.Recorder, observed *egress) error {
+// observeBus proxies the bus. opts is empty for a driven run, which leaves the wire untouched in
+// both directions; an observed run supplies the hooks it is watched and faulted through.
+func (s *Sandbox) observeBus(
+	ctx context.Context,
+	sink *effect.Recorder,
+	observed *egress,
+	opts natsproxy.Options,
+) error {
 	upstream, err := hostPort(s.cfg.Corpus.URL())
 	if err != nil {
 		return err
 	}
 
-	bus, err := natsproxy.Listen(ctx, "127.0.0.1:0", upstream, sink)
+	bus, err := natsproxy.ListenWith(ctx, "127.0.0.1:0", upstream, sink, opts)
 	if err != nil {
 		return fmt.Errorf("listen in front of the bus: %w", err)
 	}

@@ -23,9 +23,10 @@ import (
 )
 
 const (
-	// defaultQuiesce is how long a message's attribution window stays open after its handler
-	// returns, to catch writes the handler started but did not wait for.
-	defaultQuiesce = 100 * time.Millisecond
+	// DefaultQuiesce is how long a message's attribution window stays open after its handler returns,
+	// to catch writes the handler started but did not wait for. Exported because both run models need
+	// the same one, and a second copy of the number would drift.
+	DefaultQuiesce = 100 * time.Millisecond
 	// defaultFetchWait bounds how long Next blocks before concluding the corpus is drained.
 	defaultFetchWait = 2 * time.Second
 )
@@ -257,7 +258,7 @@ type Options struct {
 
 func (o Options) withDefaults() Options {
 	if o.Quiesce <= 0 {
-		o.Quiesce = defaultQuiesce
+		o.Quiesce = DefaultQuiesce
 	}
 
 	if o.FetchWait <= 0 {
@@ -319,7 +320,7 @@ func (r *Runner) Run(
 	handler Handler,
 	recorder *effect.Recorder,
 ) (Result, error) {
-	verdict, err := r.admit(mutation)
+	verdict, err := Admit(r.config, mutation)
 	if err != nil {
 		return Result{}, err
 	}
@@ -356,9 +357,13 @@ func (r *Runner) Run(
 	return result, nil
 }
 
-// admit refuses a fault the recorded configuration does not license, or one Stutter cannot yet
-// inject honestly.
-func (r *Runner) admit(mutation Mutation) (policy.Verdict, error) {
+// Admit refuses a fault the recorded configuration does not license, or one Stutter cannot yet
+// inject honestly, and otherwise returns the clause that licensed it.
+//
+// Both run models go through it. A driven service and one that consumes for itself must refuse the
+// same faults for the same reasons, and the clause a finding quotes has to be the same text either
+// way — a second copy of the rule would drift out of step with this one.
+func Admit(config policy.Config, mutation Mutation) (policy.Verdict, error) {
 	if _, isConcurrent := mutation.(Concurrent); isConcurrent {
 		return policy.Verdict{}, fmt.Errorf(
 			"%w: concurrent delivery needs per-connection effect attribution, without which effects "+
@@ -367,7 +372,7 @@ func (r *Runner) admit(mutation Mutation) (policy.Verdict, error) {
 
 	fault := mutation.Fault()
 
-	verdict := r.config.Permits(fault)
+	verdict := config.Permits(fault)
 	if !verdict.Permitted {
 		return verdict, fmt.Errorf("%w: %s — %s", ErrForbidden, fault, verdict.Clause)
 	}

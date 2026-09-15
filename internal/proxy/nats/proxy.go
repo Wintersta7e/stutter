@@ -55,10 +55,34 @@ type Sink interface {
 	Record(observed effect.Observation)
 }
 
+// Acks decides the fate of an acknowledgement the service under test sends.
+//
+// It exists for the service Stutter does not drive. A containerised consumer pulls from JetStream
+// itself and acknowledges for itself, so the driver has no acknowledgement to withhold — the only
+// lever left is the wire, where an acknowledgement is an ordinary publish the proxy can swallow.
+type Acks interface {
+	// Withhold reports whether to drop this acknowledgement instead of forwarding it, which makes
+	// the server redeliver exactly as an unacknowledged message would be.
+	Withhold(ack Ack) bool
+}
+
+// Options are the hooks an observed run needs and a driven run does not.
+//
+// Their zero value leaves the wire untouched in both directions, which is what a driven service
+// requires: there the driver owns delivery, and a proxy that swallowed or watched anything would be
+// interfering with a run it does not control.
+type Options struct {
+	// Acks decides the fate of each acknowledgement the service sends.
+	Acks Acks
+	// Deliveries is notified of each message the bus hands to the service.
+	Deliveries Deliveries
+}
+
 // Proxy accepts NATS client connections and forwards them to an upstream server.
 type Proxy struct {
 	listener net.Listener
 	sink     Sink
+	opts     Options
 	upstream string
 	dialer   net.Dialer
 	wg       sync.WaitGroup
@@ -68,6 +92,12 @@ type Proxy struct {
 //
 // Use "127.0.0.1:0" to let the kernel pick a port and read it back from Addr.
 func Listen(ctx context.Context, addr, upstream string, sink Sink) (*Proxy, error) {
+	return ListenWith(ctx, addr, upstream, sink, Options{})
+}
+
+// ListenWith binds a proxy that also watches deliveries and can withhold acknowledgements, which is
+// what driving a service Stutter does not dispatch to requires.
+func ListenWith(ctx context.Context, addr, upstream string, sink Sink, opts Options) (*Proxy, error) {
 	var config net.ListenConfig
 
 	listener, err := config.Listen(ctx, "tcp", addr)
@@ -75,7 +105,7 @@ func Listen(ctx context.Context, addr, upstream string, sink Sink) (*Proxy, erro
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	return &Proxy{listener: listener, upstream: upstream, sink: sink}, nil
+	return &Proxy{listener: listener, upstream: upstream, sink: sink, opts: opts}, nil
 }
 
 // Addr is the address the proxy is listening on.
@@ -127,6 +157,7 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 		fromClient: bufio.NewReaderSize(client, readBuffer),
 		fromServer: bufio.NewReaderSize(upstream, readBuffer),
 		sink:       p.sink,
+		opts:       p.opts,
 	}
 
 	if err := current.negotiate(); err != nil {
@@ -166,6 +197,7 @@ type session struct {
 	fromClient *bufio.Reader
 	fromServer *bufio.Reader
 	sink       Sink
+	opts       Options
 }
 
 // negotiate forwards the server's opening INFO and confirms the connection will stay readable.
@@ -223,6 +255,10 @@ func (s *session) pumpClient() {
 
 		s.inspect(current)
 
+		if s.withhold(current) {
+			continue
+		}
+
 		if !s.forward(current.raw) {
 			return
 		}
@@ -234,14 +270,94 @@ func (s *session) pumpClient() {
 // Closing the client afterwards releases pumpClient, which is otherwise blocked on a read that a
 // disconnected bus will never satisfy.
 func (s *session) pumpServer() {
-	//nolint:errcheck // a forwarding failure is the connection ending, which is what happens next.
-	_, _ = io.Copy(s.client, s.fromServer)
+	defer func() { _ = s.client.Close() }()
 
-	_ = s.client.Close()
+	// Nothing is watching deliveries, so the bus side stays a straight copy. Every driven run takes
+	// this path, and parsing it would put a new way to desync in front of traffic that has no need
+	// of one.
+	if s.opts.Deliveries == nil {
+		//nolint:errcheck // a forwarding failure is the connection ending, which is what happens next.
+		_, _ = io.Copy(s.client, s.fromServer)
+
+		return
+	}
+
+	s.watchDeliveries()
+}
+
+// watchDeliveries forwards the bus's messages, noting each delivery on the way past.
+//
+// It mirrors pumpClient, including the rule that matters most: losing sight of the protocol costs
+// observation, never the connection. A service cut off mid-run reports as a handler that stopped
+// producing effects, which is a far worse answer than a missing window.
+func (s *session) watchDeliveries() {
+	for {
+		current, err := readServerFrame(s.fromServer)
+		if err != nil {
+			if current == nil {
+				return
+			}
+
+			s.forwardClient(current.raw)
+
+			if errors.Is(err, errDesynced) {
+				//nolint:errcheck // a forwarding failure is the connection ending, and it ends here anyway.
+				_, _ = io.Copy(s.client, s.fromServer)
+			}
+
+			return
+		}
+
+		s.noteDelivery(current)
+
+		if !s.forwardClient(current.raw) {
+			return
+		}
+	}
+}
+
+// noteDelivery reports a message the bus handed over, identified by the subject it will be
+// acknowledged on.
+//
+// A delivery whose reply subject is not an acknowledgement subject is ordinary pub/sub traffic, not
+// a consumer delivery, and opening a window for it would attribute effects to a message the service
+// was never working on.
+func (s *session) noteDelivery(current *frame) {
+	if !isDelivery(current.op) {
+		return
+	}
+
+	ack, parsed := parseAck(current.args.reply, nil)
+	if !parsed {
+		return
+	}
+
+	s.opts.Deliveries.Delivered(Delivery{
+		Subject: current.args.subject,
+		Payload: current.body[current.args.headerLen:],
+		Ack:     ack,
+	})
+}
+
+// forwardClient writes bytes back to the service, reporting whether the connection is still usable.
+func (s *session) forwardClient(raw []byte) bool {
+	if len(raw) == 0 {
+		return true
+	}
+
+	_, err := s.client.Write(raw)
+
+	return err == nil
 }
 
 func (s *session) inspect(current *frame) {
 	if !isPublish(current.op) {
+		return
+	}
+
+	// An acknowledgement or a pull request is delivery bookkeeping, not the service's own work.
+	// Recording one would put Stutter's own fault injection into the sequence it is comparing.
+	if isBookkeeping(current.args.subject) {
 		return
 	}
 
@@ -250,6 +366,24 @@ func (s *session) inspect(current *frame) {
 	text := render(current.args, headers, current.body[current.args.headerLen:])
 
 	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindNATS})
+}
+
+// withhold reports whether this frame is an acknowledgement the run has chosen to swallow.
+//
+// Dropping it is a genuine withheld ack: a JetStream acknowledgement is a fire-and-forget publish,
+// so the client cannot tell, and the server redelivers once the deadline passes. That is the only
+// lever available against a service that acknowledges for itself rather than being driven.
+func (s *session) withhold(current *frame) bool {
+	if s.opts.Acks == nil || !isPublish(current.op) || !isAckSubject(current.args.subject) {
+		return false
+	}
+
+	ack, parsed := parseAck(current.args.subject, current.body[current.args.headerLen:])
+	if !parsed {
+		return false
+	}
+
+	return s.opts.Acks.Withhold(ack)
 }
 
 // forward writes bytes on to the upstream, reporting whether the connection is still usable.

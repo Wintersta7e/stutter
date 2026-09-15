@@ -138,6 +138,27 @@ func closeProxy(t *testing.T, proxy *opaque.Proxy, done <-chan error) {
 	}
 }
 
+// waitForEffects waits until count effects have been observed.
+//
+// A connection that has been dialled has not necessarily been accepted: the kernel completes the
+// handshake, and closing the listener before Serve picks the connection up drops it. Tests that
+// read a reply have already proved the connection was handled; a fire-and-forget one has not, and
+// without this it fails for a reason that has nothing to do with what it is checking.
+func waitForEffects(t *testing.T, current *sink, count int) {
+	t.Helper()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(current.texts()) >= count {
+			return
+		}
+
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	t.Fatalf("effects observed = %d, want %d", len(current.texts()), count)
+}
+
 func dial(t *testing.T, addr string) net.Conn {
 	t.Helper()
 
@@ -201,6 +222,7 @@ func TestUnansweredRequestSurvivesTheConnection(t *testing.T) {
 
 	_ = client.Close()
 
+	waitForEffects(t, current, 1)
 	closeProxy(t, proxy, done)
 
 	want := []string{"dependency=cache payload=METRIC stock.written 1"}
@@ -345,6 +367,7 @@ func TestOversizeRequestSplitsOnAnExactByteCount(t *testing.T) {
 
 	_ = client.Close()
 
+	waitForEffects(t, current, 2)
 	closeProxy(t, proxy, done)
 
 	got := current.texts()

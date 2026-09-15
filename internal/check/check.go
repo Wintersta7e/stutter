@@ -8,6 +8,7 @@ package check
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -160,12 +161,22 @@ func (c *check) attempt(
 		return report.Divergence{}, false, nil
 	}
 
-	c.injected++
-
 	mutated, err := c.pass(ctx, string(fault), mutation, nil)
+
+	// A session may be unable to express a fault against the service it is driving: a run watched on
+	// the wire has no way to hold a delivery back before a service that pulls for itself has already
+	// been handed it. Skipping matches how a fault with no mutation at all is treated, and injecting
+	// something weaker under the same name would be worse than injecting nothing.
+	if errors.Is(err, replay.ErrUnsupported) {
+		return report.Divergence{}, false, nil
+	}
+
 	if err != nil {
 		return report.Divergence{}, false, err
 	}
+
+	// Counted only once the run happened, so a fault the session refused costs the budget nothing.
+	c.injected++
 
 	outcome := c.comparer.Compare(reference.Effects, mutated.Effects)
 	if outcome.OK() {

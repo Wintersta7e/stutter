@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -25,10 +26,13 @@ type session struct {
 	names         []string
 	nonIdempotent map[uint64]bool
 	stubbedGuard  map[uint64]bool
-	messages      []uint64
-	resets        int
-	unstable      bool
-	failOnReset   bool
+	// refuses are the faults this session cannot express against the service it drives, as a run
+	// watched on the wire cannot express a delay.
+	refuses     map[policy.Fault]bool
+	messages    []uint64
+	resets      int
+	unstable    bool
+	failOnReset bool
 }
 
 func newSession() *session {
@@ -53,6 +57,11 @@ func (s *session) Run(
 	mutation replay.Mutation,
 	retain []uint64,
 ) (replay.Result, error) {
+	if s.refuses[mutation.Fault()] {
+		return replay.Result{}, fmt.Errorf("%w: this session cannot express %s",
+			replay.ErrUnsupported, mutation.Fault())
+	}
+
 	s.names = append(s.names, name)
 
 	var effects []effect.Effect
@@ -289,6 +298,37 @@ func TestEveryPassGetsADistinctName(t *testing.T) {
 	if scripted.resets != len(scripted.names) {
 		t.Errorf("%d resets for %d runs; every pass must start from the same state",
 			scripted.resets, len(scripted.names))
+	}
+}
+
+// TestAnInexpressibleFaultIsSkippedNotFatal covers a session that cannot commit every fault the
+// recorded configuration permits. A service that consumes for itself is faulted by swallowing its
+// own acknowledgements, and a delay has to act before the service has been handed the message, so
+// the session refuses it. Treating that refusal as a setup failure would throw away every real
+// finding beside it.
+func TestAnInexpressibleFaultIsSkippedNotFatal(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.refuses = map[policy.Fault]bool{policy.FaultDelay: true}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got == 3 {
+		t.Fatalf("a refused fault was reported as a setup error:\n%s", result)
+	}
+
+	if len(result.Findings) == 0 {
+		t.Errorf("the refusal cost the run every other finding:\n%s", result)
+	}
+
+	for _, name := range scripted.names {
+		if strings.HasPrefix(name, string(policy.FaultDelay)) {
+			t.Errorf("a delay run was performed by a session that refuses delay: %q", name)
+		}
 	}
 }
 

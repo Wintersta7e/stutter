@@ -18,6 +18,12 @@ const (
 	opHPub = "HPUB"
 )
 
+// Server operations that carry a body. Everything else the server sends is a bare control line.
+const (
+	opMsg  = "MSG"
+	opHMsg = "HMSG"
+)
+
 const (
 	// crlf terminates every control line, every header line and every message body.
 	crlf = "\r\n"
@@ -76,17 +82,35 @@ type frame struct {
 // A publish whose counts do not parse returns errDesynced together with the line that was read, so
 // the caller can still forward those bytes: the message costs an effect, never the connection.
 func readFrame(from *bufio.Reader) (*frame, error) {
+	return readWireFrame(from, isPublish, parsePublishArgs)
+}
+
+// readServerFrame reads one message the bus sent, on the same terms as readFrame.
+//
+// The server side is parsed for one reason only: a service Stutter provisions rather than drives
+// receives its own deliveries, so the moment a message reaches it is visible here and nowhere else.
+func readServerFrame(from *bufio.Reader) (*frame, error) {
+	return readWireFrame(from, isDelivery, parseDeliveryArgs)
+}
+
+// readWireFrame reads one protocol message, leaving the connection positioned at the next control
+// line. bodied reports which operations carry a body, and args reads their counts.
+func readWireFrame(
+	from *bufio.Reader,
+	bodied func(op string) bool,
+	args func(op string, fields []string) (publishArgs, bool),
+) (*frame, error) {
 	line, err := readLine(from)
 	if err != nil {
 		return nil, err
 	}
 
-	op, args := splitControlLine(line)
-	if !isPublish(op) {
+	op, fields := splitControlLine(line)
+	if !bodied(op) {
 		return &frame{raw: line, op: op}, nil
 	}
 
-	parsed, ok := parsePublishArgs(op, args)
+	parsed, ok := args(op, fields)
 	if !ok {
 		return &frame{raw: line, op: op}, errDesynced
 	}
@@ -152,6 +176,33 @@ func parsePublishArgs(op string, args []string) (publishArgs, bool) {
 	}
 
 	return parsePlainArgs(args)
+}
+
+func isDelivery(op string) bool {
+	return strings.EqualFold(op, opMsg) || strings.EqualFold(op, opHMsg)
+}
+
+// parseDeliveryArgs reads "MSG <subject> <sid> [reply-to] <#bytes>" and the HMSG form.
+//
+// The subscription id sits between the subject and the reply subject and carries nothing Stutter
+// needs — the client chose it — so it is dropped, after which the arguments are exactly a publish's
+// and are read by the same code.
+func parseDeliveryArgs(op string, args []string) (publishArgs, bool) {
+	const sidAt = 1
+
+	if len(args) <= sidAt {
+		return publishArgs{}, false
+	}
+
+	withoutSID := make([]string, 0, len(args)-1)
+	withoutSID = append(withoutSID, args[0])
+	withoutSID = append(withoutSID, args[sidAt+1:]...)
+
+	if strings.EqualFold(op, opHMsg) {
+		return parseHeaderedArgs(withoutSID)
+	}
+
+	return parsePlainArgs(withoutSID)
 }
 
 // parsePlainArgs reads "PUB <subject> [reply-to] <#bytes>", whose one count is the payload alone.
