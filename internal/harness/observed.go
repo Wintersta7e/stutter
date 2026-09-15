@@ -65,7 +65,7 @@ func (s *Sandbox) runObserved(
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), s.cfg.HashKey)
-	run := newObservedRun(name, wire, recorder, staged, s.quiesce())
+	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, staged, s.quiesce())
 
 	observed, err := s.observe(ctx, recorder, natsproxy.Options{Acks: run, Deliveries: run})
 	if err != nil {
@@ -186,7 +186,10 @@ type observedRun struct {
 	recorder *effect.Recorder
 	// recorded translates a sequence the rebuilt stream is using back to the one the message was
 	// recorded under.
-	recorded  map[uint64]uint64
+	recorded map[uint64]uint64
+	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
+	// own bus work and is none of this run's business.
+	stream    string
 	activity  atomic.Int64
 	delivered atomic.Int64
 	failed    atomic.Int64
@@ -194,6 +197,7 @@ type observedRun struct {
 
 func newObservedRun(
 	consumer string,
+	stream string,
 	wire *replay.WirePolicy,
 	recorder *effect.Recorder,
 	staged []corpus.Staged,
@@ -209,6 +213,7 @@ func newObservedRun(
 		windows:  &windows{recorder: recorder, consumer: consumer, quiesce: quiesce},
 		recorder: recorder,
 		recorded: recorded,
+		stream:   stream,
 	}
 
 	run.touch()
@@ -222,7 +227,7 @@ func newObservedRun(
 // acts on the message. A delivery from any other stream is the service's own bus work and is none of
 // this run's business.
 func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
-	if delivery.Ack.Stream != corpus.StreamName {
+	if delivery.Ack.Stream != r.stream {
 		return
 	}
 
@@ -233,7 +238,7 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 
 // Withhold decides the fate of one acknowledgement and closes the window of the message it settles.
 func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
-	if ack.Stream != corpus.StreamName {
+	if ack.Stream != r.stream {
 		return false
 	}
 

@@ -11,9 +11,11 @@
 // effect but never corrupts the connection. Parsing goes only as far as producing a stable, readable
 // line: understanding the message is not required to notice that one run published it twice.
 //
-// Only the client-to-server direction is parsed. Divergence is decided by what the service did, not
-// by what it was told, so subscriptions, pings and everything the bus sends back are forwarded
-// without inspection and never become effects.
+// Only the client-to-server direction becomes effects. Divergence is decided by what the service
+// did, not by what it was told, so subscriptions and pings never become effects. The bus side is
+// read for exactly two facts that are visible nowhere else: which message was handed over, and
+// whether the bus REFUSED a publish. A refused operation changed nothing, and without that fact a
+// working idempotency guard reports as a divergence made entirely of its own rejected claim.
 package nats
 
 import (
@@ -50,9 +52,13 @@ const (
 var errEncrypted = errors.New("client negotiated TLS with the bus; " +
 	"published effects cannot be observed — disable TLS on the sandbox connection")
 
-// Sink receives the effects the proxy observes.
+// Sink receives the effects the proxy observes, and the bus's verdict on the ones it answers.
 type Sink interface {
 	Record(observed effect.Observation)
+	// Reject marks the effect awaiting this correlation as refused, so it decides no verdict.
+	Reject(correlation string)
+	// Answered forgets a correlation the bus accepted.
+	Answered(correlation string)
 }
 
 // Acks decides the fate of an acknowledgement the service under test sends.
@@ -157,6 +163,7 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 		fromClient: bufio.NewReaderSize(client, readBuffer),
 		fromServer: bufio.NewReaderSize(upstream, readBuffer),
 		sink:       p.sink,
+		awaiting:   make(map[string]struct{}),
 		opts:       p.opts,
 	}
 
@@ -197,7 +204,34 @@ type session struct {
 	fromClient *bufio.Reader
 	fromServer *bufio.Reader
 	sink       Sink
-	opts       Options
+	// awaiting holds the reply inboxes of publishes the bus has not answered yet. The two pumps are
+	// separate goroutines, so it is guarded.
+	awaiting map[string]struct{}
+	opts     Options
+	mu       sync.Mutex
+}
+
+// expect notes that the bus owes an answer on this inbox.
+func (s *session) expect(inbox string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.awaiting[inbox] = struct{}{}
+}
+
+// awaited reports whether a message the bus sent is the answer to a publish this session observed,
+// consuming the expectation.
+func (s *session) awaited(subject string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, owed := s.awaiting[subject]; !owed {
+		return false
+	}
+
+	delete(s.awaiting, subject)
+
+	return true
 }
 
 // negotiate forwards the server's opening INFO and confirms the connection will stay readable.
@@ -265,32 +299,22 @@ func (s *session) pumpClient() {
 	}
 }
 
-// pumpServer forwards everything the bus sends, uninspected.
+// pumpServer forwards everything the bus sends, reading it on the way past.
+//
+// Both run models parse this side now. A driven run used to take a straight copy on the grounds that
+// nothing was watching, but something is: an operation the bus REFUSED changed nothing, and the only
+// place that refusal is visible is the answer it sends back. Without it a working idempotency guard
+// reports as a divergence made entirely of its own refused claim.
 //
 // Closing the client afterwards releases pumpClient, which is otherwise blocked on a read that a
 // disconnected bus will never satisfy.
-func (s *session) pumpServer() {
-	defer func() { _ = s.client.Close() }()
-
-	// Nothing is watching deliveries, so the bus side stays a straight copy. Every driven run takes
-	// this path, and parsing it would put a new way to desync in front of traffic that has no need
-	// of one.
-	if s.opts.Deliveries == nil {
-		//nolint:errcheck // a forwarding failure is the connection ending, which is what happens next.
-		_, _ = io.Copy(s.client, s.fromServer)
-
-		return
-	}
-
-	s.watchDeliveries()
-}
-
-// watchDeliveries forwards the bus's messages, noting each delivery on the way past.
 //
 // It mirrors pumpClient, including the rule that matters most: losing sight of the protocol costs
 // observation, never the connection. A service cut off mid-run reports as a handler that stopped
 // producing effects, which is a far worse answer than a missing window.
-func (s *session) watchDeliveries() {
+func (s *session) pumpServer() {
+	defer func() { _ = s.client.Close() }()
+
 	for {
 		current, err := readServerFrame(s.fromServer)
 		if err != nil {
@@ -308,12 +332,31 @@ func (s *session) watchDeliveries() {
 			return
 		}
 
+		s.judge(current)
 		s.noteDelivery(current)
 
 		if !s.forwardClient(current.raw) {
 			return
 		}
 	}
+}
+
+// judge reports the bus's answer to a publish this session recorded.
+//
+// Only a message addressed to an inbox the session is waiting on is an answer, so ordinary traffic
+// that happens to carry an error payload is never mistaken for one.
+func (s *session) judge(current *frame) {
+	if !isDelivery(current.op) || !s.awaited(current.args.subject) {
+		return
+	}
+
+	if refused(current.body[current.args.headerLen:]) {
+		s.sink.Reject(current.args.subject)
+
+		return
+	}
+
+	s.sink.Answered(current.args.subject)
 }
 
 // noteDelivery reports a message the bus handed over, identified by the subject it will be
@@ -365,7 +408,20 @@ func (s *session) inspect(current *frame) {
 
 	text := render(current.args, headers, current.body[current.args.headerLen:])
 
-	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindNATS})
+	// A publish carrying a reply inbox is a request, and the bus will say whether it stored the
+	// message. Waiting for that answer is what lets a refused operation be excluded from the
+	// comparison; a publish with nowhere to answer is fire-and-forget and stands as recorded.
+	correlation := current.args.reply
+	if correlation != "" {
+		s.expect(correlation)
+	}
+
+	s.sink.Record(effect.Observation{
+		Raw:         text,
+		Printable:   text,
+		Kind:        effect.KindNATS,
+		Correlation: correlation,
+	})
 }
 
 // withhold reports whether this frame is an acknowledgement the run has chosen to swallow.

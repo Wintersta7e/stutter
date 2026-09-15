@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"encoding/json"
 	"strconv"
 	"strings"
 )
@@ -64,6 +65,34 @@ func (a Ack) InProgress() bool {
 // value to read, so this is what stands in for a handler error on a driven run.
 func (a Ack) Negative() bool {
 	return string(a.Payload) == ackNegative
+}
+
+// apiResponse is the shape every JetStream API reply shares. Only the presence of the error object
+// is read: which error it was is the dependency's business, and interpreting it is exactly the thing
+// the standing rule forbids.
+type apiResponse struct {
+	Error *apiError `json:"error"`
+}
+
+// apiError is present on every JetStream reply that declined the request. Only its presence is read.
+type apiError struct {
+	Code int `json:"code"`
+}
+
+// refused reports whether the bus answered a publish by declining to store it.
+//
+// A body that is not a JetStream API reply is not a refusal: a core NATS request-reply carries
+// whatever the responder chose, and guessing at it would drop effects that really happened. The
+// conservative direction is to keep the effect, because an effect wrongly kept is at worst a
+// divergence a human can dismiss, while one wrongly dropped is a bug that was never reported.
+func refused(payload []byte) bool {
+	var answer apiResponse
+
+	if err := json.Unmarshal(payload, &answer); err != nil {
+		return false
+	}
+
+	return answer.Error != nil
 }
 
 // isAckSubject reports whether a publish is an acknowledgement rather than the service's own work.

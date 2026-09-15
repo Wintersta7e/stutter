@@ -46,10 +46,57 @@ type Session interface {
 	Run(ctx context.Context, name string, mutation replay.Mutation, retain []uint64) (replay.Result, error)
 }
 
+// Invariant is a user's standing answer to a divergence Stutter cannot rule on by itself.
+//
+// Some repeated work is harmless and some is a second charge, and nothing in the effect sequence
+// says which — an audit row written twice is append-only by design, while a payment captured twice
+// is the bug. Only the person who owns the handler knows, so this is how they say it once instead of
+// re-reading the same WARN on every run.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type Invariant struct {
+	// Consumer limits the rule to one consumer. Empty matches any.
+	Consumer string
+	// Matches is a substring of the canonical form of the effect that diverged. A substring rather
+	// than a pattern because the canonical form is already normalised: the values that would differ
+	// between runs have been substituted out, so the stable part is plain text.
+	Matches string
+	// Because is why, and is rendered beside the finding. A verdict set by declaration has to carry
+	// the declaration's reason or nobody can audit it later.
+	Because string
+	// Impact is the classification to apply: corrupting promotes the finding to a failure, acceptable
+	// silences it into Report.Silenced.
+	Impact report.Impact
+}
+
+// classify returns the impact a declared invariant puts on this divergence, if any.
+//
+// The canonical form of the effect that DIVERGED is what a rule matches, because that is the effect
+// the finding is about. Rules are tried in order and the first match wins, so a specific rule can be
+// placed ahead of a general one.
+func classify(invariants []Invariant, consumer, diverged string) (Invariant, bool) {
+	for _, rule := range invariants {
+		if rule.Consumer != "" && rule.Consumer != consumer {
+			continue
+		}
+
+		if rule.Matches == "" || !strings.Contains(diverged, rule.Matches) {
+			continue
+		}
+
+		return rule, true
+	}
+
+	return Invariant{}, false
+}
+
 // Options configures a check.
 type Options struct {
 	// Messages are the corpus stream sequences, in recorded order.
 	Messages []uint64
+	// Invariants are the user's standing answers about which repeated work matters. Empty leaves
+	// every divergence to the protocol default, which is the zero-declaration starting point.
+	Invariants []Invariant
 	// Consumer names the consumer under test, for attribution.
 	Consumer string
 	// Config is the recorded consumer configuration. It decides which faults are legal.
@@ -104,7 +151,7 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 
 	gates := []report.GateCheck{{
 		Name:   report.GateDeterminism,
-		Result: c.comparer.Compare(reference.Effects, repeat.Effects),
+		Result: c.comparer.Compare(effect.Compared(reference.Effects), effect.Compared(repeat.Effects)),
 	}}
 
 	// A violated gate stops the run rather than qualifying it: every comparison past this point
@@ -178,7 +225,12 @@ func (c *check) attempt(
 	// Counted only once the run happened, so a fault the session refused costs the budget nothing.
 	c.injected++
 
-	outcome := c.comparer.Compare(reference.Effects, mutated.Effects)
+	// Every comparison and every position taken from one uses the rejected-free view: the gate
+	// reports an ordinal within the sequence it was given, so indexing a different one would name a
+	// different effect in the finding.
+	mutatedEffects := effect.Compared(mutated.Effects)
+
+	outcome := c.comparer.Compare(effect.Compared(reference.Effects), mutatedEffects)
 	if outcome.OK() {
 		return report.Divergence{}, false, nil
 	}
@@ -188,13 +240,33 @@ func (c *check) attempt(
 		return report.Divergence{}, false, err
 	}
 
-	messageEffects := forMessage(mutated.Effects, outcome.Message)
+	return c.describe(outcome, mutatedEffects, fault, mutated.Clause, repro), true, nil
+}
+
+// describe turns a comparison that failed into the divergence a report rules on.
+func (c *check) describe(
+	outcome gate.Result,
+	mutatedEffects []effect.Effect,
+	fault policy.Fault,
+	clause string,
+	repro string,
+) report.Divergence {
+	messageEffects := forMessage(mutatedEffects, outcome.Message)
 	metadata := metadataPositions(messageEffects)
+
+	// The mutated run's effect is what diverged, except where the fault made an effect disappear and
+	// there is only the reference's to name.
+	diverged := outcome.Got
+	if diverged == "" {
+		diverged = outcome.Want
+	}
+
+	declared, _ := classify(c.opts.Invariants, c.opts.Consumer, diverged)
 
 	return report.Divergence{
 		Consumer:     c.opts.Consumer,
 		Fault:        fault,
-		Clause:       mutated.Clause,
+		Clause:       clause,
 		Summary:      summarise(outcome),
 		Repro:        repro,
 		Clean:        outcome.Want,
@@ -203,7 +275,9 @@ func (c *check) attempt(
 		StubReads:    metadata.stubbed,
 		OffScript:    metadata.offScript,
 		DivergedAt:   outcome.Index,
-	}, true, nil
+		Impact:       declared.Impact,
+		Because:      declared.Because,
+	}
 }
 
 // shrink reduces a divergence to the smallest message set that still reproduces it.
@@ -227,7 +301,7 @@ func (c *check) shrink(ctx context.Context, mutation replay.Mutation) (string, e
 			return false, err
 		}
 
-		return !c.comparer.Compare(clean.Effects, faulted.Effects).OK(), nil
+		return !c.comparer.Compare(effect.Compared(clean.Effects), effect.Compared(faulted.Effects)).OK(), nil
 	}
 
 	start := shrink.Candidate{Messages: c.opts.Messages, Mutations: []replay.Mutation{mutation}}

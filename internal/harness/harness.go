@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/url"
 	"slices"
 	"time"
@@ -38,6 +39,9 @@ var errNoService = errors.New("exactly one of Connect and Start must be set: " +
 // defaultHTTPHost is stable across runs while the listener's kernel-assigned port is not. The
 // reserved .invalid suffix makes it impossible to mistake this local stub identity for a real host.
 const defaultHTTPHost = "dependency.invalid"
+
+// loopback is where the proxies listen unless the service under test cannot reach it.
+const loopback = "127.0.0.1"
 
 // alwaysProxied counts the proxies every run gets whatever the configuration says: the bus and the
 // HTTP stub. The database and any unparsed dependency are added to it.
@@ -103,6 +107,14 @@ type Config struct {
 	// HTTPHost is the stable logical host rendered into effects when Connect uses the local proxy
 	// URL. Empty uses a reserved non-resolving name and costs local callers no declaration.
 	HTTPHost string
+	// BindHost is the interface the proxies listen on. Empty is loopback, which is what a service
+	// sharing this network namespace needs. A CONTAINERISED service does not share it, so its proxies
+	// have to listen somewhere it can reach.
+	BindHost string
+	// AdvertiseHost is the host the service is told to dial, where that differs from the interface the
+	// proxies bound. A container reaches its host by a name of its own and never by the host's
+	// loopback, so the address that works for the listener is not the address to hand out.
+	AdvertiseHost string
 	// HashKey keys the raw-effect hash. Every run in a comparison must share one.
 	HashKey []byte
 	// Policy is the recorded consumer configuration.
@@ -244,6 +256,34 @@ func (s *Sandbox) runDriven(
 	return result, nil
 }
 
+// bind is the address the proxies listen on, with a kernel-assigned port.
+func (s *Sandbox) bind() string {
+	host := s.cfg.BindHost
+	if host == "" {
+		host = loopback
+	}
+
+	return net.JoinHostPort(host, "0")
+}
+
+// advertise rewrites a listener's address into the one the service under test should dial.
+//
+// A proxy bound to every interface reports 0.0.0.0, which is not an address anything can connect to,
+// and a container cannot reach its host's loopback under any name of its own. Both are the same
+// problem: where the proxy listens and where the service dials are not always the same host.
+func (s *Sandbox) advertise(addr string) string {
+	if s.cfg.AdvertiseHost == "" {
+		return addr
+	}
+
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+
+	return net.JoinHostPort(s.cfg.AdvertiseHost, port)
+}
+
 // egress is the proxies standing in front of the service's dependencies.
 type egress struct {
 	httpRun *httpproxy.Run
@@ -363,13 +403,13 @@ func (s *Sandbox) observeBus(
 		return err
 	}
 
-	bus, err := natsproxy.ListenWith(ctx, "127.0.0.1:0", upstream, sink, opts)
+	bus, err := natsproxy.ListenWith(ctx, s.bind(), upstream, sink, opts)
 	if err != nil {
 		return fmt.Errorf("listen in front of the bus: %w", err)
 	}
 
 	observed.start(ctx, ignoringContext(bus.Close), bus.Serve)
-	observed.at.NATS = "nats://" + bus.Addr()
+	observed.at.NATS = "nats://" + s.advertise(bus.Addr())
 
 	return nil
 }
@@ -379,14 +419,14 @@ func (s *Sandbox) observeDatabase(ctx context.Context, sink *effect.Recorder, ob
 		return nil
 	}
 
-	postgres, err := pg.Listen(ctx, "127.0.0.1:0", s.upstream, sink)
+	postgres, err := pg.Listen(ctx, s.bind(), s.upstream, sink)
 	if err != nil {
 		return fmt.Errorf("listen in front of the database: %w", err)
 	}
 
 	observed.start(ctx, ignoringContext(postgres.Close), postgres.Serve)
 
-	proxied, err := rewriteHost(s.cfg.PostgresDSN, postgres.Addr())
+	proxied, err := rewriteHost(s.cfg.PostgresDSN, s.advertise(postgres.Addr()))
 	if err != nil {
 		return err
 	}
@@ -412,12 +452,12 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 	observed.start(ctx, proxy.CloseContext, proxy.Serve)
 
 	if s.certificates == nil {
-		observed.at.HTTP = "http://" + proxy.Addr()
+		observed.at.HTTP = "http://" + s.advertise(proxy.Addr())
 
 		return nil
 	}
 
-	observed.at.HTTP = "https://" + proxy.Addr()
+	observed.at.HTTP = "https://" + s.advertise(proxy.Addr())
 	observed.at.HTTPCACert = s.certificates.pem
 
 	return nil
@@ -425,7 +465,7 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 
 func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpproxy.Proxy, error) {
 	if s.certificates == nil {
-		proxy, err := httpproxy.Listen(ctx, "127.0.0.1:0", s.cfg.HTTPHost, sink, s.httpScript)
+		proxy, err := httpproxy.Listen(ctx, s.bind(), s.cfg.HTTPHost, sink, s.httpScript)
 		if err != nil {
 			return nil, fmt.Errorf("bind the cleartext stub: %w", err)
 		}
@@ -435,7 +475,7 @@ func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpp
 
 	proxy, err := httpproxy.ListenTLS(
 		ctx,
-		"127.0.0.1:0",
+		s.bind(),
 		s.cfg.HTTPHost,
 		sink,
 		s.httpScript,
@@ -452,13 +492,13 @@ func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpp
 // error joining do not depend on map iteration.
 func (s *Sandbox) observeOpaque(ctx context.Context, sink *effect.Recorder, observed *egress) error {
 	for _, name := range slices.Sorted(maps.Keys(s.cfg.Opaque)) {
-		proxy, err := opaqueproxy.Listen(ctx, "127.0.0.1:0", name, s.cfg.Opaque[name], sink)
+		proxy, err := opaqueproxy.Listen(ctx, s.bind(), name, s.cfg.Opaque[name], sink)
 		if err != nil {
 			return fmt.Errorf("listen in front of %q: %w", name, err)
 		}
 
 		observed.start(ctx, ignoringContext(proxy.Close), proxy.Serve)
-		observed.at.Opaque[name] = proxy.Addr()
+		observed.at.Opaque[name] = s.advertise(proxy.Addr())
 	}
 
 	return nil

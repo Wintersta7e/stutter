@@ -158,6 +158,9 @@ type Divergence struct {
 	Clean string
 	// Mutated is the same outcome under the fault.
 	Mutated string
+	// Because is the reason a declared invariant gave for classifying this divergence. It is rendered
+	// beside the finding, so a promotion to FAIL is never a verdict without a stated reason.
+	Because string
 	// Impact classifies what this divergence costs. Setting it overrides the protocol default.
 	Impact Impact
 	// DivergedKind is the protocol of the first effect that differed, from effect.Effect.Kind at
@@ -328,8 +331,16 @@ func (d Divergence) rule() Finding {
 }
 
 func (d Divergence) notes() []string {
+	var declared []string
+
+	// A declared invariant decided this verdict, so it is rendered whether it raised or lowered it.
+	// A finding that fails because someone said it should has to say who said so.
+	if d.Impact != ImpactUnclassified && d.Because != "" {
+		declared = append(declared, "declared invariant: "+d.Because)
+	}
+
 	if len(d.OffScript) == 0 {
-		return nil
+		return declared
 	}
 
 	positions := slices.Clone(d.OffScript)
@@ -348,8 +359,8 @@ func (d Divergence) notes() []string {
 		verb = "were"
 	}
 
-	return []string{"off-script: " + label + strings.Join(parts, ", ") + " " + verb +
-		" absent from the clean run and received the default stub"}
+	return append(declared, "off-script: "+label+strings.Join(parts, ", ")+" "+verb+
+		" absent from the clean run and received the default stub")
 }
 
 // reservations lists every reason this divergence warns rather than fails.

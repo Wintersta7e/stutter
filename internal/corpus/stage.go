@@ -40,7 +40,7 @@ type Staged struct {
 // reduced to the last subset it staged. It also means a staging that fails part way cannot cost the
 // corpus anything: the messages are already in the caller's hands.
 func (c *Corpus) Snapshot(ctx context.Context) ([]Message, error) {
-	stream, err := c.stream.Stream(ctx, StreamName)
+	stream, err := c.stream.Stream(ctx, c.topic.Stream)
 	if err != nil {
 		return nil, fmt.Errorf("open the corpus stream: %w", err)
 	}
@@ -80,11 +80,11 @@ func (c *Corpus) Snapshot(ctx context.Context) ([]Message, error) {
 // a purged stream carries state a virgin one does not, and a run that starts from an equivalent
 // rather than an identical position is not comparable with the one before it.
 func (c *Corpus) Stage(ctx context.Context, messages []Message) ([]Staged, error) {
-	if err := c.stream.DeleteStream(ctx, StreamName); err != nil {
+	if err := c.stream.DeleteStream(ctx, c.topic.Stream); err != nil {
 		return nil, fmt.Errorf("delete the corpus stream: %w", err)
 	}
 
-	if _, err := c.stream.CreateStream(ctx, streamConfig()); err != nil {
+	if _, err := c.stream.CreateStream(ctx, streamConfig(c.topic)); err != nil {
 		return nil, fmt.Errorf("recreate the corpus stream: %w", err)
 	}
 
@@ -104,10 +104,10 @@ func (c *Corpus) Stage(ctx context.Context, messages []Message) ([]Staged, error
 
 // streamConfig is the corpus stream's shape, in one place so a staged stream is identical to the one
 // Start created.
-func streamConfig() jetstream.StreamConfig {
+func streamConfig(topic Topic) jetstream.StreamConfig {
 	return jetstream.StreamConfig{
-		Name:      StreamName,
-		Subjects:  []string{subjectFilter},
+		Name:      topic.Stream,
+		Subjects:  []string{topic.Filter},
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	}

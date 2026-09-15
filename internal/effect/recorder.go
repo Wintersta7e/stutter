@@ -18,8 +18,11 @@ import (
 type Recorder struct {
 	canon   *Canonicaliser
 	hashKey []byte
-	effects []Effect
-	window  window
+	// awaiting maps a correlation token to the effect still owed an answer, so Reject can find it.
+	// An effect is removed once answered, because a correlation token is used exactly once.
+	awaiting map[string]int
+	effects  []Effect
+	window   window
 	// setup counts effects observed before the first message was ever delivered.
 	setup int
 	// armed becomes true at the first Open. Before it, nothing is the service's response to traffic.
@@ -41,7 +44,7 @@ type window struct {
 // Two runs being compared must share a key, or their raw hashes cannot be compared and the
 // diagnosis is lost.
 func NewRecorder(canon *Canonicaliser, hashKey []byte) *Recorder {
-	return &Recorder{canon: canon, hashKey: hashKey}
+	return &Recorder{canon: canon, hashKey: hashKey, awaiting: make(map[string]int)}
 }
 
 // Open begins an attribution window for one message.
@@ -96,6 +99,10 @@ func (r *Recorder) Record(observed Observation) {
 		mode = r.window.prov.Mode()
 	}
 
+	if observed.Correlation != "" {
+		r.awaiting[observed.Correlation] = len(r.effects)
+	}
+
 	r.effects = append(r.effects, Effect{
 		Consumer:   r.window.consumer,
 		Kind:       observed.Kind,
@@ -109,6 +116,33 @@ func (r *Recorder) Record(observed Observation) {
 		OffScript:  observed.OffScript,
 		Late:       !r.window.open,
 	})
+}
+
+// Reject marks the effect awaiting this correlation as refused by its dependency.
+//
+// Marking rather than removing keeps the sequence's positions stable: a reader still sees what the
+// service attempted, and only the comparison ignores it. An unknown token is ignored, because a
+// reply to a request observed before the run was armed has no effect to mark.
+func (r *Recorder) Reject(correlation string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	at, awaited := r.awaiting[correlation]
+	if !awaited {
+		return
+	}
+
+	delete(r.awaiting, correlation)
+	r.effects[at].Rejected = true
+}
+
+// Answered forgets a correlation whose reply carried no refusal, so the map does not grow for the
+// length of a run.
+func (r *Recorder) Answered(correlation string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.awaiting, correlation)
 }
 
 // Close ends the attribution window. Effects recorded afterwards are marked Late.

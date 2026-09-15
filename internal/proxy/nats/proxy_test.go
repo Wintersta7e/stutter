@@ -30,8 +30,10 @@ const (
 
 // observed is one effect as the proxy reported it.
 type observed struct {
-	kind effect.Kind
-	text string
+	kind        effect.Kind
+	text        string
+	correlation string
+	rejected    bool
 }
 
 // recorder is the Sink the proxy writes to. The proxy records from its own goroutines, so it locks.
@@ -48,7 +50,41 @@ func (r *recorder) Record(item effect.Observation) {
 		panic("the readable form and the comparable form were expected to match")
 	}
 
-	r.entries = append(r.entries, observed{kind: item.Kind, text: item.Raw})
+	r.entries = append(r.entries, observed{
+		kind:        item.Kind,
+		text:        item.Raw,
+		correlation: item.Correlation,
+	})
+}
+
+// Reject marks what the bus refused, mirroring the real recorder so a test sees the same view.
+func (r *recorder) Reject(correlation string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for at := range r.entries {
+		if r.entries[at].correlation == correlation {
+			r.entries[at].rejected = true
+		}
+	}
+}
+
+func (*recorder) Answered(string) {}
+
+// refusals returns the text of every effect the bus declined.
+func (r *recorder) refusals() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var declined []string
+
+	for _, item := range r.entries {
+		if item.rejected {
+			declined = append(declined, item.text)
+		}
+	}
+
+	return declined
 }
 
 func (r *recorder) texts() []string {

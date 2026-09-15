@@ -368,11 +368,27 @@ func TestGuardedHandlerIsNotReported(t *testing.T) {
 		if found.Status == report.StatusFail {
 			t.Errorf("a correctly guarded handler was reported as failing:\n%s", result)
 		}
+
+		// The guard's second claim is REFUSED by the bus: nothing is stored and the handler does
+		// nothing. A finding whose diverged effect is that refused claim is a working guard reported
+		// as a bug — the false positive release gate 1 forbids, and it fires on every message of any
+		// service whose dedupe guard is a key/value claim.
+		if strings.Contains(found.Mutated, "kv.create") {
+			t.Errorf("the guard's refused claim was reported as a divergence:\n%s", result)
+		}
 	}
 }
 
 // TestHTTPGuardIsMarkedGuardDependent exercises the whole metadata path: HTTP observation, frozen
 // response replay, off-script fallback, effect metadata, per-message indexing, and report ruling.
+//
+// It is also the adversarial case for the frozen stub. The clean run captured one guard reply, so a
+// duplicate delivery's SECOND guard call is off script and takes the default — and this default says
+// the work is already claimed, which talks the handler out of the very duplicate work the fault was
+// injected to expose. That is the stub introducing divergence, which the standing rule forbids, so
+// the masking is allowed to happen only on condition that it can never happen QUIETLY: the finding
+// must carry both marks, guard-dependent and off-script, and the report must never read as a handler
+// that was checked and found safe.
 func TestHTTPGuardIsMarkedGuardDependent(t *testing.T) {
 	t.Parallel()
 
@@ -432,6 +448,19 @@ func TestHTTPGuardIsMarkedGuardDependent(t *testing.T) {
 
 	if !strings.Contains(result.String(), "off-script") {
 		t.Errorf("report omitted the off-script call:\n%s", result)
+	}
+
+	// The masking is real and this is its fingerprint: the divergence is the repeated GUARD call, not
+	// a repeated database write, because the default reply stopped the handler before it wrote. If
+	// this ever becomes the database write, the stub is no longer masking and the reservations above
+	// are no longer load-bearing.
+	if !strings.Contains(found.Mutated, "http.request") {
+		t.Errorf("diverged on %q, want the guard call — the stub is no longer masking the doubled write",
+			found.Mutated)
+	}
+
+	if strings.Contains(found.Mutated, "UPDATE stock") {
+		t.Errorf("diverged on the database write %q, so the default reply did not mask it", found.Mutated)
 	}
 }
 

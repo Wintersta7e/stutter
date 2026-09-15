@@ -18,6 +18,10 @@ import (
 
 var errSessionBroken = errors.New("the sandbox never came up")
 
+// stockWrite is the canonical form the scripted session's non-idempotent write renders as, named once
+// so a declaration in a test and the effect it is meant to match cannot drift apart.
+const stockWrite = "UPDATE stock"
+
 // session is a scripted service under test. Message 1 is non-idempotent — a second delivery repeats
 // its write — and message 2 is not. Nothing else here is nondeterministic, so the determinism gate
 // holds unless a test deliberately breaks it.
@@ -329,6 +333,109 @@ func TestAnInexpressibleFaultIsSkippedNotFatal(t *testing.T) {
 		if strings.HasPrefix(name, string(policy.FaultDelay)) {
 			t.Errorf("a delay run was performed by a session that refuses delay: %q", name)
 		}
+	}
+}
+
+// TestAnInvariantSilencesADivergence is the answer to work that repeats harmlessly.
+//
+// A doubled audit row is a real duplicated write and Stutter is right to see it, but whether it
+// matters is knowledge only the handler's owner has. Silencing is counted rather than dropped, so a
+// run that silenced everything cannot read as a clean one.
+func TestAnInvariantSilencesADivergence(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	opts := options(scripted)
+	opts.Invariants = []check.Invariant{{
+		Matches: stockWrite,
+		Impact:  report.ImpactAcceptable,
+		Because: "stock updates are absolute, not relative",
+	}}
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(result.Findings) != 0 {
+		t.Fatalf("Findings = %d, want 0 — the invariant did not silence the divergence:\n%s",
+			len(result.Findings), result)
+	}
+
+	if result.Silenced == 0 {
+		t.Error("the divergence was dropped rather than counted; a silenced run must not read as clean")
+	}
+
+	if got := result.ExitCode(); got != 0 {
+		t.Errorf("ExitCode() = %d, want 0", got)
+	}
+}
+
+// TestAnInvariantPromotesADivergenceToFail is the other direction, and the one that changes an exit
+// code. A repeated outbound call defaults to WARN because Stutter cannot tell a charge from a ping;
+// an owner who knows it is a charge says so once.
+func TestAnInvariantPromotesADivergenceToFail(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	opts := options(scripted)
+	opts.Invariants = []check.Invariant{{
+		Consumer: "reserve_stock",
+		Matches:  stockWrite,
+		Impact:   report.ImpactCorrupting,
+		Because:  "every reservation is money",
+	}}
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(result.Findings) == 0 {
+		t.Fatalf("no findings at all:\n%s", result)
+	}
+
+	found := result.Findings[0]
+	if found.Status != report.StatusFail {
+		t.Errorf("Status = %q, want FAIL — the invariant did not promote it (reservations: %v)",
+			found.Status, found.Reservations)
+	}
+
+	if !strings.Contains(result.String(), "every reservation is money") {
+		t.Errorf("the report does not say which declaration decided this:\n%s", result)
+	}
+
+	if got := result.ExitCode(); got != 1 {
+		t.Errorf("ExitCode() = %d, want 1", got)
+	}
+}
+
+// TestAnInvariantForAnotherConsumerIsNotApplied keeps a rule from leaking across handlers. Two
+// consumers writing the same table is ordinary, and a declaration about one of them is not a
+// statement about the other.
+func TestAnInvariantForAnotherConsumerIsNotApplied(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	opts := options(scripted)
+	opts.Invariants = []check.Invariant{{
+		Consumer: "some_other_consumer",
+		Matches:  stockWrite,
+		Impact:   report.ImpactAcceptable,
+		Because:  "not this handler",
+	}}
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Silenced != 0 {
+		t.Errorf("Silenced = %d, want 0 — another consumer's declaration was applied here", result.Silenced)
+	}
+
+	if len(result.Findings) == 0 {
+		t.Errorf("the finding was silenced by a rule naming a different consumer:\n%s", result)
 	}
 }
 

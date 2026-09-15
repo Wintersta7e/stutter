@@ -15,11 +15,16 @@ const (
 	opPut     = "kv.put"
 	opDelete  = "kv.delete"
 	opPurge   = "kv.purge"
+	opGet     = "kv.get"
 )
 
 const (
 	// kvMarker is the segment that opens a key/value subject: $KV.<bucket>.<key>.
 	kvMarker = "$KV"
+	// directGetSegment marks a JetStream direct get, which names the subject it reads inside its own:
+	// $JS.API.DIRECT.GET.<stream>.$KV.<bucket>.<key>. A domain sits between $JS and API, so the
+	// request segment is matched rather than a whole prefix.
+	directGetSegment = ".DIRECT.GET."
 	// kvSegments is how many segments a key/value subject needs after the marker: a bucket and at
 	// least one segment of key.
 	kvSegments = 2
@@ -80,6 +85,10 @@ func render(args publishArgs, headers []header, payload []byte) string {
 // It also returns the headers that did not go into naming the operation, so the two the name already
 // encodes are not repeated after it.
 func describe(subject string, headers []header) ([]string, []header) {
+	if read, isGet := splitDirectGet(subject); isGet {
+		return []string{opGet, "bucket=" + read.bucket, "key=" + read.key}, headers
+	}
+
 	parsed, ok := splitKVSubject(subject)
 	if !ok {
 		return []string{opPublish, "subject=" + subject}, headers
@@ -100,7 +109,43 @@ func describe(subject string, headers []header) ([]string, []header) {
 // The marker is located rather than assumed to be the first segment, because a bucket reached
 // through a JetStream domain carries an API prefix in front of it. Everything after the bucket is
 // the key, since a key may contain dots.
+//
+// Callers must rule out a direct get first: that request names the key/value subject it READS inside
+// its own subject, so this would resolve it and report a lookup as a write.
 func splitKVSubject(subject string) (kvSubject, bool) {
+	segments := strings.Split(subject, ".")
+
+	for index, segment := range segments {
+		if segment != kvMarker {
+			continue
+		}
+
+		rest := segments[index+1:]
+		if len(rest) < kvSegments {
+			return kvSubject{}, false
+		}
+
+		return kvSubject{bucket: rest[0], key: strings.Join(rest[1:], ".")}, true
+	}
+
+	return kvSubject{}, false
+}
+
+// splitDirectGet resolves the key/value entry a direct get is asking for.
+//
+// A direct get is published to $JS.API.DIRECT.GET.<stream>.$KV.<bucket>.<key>, and the request
+// segment is matched rather than the whole prefix because a JetStream domain sits between $JS and
+// API. Without this the embedded subject resolves as a key/value write and a guard that merely
+// looked its claim up is reported as having stored it again.
+//
+// Naming the read is worth the few lines: a dedupe guard that finds its claim taken does exactly
+// this lookup on every redelivery, so it is the effect a correctly guarded handler produces most
+// often, and "publish subject=$JS.API.DIRECT.GET.…" tells a reader nothing they can act on.
+func splitDirectGet(subject string) (kvSubject, bool) {
+	if !strings.Contains(subject, directGetSegment) {
+		return kvSubject{}, false
+	}
+
 	segments := strings.Split(subject, ".")
 
 	for index, segment := range segments {

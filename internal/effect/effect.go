@@ -56,6 +56,32 @@ type Effect struct {
 	// Late marks an effect that arrived after its message's quiesce window closed. Late effects are
 	// a determinism hazard and are reported as an anomaly, never as a divergence.
 	Late bool
+	// Rejected marks an operation the dependency refused, which therefore changed nothing. It is kept
+	// so a reader can see what the service attempted, and excluded from comparison by Compared.
+	//
+	// This is the ONE place a response is read. The standing rule is that divergence is decided by
+	// what the service asked for, never by what the dependency answered — narrowed here to never
+	// INTERPRET a response. Whether an operation happened at all is not an interpretation of it, and
+	// without this a working idempotency guard reports as a divergence: the guard's second claim is
+	// refused by the bus, the handler does nothing, and the refusal alone lengthens the sequence.
+	Rejected bool
+}
+
+// Compared narrows a run's effects to the ones that may decide a verdict.
+//
+// A refused operation changed nothing, so two runs that differ only in refusals did the same work.
+// Both the comparison and any position taken from it must use this same view: the gate reports an
+// ordinal WITHIN this sequence, and indexing the unfiltered one names a different effect.
+func Compared(effects []Effect) []Effect {
+	kept := make([]Effect, 0, len(effects))
+
+	for _, observed := range effects {
+		if !observed.Rejected {
+			kept = append(kept, observed)
+		}
+	}
+
+	return kept
 }
 
 // Observation is the protocol-neutral input a proxy gives the recorder.
@@ -67,6 +93,9 @@ type Observation struct {
 	Raw       string
 	Printable string
 	Kind      Kind
-	Stubbed   bool
-	OffScript bool
+	// Correlation names a reply the dependency still owes, so Reject can find this effect again when
+	// the answer arrives. Empty when the protocol gives nothing to wait for.
+	Correlation string
+	Stubbed     bool
+	OffScript   bool
 }

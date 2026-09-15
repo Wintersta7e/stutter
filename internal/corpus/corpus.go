@@ -45,17 +45,46 @@ var errServerNotReady = errors.New("embedded nats server not ready for connectio
 // is not.
 var errWrongStorage = errors.New("stream storage type is not what was requested")
 
+// Topic names the stream a corpus lives on and the subjects it holds.
+//
+// It is configurable because a corpus of a REAL service's traffic has to live where that service
+// consumes from: a provisioned consumer subscribes to its own stream by name and filter, both
+// compiled into it, and it cannot be told to read Stutter's instead.
+type Topic struct {
+	// Stream is the stream name.
+	Stream string
+	// Filter is the subject filter the stream and its replay consumers are bound to.
+	Filter string
+}
+
+// DefaultTopic is the corpus of Stutter's own making, used wherever the traffic is synthetic.
+func DefaultTopic() Topic {
+	return Topic{Stream: StreamName, Filter: subjectFilter}
+}
+
 // Corpus is an embedded NATS server holding one stream of recorded messages.
 type Corpus struct {
 	server *server.Server
 	conn   *nats.Conn
 	stream jetstream.JetStream
+	topic  Topic
+}
+
+// Topic reports which stream and subjects this corpus occupies.
+func (c *Corpus) Topic() Topic {
+	return c.topic
 }
 
 // Start brings up an embedded JetStream server and creates the corpus stream beneath storeDir.
 //
 // The caller owns the returned Corpus and must Close it.
 func Start(ctx context.Context, storeDir string) (*Corpus, error) {
+	return StartAs(ctx, storeDir, DefaultTopic())
+}
+
+// StartAs brings up a corpus on a chosen stream, for traffic belonging to a service that already
+// decided where it consumes from.
+func StartAs(ctx context.Context, storeDir string, topic Topic) (*Corpus, error) {
 	natsServer, err := server.NewServer(&server.Options{
 		ServerName: "stutter-corpus",
 		Host:       "127.0.0.1",
@@ -77,7 +106,7 @@ func Start(ctx context.Context, storeDir string) (*Corpus, error) {
 		return nil, errServerNotReady
 	}
 
-	corpus, err := connect(ctx, natsServer)
+	corpus, err := connect(ctx, natsServer, topic)
 	if err != nil {
 		shutdown(natsServer)
 
@@ -126,10 +155,10 @@ func (c *Corpus) Replay(ctx context.Context, name string, opts ConsumerOptions) 
 		pending = 1
 	}
 
-	consumer, err := c.stream.CreateOrUpdateConsumer(ctx, StreamName, jetstream.ConsumerConfig{
+	consumer, err := c.stream.CreateOrUpdateConsumer(ctx, c.topic.Stream, jetstream.ConsumerConfig{
 		Name:          name,
 		Durable:       name,
-		FilterSubject: subjectFilter,
+		FilterSubject: c.topic.Filter,
 		DeliverPolicy: jetstream.DeliverAllPolicy,
 		ReplayPolicy:  jetstream.ReplayInstantPolicy,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -156,7 +185,7 @@ func (c *Corpus) Close() {
 	shutdown(c.server)
 }
 
-func connect(ctx context.Context, natsServer *server.Server) (*Corpus, error) {
+func connect(ctx context.Context, natsServer *server.Server, topic Topic) (*Corpus, error) {
 	conn, err := nats.Connect(natsServer.ClientURL())
 	if err != nil {
 		return nil, fmt.Errorf("connect to embedded nats server: %w", err)
@@ -169,7 +198,7 @@ func connect(ctx context.Context, natsServer *server.Server) (*Corpus, error) {
 		return nil, fmt.Errorf("open jetstream context: %w", err)
 	}
 
-	created, err := stream.CreateOrUpdateStream(ctx, streamConfig())
+	created, err := stream.CreateOrUpdateStream(ctx, streamConfig(topic))
 	if err != nil {
 		conn.Close()
 
@@ -189,7 +218,7 @@ func connect(ctx context.Context, natsServer *server.Server) (*Corpus, error) {
 		return nil, fmt.Errorf("%w: wanted file, got %s", errWrongStorage, info.Config.Storage)
 	}
 
-	return &Corpus{server: natsServer, conn: conn, stream: stream}, nil
+	return &Corpus{server: natsServer, conn: conn, stream: stream, topic: topic}, nil
 }
 
 func shutdown(natsServer *server.Server) {
