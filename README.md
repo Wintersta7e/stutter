@@ -83,9 +83,9 @@ outside that will be poor.
   key/value idempotency claim, or one held behind an API call, is visible
   rather than invisible
 - A statement the database says changed nothing — an `ON CONFLICT DO NOTHING`
-  insert that conflicted, an update that matched no row, one that errored — is
-  not counted as work, so a handler made idempotent by its own SQL is not
-  reported for repeating it
+  insert that conflicted, an update that matched no row, one that errored, or
+  anything in a transaction that rolled back — is not counted as work, so a
+  handler made idempotent by its own SQL is not reported for repeating it
 - An opaque fallback for the rest: a request to an unparsed dependency is the
   run of bytes that ends when the dependency answers, which detects a repeated
   request without claiming to understand it. A finding built on one says in the
@@ -114,10 +114,10 @@ outside that will be poor.
 - Postgres is the only datastore whose effects are read as statements. Any other
   engine goes through the opaque fallback, which notices a repeated request but
   cannot say what it was
-- Two idempotent patterns can still be reported as divergence: a transaction that
-  rolls back (its statements succeeded before the rollback undid them), and a
-  dedupe guard that is a `SELECT` — the extra read on redelivery is visible, and a
-  read cannot be told apart from a function call that writes
+- A dedupe guard that only looks again on redelivery is reported as a warning,
+  not passed: the extra read is visible, and a read cannot be told apart from a
+  function call that writes. A transaction rolled back to a savepoint still
+  counts the statements it undid
 - Stub replies are configured in Go, so without provisioning every HTTP endpoint
   answers an empty JSON object. A service that pins certificates or ships its own
   certificate pool cannot reach the stub at all; that stops the run loudly rather
