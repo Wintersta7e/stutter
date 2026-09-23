@@ -34,6 +34,7 @@ type observed struct {
 	text        string
 	correlation string
 	rejected    bool
+	read        bool
 }
 
 // recorder is the Sink the proxy writes to. The proxy records from its own goroutines, so it locks.
@@ -54,6 +55,7 @@ func (r *recorder) Record(item effect.Observation) {
 		kind:        item.Kind,
 		text:        item.Raw,
 		correlation: item.Correlation,
+		read:        item.Read,
 	})
 }
 
@@ -70,6 +72,22 @@ func (r *recorder) Reject(correlation string) {
 }
 
 func (*recorder) Answered(string) {}
+
+// reads returns the text of every effect the proxy marked as a read.
+func (r *recorder) reads() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	var looked []string
+
+	for _, item := range r.entries {
+		if item.read {
+			looked = append(looked, item.text)
+		}
+	}
+
+	return looked
+}
 
 // refusals returns the text of every effect the bus declined.
 func (r *recorder) refusals() []string {

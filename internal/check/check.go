@@ -267,9 +267,10 @@ func (c *check) attempt(
 	// Every comparison and every position taken from one uses the rejected-free view: the gate
 	// reports an ordinal within the sequence it was given, so indexing a different one would name a
 	// different effect in the finding.
+	referenceEffects := effect.Compared(reference.Effects)
 	mutatedEffects := effect.Compared(mutated.Effects)
 
-	outcome := c.comparer.Compare(effect.Compared(reference.Effects), mutatedEffects)
+	outcome := c.comparer.Compare(referenceEffects, mutatedEffects)
 	if outcome.OK() {
 		return report.Divergence{}, false, nil
 	}
@@ -279,7 +280,51 @@ func (c *check) attempt(
 		return report.Divergence{}, false, err
 	}
 
-	return c.describe(outcome, mutatedEffects, fault, mutated.Clause, repro), true, nil
+	divergence := c.describe(outcome, mutatedEffects, fault, mutated.Clause, repro)
+	divergence.ReadsOnly = readsOnly(
+		forMessage(referenceEffects, outcome.Message),
+		forMessage(mutatedEffects, outcome.Message),
+	)
+
+	return divergence, true, nil
+}
+
+// readsOnly reports whether everything that differs between two runs' effects for one message is a
+// read.
+//
+// The effects are compared as multisets, not by the first difference. A guard that looks its claim
+// up again on redelivery and then does nothing adds a read and nothing else; a guard that misses adds
+// the read AND the write, and judging the first difference alone would call that one harmless too.
+func readsOnly(reference, mutated []effect.Effect) bool {
+	counts := make(map[string]int, len(reference)+len(mutated))
+	reads := make(map[string]bool, len(reference)+len(mutated))
+
+	tally := func(effects []effect.Effect, step int) {
+		for _, item := range effects {
+			key := string(item.Kind) + " " + item.Canonical
+			counts[key] += step
+			reads[key] = item.Read
+		}
+	}
+
+	tally(reference, 1)
+	tally(mutated, -1)
+
+	differs := false
+
+	for key, count := range counts {
+		if count == 0 {
+			continue
+		}
+
+		if !reads[key] {
+			return false
+		}
+
+		differs = true
+	}
+
+	return differs
 }
 
 // describe turns a comparison that failed into the divergence a report rules on.

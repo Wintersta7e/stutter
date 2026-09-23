@@ -114,6 +114,7 @@ func (r *Recorder) Record(observed Observation) {
 		Seq:        len(r.effects),
 		Stubbed:    observed.Stubbed,
 		OffScript:  observed.OffScript,
+		Read:       observed.Read,
 		Late:       !r.window.open,
 	})
 }

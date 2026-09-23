@@ -34,7 +34,10 @@ type session struct {
 	// watched on the wire cannot express a delay.
 	refuses map[policy.Fault]bool
 	// silent are messages the service takes delivery of and does nothing observable with.
-	silent      map[uint64]bool
+	silent map[uint64]bool
+	// readGuard are messages whose handler looks its claim up before writing, and looks again when the
+	// message is redelivered. Whether it writes again too is nonIdempotent's business.
+	readGuard   map[uint64]bool
 	messages    []uint64
 	resets      int
 	unstable    bool
@@ -88,7 +91,15 @@ func (s *session) Run(
 			})
 		}
 
+		if s.readGuard[seq] {
+			effects = append(effects, claimLookup(seq))
+		}
+
 		effects = append(effects, write(seq))
+
+		if s.readGuard[seq] && redelivers(mutation, seq) {
+			effects = append(effects, claimLookup(seq))
+		}
 
 		if s.repeats(mutation, seq) {
 			effects = append(effects, write(seq))
@@ -114,10 +125,11 @@ func (s *session) Run(
 }
 
 func (s *session) repeats(mutation replay.Mutation, seq uint64) bool {
-	if !s.nonIdempotent[seq] {
-		return false
-	}
+	return s.nonIdempotent[seq] && redelivers(mutation, seq)
+}
 
+// redelivers reports whether a mutation hands this message to the handler a second time.
+func redelivers(mutation replay.Mutation, seq uint64) bool {
 	switch fault := mutation.(type) {
 	case replay.Duplicate:
 		return fault.Seq == seq
@@ -125,6 +137,16 @@ func (s *session) repeats(mutation replay.Mutation, seq uint64) bool {
 		return fault.Seq == seq
 	default:
 		return false
+	}
+}
+
+// claimLookup is a read-based dedupe guard looking its claim up.
+func claimLookup(seq uint64) effect.Effect {
+	return effect.Effect{
+		Kind:       effect.KindPostgres,
+		Canonical:  fmt.Sprintf("SELECT 1 FROM processed WHERE id = %d", seq),
+		MessageSeq: seq,
+		Read:       true,
 	}
 }
 
@@ -330,6 +352,62 @@ func TestCleanRunHealthIsReported(t *testing.T) {
 	// entitled to ignore some of what it is sent.
 	if violations := result.Violations(); len(violations) != 0 {
 		t.Errorf("Violations() = %v, want none while some messages produced effects", violations)
+	}
+}
+
+// TestAGuardThatOnlyLooksAgainIsNotAFailure: a read-based dedupe guard finds its claim on redelivery
+// and does nothing else. The extra read is a real difference, so it is still reported — but a read
+// changes no data, so it warns rather than fails.
+func TestAGuardThatOnlyLooksAgainIsNotAFailure(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.nonIdempotent = nil
+	scripted.readGuard = map[uint64]bool{1: true}
+
+	opts := options(scripted)
+	opts.MaxRuns = 1
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitPass {
+		t.Errorf("ExitCode() = %d, want %d: a guard that only looked again failed\n%s", got, report.ExitPass, result)
+	}
+
+	if len(result.Findings) != 1 || result.Findings[0].Status != report.StatusWarn {
+		t.Fatalf("Findings = %+v, want one WARN for the extra read", result.Findings)
+	}
+
+	explained := slices.ContainsFunc(result.Findings[0].Reservations, func(reservation string) bool {
+		return strings.Contains(reservation, "only difference is a read")
+	})
+	if !explained {
+		t.Errorf("Reservations = %q, want the reason the read was not ruled a failure", result.Findings[0].Reservations)
+	}
+}
+
+// TestAGuardThatMissesStillFails: its FIRST difference is the extra read, and the write behind it is
+// what matters. Judging the first difference alone would call this one harmless.
+func TestAGuardThatMissesStillFails(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.readGuard = map[uint64]bool{1: true}
+
+	opts := options(scripted)
+	opts.MaxRuns = 1
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitFail {
+		t.Errorf("ExitCode() = %d, want %d: a guard that read and then wrote again was let through\n%s",
+			got, report.ExitFail, result)
 	}
 }
 

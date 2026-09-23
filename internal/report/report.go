@@ -60,6 +60,10 @@ const (
 	// the report can only say that it happened, never what it did.
 	opaqueDivergenceNote = "the diverging effect is on a protocol Stutter does not parse, so this " +
 		"names a difference it cannot describe and is not actionable as it stands"
+	// readDivergenceNote covers a divergence made only of reads: a guard looking again changes no
+	// data, unless what it read called a function that writes, and the request cannot say which.
+	readDivergenceNote = "the only difference is a read — a guard looking again changes nothing " +
+		"unless the read calls a function that writes; declare an invariant to promote or silence it"
 	// unclassifiedNote is the fallback when even the protocol is unknown.
 	unclassifiedNote = "may be acceptable — declare an invariant to silence"
 )
@@ -202,6 +206,9 @@ type Divergence struct {
 	// DivergedAt is the ordinal of the first effect that differed from the reference run, which is
 	// gate.Result.Index from the comparison that found it. Negative means the position is unknown.
 	DivergedAt int
+	// ReadsOnly means every effect that differed for the message was a read. The first differing
+	// effect alone cannot decide it: a guard that misses reads again AND writes again.
+	ReadsOnly bool
 }
 
 // Finding is a divergence this package has ruled on.
@@ -452,6 +459,10 @@ func (d Divergence) unclassifiedReason() string {
 func (d Divergence) defaultImpact() (Impact, string) {
 	switch d.DivergedKind {
 	case effect.KindPostgres:
+		if d.ReadsOnly {
+			return ImpactUnclassified, readDivergenceNote
+		}
+
 		return ImpactCorrupting, ""
 	case effect.KindSMTP:
 		return ImpactUnclassified, mailDivergenceNote

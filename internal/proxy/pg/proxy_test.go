@@ -138,6 +138,10 @@ func TestTheDatabaseSaysWhichStatementsChangedNothing(t *testing.T) {
 			t.Errorf("effect %d %q: Rejected = %v, want %v", at, observed[at].Canonical,
 				observed[at].Rejected, statement.rejected)
 		}
+
+		if read := strings.HasPrefix(statement.sql, "SELECT"); observed[at].Read != read {
+			t.Errorf("effect %d %q: Read = %v, want %v", at, observed[at].Canonical, observed[at].Read, read)
+		}
 	}
 
 	if ping := observed[len(statements)]; !ping.Rejected {

@@ -352,9 +352,26 @@ func (s *session) emit(sql string, params []string) string {
 	token := "pg/" + strconv.FormatUint(s.id, 10) + "/" + strconv.FormatUint(s.issued, 10)
 
 	text := render(sql, params)
-	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindPostgres, Correlation: token})
+	s.sink.Record(effect.Observation{
+		Raw:         text,
+		Printable:   text,
+		Kind:        effect.KindPostgres,
+		Correlation: token,
+		Read:        isRead(sql),
+	})
 
 	return token
+}
+
+// isRead reports whether a statement asks for data rather than changing it. Only the plain forms
+// qualify: a CTE can write, so WITH is not a read however it ends.
+func isRead(sql string) bool {
+	switch leadingVerb(sql) {
+	case "SELECT", "SHOW":
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *session) forwardUntyped() ([]byte, error) {

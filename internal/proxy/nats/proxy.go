@@ -416,11 +416,15 @@ func (s *session) inspect(current *frame) {
 		s.expect(correlation)
 	}
 
+	// A direct get looks a key up. It is the lookup a dedupe guard repeats on every redelivery.
+	_, lookup := splitDirectGet(current.args.subject)
+
 	s.sink.Record(effect.Observation{
 		Raw:         text,
 		Printable:   text,
 		Kind:        effect.KindNATS,
 		Correlation: correlation,
+		Read:        lookup,
 	})
 }
 

@@ -3,6 +3,7 @@ package nats_test
 import (
 	"errors"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -128,5 +129,11 @@ func TestARefusedClaimIsReportedAsRefused(t *testing.T) {
 
 	if stores := observed.matching("kv.put"); len(stores) != 0 {
 		t.Errorf("a lookup was recorded as a store: %v", stores)
+	}
+
+	// Marked as a read, too: a guard that only looked again under redelivery must not fail on the
+	// look alone.
+	if reads, lookups := observed.reads(), observed.matching("kv.get"); !slices.Equal(reads, lookups) {
+		t.Errorf("effects marked as reads = %v, want exactly the lookups %v", reads, lookups)
 	}
 }

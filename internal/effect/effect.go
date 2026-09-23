@@ -53,6 +53,10 @@ type Effect struct {
 	Stubbed bool
 	// OffScript marks a stubbed call absent from the clean run. It received the default response.
 	OffScript bool
+	// Read marks an effect that asked for data rather than changing it: a SELECT, a key/value lookup.
+	// It still takes part in comparison — a read can call a function that writes, and nothing in the
+	// request says so — but a divergence made only of reads is a guard looking again, not wrong data.
+	Read bool
 	// Late marks an effect that arrived after its message's quiesce window closed. Late effects are
 	// a determinism hazard and are reported as an anomaly, never as a divergence.
 	Late bool
@@ -98,4 +102,6 @@ type Observation struct {
 	Correlation string
 	Stubbed     bool
 	OffScript   bool
+	// Read marks a request for data rather than a change to it. See Effect.Read.
+	Read bool
 }

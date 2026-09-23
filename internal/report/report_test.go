@@ -524,6 +524,34 @@ func TestDivergentWriteFailsWithoutAnyDeclaration(t *testing.T) {
 
 // TestDefaultImpactFollowsTheDivergingProtocol pins the whole table, including the deliberate
 // asymmetry: only a datastore write is called corrupting without a declaration.
+// TestADivergenceMadeOnlyOfReadsWarns: a read changes no data unless it calls a function that writes,
+// which the request cannot show — so it is reported and explained, not failed, and a declaration
+// still has the last word.
+func TestADivergenceMadeOnlyOfReadsWarns(t *testing.T) {
+	t.Parallel()
+
+	divergence := corruptingStock()
+	divergence.ReadsOnly = true
+
+	finding := onlyFinding(t, report.New(wideScan(), heldGates(), []report.Divergence{divergence}))
+	if finding.Status != report.StatusWarn {
+		t.Errorf("Status = %q, want WARN for a divergence made only of reads", finding.Status)
+	}
+
+	if !slices.ContainsFunc(finding.Reservations, func(r string) bool { return strings.Contains(r, "a read") }) {
+		t.Errorf("Reservations = %q, want the reason a read did not fail", finding.Reservations)
+	}
+
+	divergence.Impact = report.ImpactCorrupting
+
+	if promoted := onlyFinding(
+		t,
+		report.New(wideScan(), heldGates(), []report.Divergence{divergence}),
+	); promoted.Status != report.StatusFail {
+		t.Errorf("Status = %q, want FAIL once an invariant declares the read corrupting", promoted.Status)
+	}
+}
+
 func TestDefaultImpactFollowsTheDivergingProtocol(t *testing.T) {
 	t.Parallel()
 
