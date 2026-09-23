@@ -45,6 +45,21 @@ func violatedGates() []report.GateCheck {
 	}
 }
 
+// unobservedGates is the measured false negative: a service that never connected, whose two empty
+// clean runs agree perfectly.
+func unobservedGates() []report.GateCheck {
+	return []report.GateCheck{
+		{Name: report.GateObservation, Result: gate.Observed(nil)},
+		{Name: report.GateDeterminism, Result: gate.Result{Class: gate.ClassMatch, Index: -1}},
+	}
+}
+
+func withHealth(built report.Report, health report.Health) report.Report {
+	built.Health = &health
+
+	return built
+}
+
 // corruptingStock is the planted-bug finding the concept document's example report opens with.
 //
 // It carries NO explicit Impact on purpose: a doubled write has to fail on Stutter's own authority,
@@ -149,6 +164,22 @@ func TestRenderMatchesGolden(t *testing.T) {
 			name:   "no gates were run, and the report says so",
 			golden: "no_gates",
 			built:  report.New(report.Scan{Consumers: 2, Messages: 7}, nil, nil),
+		},
+		{
+			name:   "a clean run that saw nothing is withheld, not passed",
+			golden: "unobserved",
+			built: withHealth(
+				report.New(report.Scan{Consumers: 1, Messages: 3}, unobservedGates(), nil),
+				report.Health{Messages: 3},
+			),
+		},
+		{
+			name:   "an unhealthy clean run qualifies the pass beside it",
+			golden: "unhealthy_pass",
+			built: withHealth(
+				report.New(report.Scan{Consumers: 1, Messages: 3}, heldGates(), nil),
+				report.Health{Messages: 3, Delivered: 4, Failed: 1, Effects: 5, Silent: 1, Late: 2},
+			),
 		},
 	}
 
@@ -664,6 +695,72 @@ func TestViolatedGateNamesOnlyTheGateThatFailed(t *testing.T) {
 
 	if violations[0].Name != report.GateDeterminism {
 		t.Errorf("Violations()[0].Name = %q, want %q", violations[0].Name, report.GateDeterminism)
+	}
+}
+
+// TestAnUnobservedRunIsNeverAPass is the measured false negative: three runs of a service that never
+// connected, zero effects each, and a report that read PASS.
+func TestAnUnobservedRunIsNeverAPass(t *testing.T) {
+	t.Parallel()
+
+	built := withHealth(
+		report.New(report.Scan{Consumers: 1, Messages: 3}, unobservedGates(), []report.Divergence{corruptingStock()}),
+		report.Health{Messages: 3},
+	)
+
+	if got := built.ExitCode(); got != report.ExitGateViolated {
+		t.Errorf("ExitCode() = %d, want %d (gate violated)", got, report.ExitGateViolated)
+	}
+
+	if len(built.Findings) != 0 {
+		t.Errorf("Findings = %v, want none from a run that observed nothing", built.Findings)
+	}
+
+	if rendered := built.String(); strings.Contains(rendered, "PASS") {
+		t.Errorf("a run that observed nothing rendered a PASS:\n%s", rendered)
+	}
+}
+
+// TestAnUnobservedRunSaysWhereToLook: never connecting, never consuming and never writing are three
+// different fixes, and the health counts are what tell them apart.
+func TestAnUnobservedRunSaysWhereToLook(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		want   string
+		health report.Health
+	}{
+		{
+			name:   "nothing connected",
+			health: report.Health{Messages: 3},
+			want:   "may never have connected",
+		},
+		{
+			name:   "connected, never consumed",
+			health: report.Health{Messages: 3, Setup: 4},
+			want:   "4 effects before the first delivery show the service connected",
+		},
+		{
+			name:   "consumed, touched nothing proxied",
+			health: report.Health{Messages: 3, Delivered: 3, Setup: 4},
+			want:   "took delivery and no proxy saw it do anything",
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			rendered := withHealth(
+				report.New(report.Scan{Consumers: 1, Messages: 3}, unobservedGates(), nil),
+				testCase.health,
+			).String()
+
+			if !strings.Contains(rendered, testCase.want) {
+				t.Errorf("rendered report is missing %q:\n%s", testCase.want, rendered)
+			}
+		})
 	}
 }
 

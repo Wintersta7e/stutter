@@ -1,0 +1,12 @@
+Scanned 1 consumer over 3 recorded messages.
+
+GATE  observation            violated
+      the clean run produced no effects at all, so there was nothing to compare —
+      a service that never reached its proxied dependencies reads exactly like this
+
+Clean run: 3 messages delivered 0 times, producing 0 effects.
+      Nothing reached any proxy: the service may never have connected, or may be
+      dialling its dependencies directly instead of through the addresses Stutter handed it.
+
+No findings were computed. Every comparison downstream of a violated gate is noise, so the
+report is withheld rather than qualified. This is not a test failure.

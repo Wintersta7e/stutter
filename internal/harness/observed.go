@@ -307,6 +307,7 @@ func (r *observedRun) result(clause string) replay.Result {
 		Delivered: int(r.delivered.Load()),
 		Failed:    int(r.failed.Load()),
 		Late:      r.recorder.LateCount(),
+		Setup:     r.recorder.SetupCount(),
 	}
 }
 

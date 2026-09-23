@@ -4,6 +4,8 @@
 // Determinism compares two unmutated clean runs; differential re-keying compares two clean runs
 // whose corpora were pseudonymised under different keys. A violation of either means every
 // downstream comparison is noise, so the report is withheld rather than qualified.
+//
+// Observation guards both: they compare, and a comparison of nothing with nothing always holds.
 package gate
 
 import (
@@ -31,6 +33,9 @@ const (
 	// ClassFieldDrift means the effects have identical structure and differ only in literal values.
 	// This is the one class that is Stutter's own fault: the normaliser is incomplete.
 	ClassFieldDrift Class = "field-drift"
+	// ClassUnobserved means the reference run produced no effects at all. Two empty sequences are
+	// identical, so every other gate holds over them without having compared anything.
+	ClassUnobserved Class = "unobserved"
 )
 
 // Result reports whether two effect sequences matched, and where they first diverged.
@@ -72,6 +77,9 @@ func (r Result) Describe() string {
 	case ClassDivergentSet:
 		return "different effects at " + position +
 			" — the service under test is not deterministic:\n  want: " + r.Want + "\n   got: " + r.Got
+	case ClassUnobserved:
+		return "the clean run produced no effects at all, so there was nothing to compare —\n" +
+			"a service that never reached its proxied dependencies reads exactly like this"
 	default:
 		return "unclassified gate failure at " + position
 	}
@@ -131,6 +139,20 @@ func (c *Comparer) Compare(reference, compared []effect.Effect) Result {
 			Want:    at(referenceForms, index),
 			Got:     at(comparedForms, index),
 		}
+	}
+
+	return Result{Class: ClassMatch, Index: -1}
+}
+
+// Observed checks that a clean run gave the other gates something to compare.
+//
+// Without it the gates hold vacuously: a service that never connected produces an empty sequence on
+// every run, two empty sequences are identical, and the report reads PASS for a service Stutter never
+// saw. That was measured against a real containerised service, and it is the worst answer the tool
+// can give — so an empty reference withholds the report exactly as an unstable one does.
+func Observed(reference []effect.Effect) Result {
+	if len(reference) == 0 {
+		return Result{Class: ClassUnobserved, Index: -1}
 	}
 
 	return Result{Class: ClassMatch, Index: -1}

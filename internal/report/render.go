@@ -59,6 +59,7 @@ func (r Report) lines() []string {
 	}
 
 	lines = append(lines, gatesHeldLine(r.Gates))
+	lines = append(lines, r.Health.summaryLines()...)
 
 	for _, finding := range r.Findings {
 		lines = append(lines, "")
@@ -69,6 +70,10 @@ func (r Report) lines() []string {
 		lines = append(lines, "")
 		lines = append(lines, note...)
 	}
+
+	// Beside the PASS line, because a clean run that refused messages or did nothing with some of
+	// them is above all a reason to doubt a pass.
+	lines = append(lines, r.Health.noteLines()...)
 
 	if line, shown := r.passLine(); shown {
 		lines = append(lines, "", line)
@@ -161,9 +166,88 @@ func (r Report) violationLines() []string {
 		lines = append(lines, indent(check.Result.Describe(), detailIndent)...)
 	}
 
+	// The clean run's health is the diagnosis: it is what says where to look next.
+	if summary := r.Health.summaryLines(); summary != nil {
+		lines = append(lines, "")
+		lines = append(lines, summary...)
+	}
+
+	lines = append(lines, r.Health.noteLines()...)
+
 	return append(lines, "",
 		"No findings were computed. Every comparison downstream of a violated gate is noise, so the",
 		"report is withheld rather than qualified. This is not a test failure.")
+}
+
+// summaryLines states what the clean run saw, so a verdict shows the evidence it rests on. When the
+// run saw nothing, it also says where to look: which of connecting, consuming and writing never
+// happened is the difference between a wrong address and a missing proxy.
+func (h *Health) summaryLines() []string {
+	if h == nil {
+		return nil
+	}
+
+	summary := "Clean run: " + plural(h.Messages, "message") + " delivered " + plural(h.Delivered, "time") +
+		", producing " + plural(h.Effects, "effect") + "."
+
+	if h.Effects > 0 {
+		return []string{summary}
+	}
+
+	switch {
+	case h.Delivered > 0:
+		return []string{
+			summary,
+			detailIndent + "The service took delivery and no proxy saw it do anything: check that every",
+			detailIndent + "dependency it writes to is reached through the address Stutter handed it.",
+		}
+	case h.Setup > 0:
+		return []string{
+			summary,
+			detailIndent + plural(h.Setup, "effect") + " before the first delivery show the service connected,",
+			detailIndent + "but it never took delivery of a message: check the stream and subject it consumes.",
+		}
+	default:
+		return []string{
+			summary,
+			detailIndent + "Nothing reached any proxy: the service may never have connected, or may be",
+			detailIndent + "dialling its dependencies directly instead of through the addresses Stutter handed it.",
+		}
+	}
+}
+
+// noteLines names what in the clean run undermines a verdict built on it. Each is observed signal:
+// none changes the exit code, and none is rendered when there is nothing to say.
+func (h *Health) noteLines() []string {
+	if h == nil {
+		return nil
+	}
+
+	var lines []string
+
+	if h.Failed > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+strconv.Itoa(h.Failed)+" of "+plural(h.Delivered, "delivery attempt")+
+				" failed on the clean run: a message the service refuses",
+			detailIndent+"does no work, so a fault aimed at it has nothing to repeat.")
+	}
+
+	// With no effects at all the observation gate has already said this, and louder.
+	if h.Silent > 0 && h.Effects > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+strconv.Itoa(h.Silent)+" of "+plural(h.Messages, "message")+
+				" produced no effect on the clean run: a fault aimed there",
+			detailIndent+"had nothing to repeat.")
+	}
+
+	if h.Late > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+plural(h.Late, "late effect")+" on the clean run: work that finished after"+
+				" its message's window",
+			detailIndent+"closed. Work a handler does not wait for is the likeliest source of instability.")
+	}
+
+	return lines
 }
 
 // findingLines renders one finding: the verdict line, then everything needed to act on it without

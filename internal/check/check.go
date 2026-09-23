@@ -149,15 +149,24 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 		return report.SetupFailed(err), nil
 	}
 
-	gates := []report.GateCheck{{
-		Name:   report.GateDeterminism,
-		Result: c.comparer.Compare(effect.Compared(reference.Effects), effect.Compared(repeat.Effects)),
-	}}
+	referenceEffects := effect.Compared(reference.Effects)
+
+	// Observation leads: a reference that saw nothing makes determinism hold over two empty
+	// sequences, and naming that as the violation would send the reader hunting for instability.
+	gates := []report.GateCheck{
+		{Name: report.GateObservation, Result: gate.Observed(referenceEffects)},
+		{Name: report.GateDeterminism, Result: c.comparer.Compare(referenceEffects, effect.Compared(repeat.Effects))},
+	}
+
+	health := c.health(reference, referenceEffects)
 
 	// A violated gate stops the run rather than qualifying it: every comparison past this point
 	// would be noise, and a caveated finding list is worse than none.
-	if !gates[0].Result.OK() || c.opts.GatesOnly {
-		return report.New(scan, gates, nil), nil
+	gated := report.New(scan, gates, nil)
+	gated.Health = &health
+
+	if len(gated.Violations()) > 0 || c.opts.GatesOnly {
+		return gated, nil
 	}
 
 	divergences, err := c.hunt(ctx, reference)
@@ -165,7 +174,37 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 		return report.SetupFailed(err), nil
 	}
 
-	return report.New(scan, gates, divergences), nil
+	built := report.New(scan, gates, divergences)
+	built.Health = &health
+
+	return built, nil
+}
+
+// health summarises the clean run every mutated run is compared against, from the same
+// rejected-free view the gates compared.
+func (c *check) health(reference replay.Result, compared []effect.Effect) report.Health {
+	acted := make(map[uint64]struct{}, len(c.opts.Messages))
+	for _, item := range compared {
+		acted[item.MessageSeq] = struct{}{}
+	}
+
+	silent := 0
+
+	for _, seq := range c.opts.Messages {
+		if _, did := acted[seq]; !did {
+			silent++
+		}
+	}
+
+	return report.Health{
+		Messages:  len(c.opts.Messages),
+		Delivered: reference.Delivered,
+		Failed:    reference.Failed,
+		Effects:   len(compared),
+		Silent:    silent,
+		Setup:     reference.Setup,
+		Late:      reference.Late,
+	}
 }
 
 // hunt injects every permitted fault against every message, within the run budget.
@@ -423,6 +462,8 @@ func summarise(outcome gate.Result) string {
 		return "the same work happened with different values"
 	case gate.ClassMatch:
 		return "no divergence"
+	case gate.ClassUnobserved:
+		return "nothing was observed to compare"
 	default:
 		return "the effect sequence differed"
 	}

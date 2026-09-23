@@ -32,11 +32,15 @@ type session struct {
 	stubbedGuard  map[uint64]bool
 	// refuses are the faults this session cannot express against the service it drives, as a run
 	// watched on the wire cannot express a delay.
-	refuses     map[policy.Fault]bool
+	refuses map[policy.Fault]bool
+	// silent are messages the service takes delivery of and does nothing observable with.
+	silent      map[uint64]bool
 	messages    []uint64
 	resets      int
 	unstable    bool
 	failOnReset bool
+	// refusesAll marks every effect as refused by its dependency, so nothing it does changes anything.
+	refusesAll bool
 }
 
 func newSession() *session {
@@ -71,6 +75,10 @@ func (s *session) Run(
 	var effects []effect.Effect
 
 	for _, seq := range s.scope(retain) {
+		if s.silent[seq] {
+			continue
+		}
+
 		if s.stubbedGuard[seq] {
 			effects = append(effects, effect.Effect{
 				Kind:       effect.KindHTTP,
@@ -96,7 +104,13 @@ func (s *session) Run(
 		})
 	}
 
-	return replay.Result{Effects: effects, Clause: "AckPolicy: explicit", Delivered: len(retain)}, nil
+	if s.refusesAll {
+		for index := range effects {
+			effects[index].Rejected = true
+		}
+	}
+
+	return replay.Result{Effects: effects, Clause: "AckPolicy: explicit", Delivered: len(s.scope(retain))}, nil
 }
 
 func (s *session) repeats(mutation replay.Mutation, seq uint64) bool {
@@ -239,6 +253,83 @@ func TestViolatedGateStopsTheRun(t *testing.T) {
 
 	if len(result.Violations()) != 1 {
 		t.Errorf("Violations() = %d, want 1", len(result.Violations()))
+	}
+}
+
+// TestACleanRunThatSawNothingIsWithheld is the measured false negative: a service that never reached
+// its proxies produced two empty clean runs, determinism held over nothing, and the report read PASS.
+func TestACleanRunThatSawNothingIsWithheld(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		configure func(*session)
+		name      string
+	}{
+		{
+			name:      "no effects at all",
+			configure: func(s *session) { s.silent = map[uint64]bool{1: true, 2: true, 3: true} },
+		},
+		{
+			// A refused operation changed nothing, so a run made only of refusals compared nothing.
+			name:      "every effect refused",
+			configure: func(s *session) { s.refusesAll = true },
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			scripted := newSession()
+			testCase.configure(scripted)
+
+			result, err := check.Run(t.Context(), scripted, options(scripted))
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+
+			if got := result.ExitCode(); got != report.ExitGateViolated {
+				t.Errorf("ExitCode() = %d, want %d (gate violated)", got, report.ExitGateViolated)
+			}
+
+			violations := result.Violations()
+			if len(violations) != 1 || violations[0].Name != report.GateObservation {
+				t.Errorf("Violations() = %v, want only %q", violations, report.GateObservation)
+			}
+
+			// The gate stops the check before any fault is spent on a service nobody saw.
+			if len(scripted.names) != 2 {
+				t.Errorf("ran %v, want only the reference pair", scripted.names)
+			}
+		})
+	}
+}
+
+// TestCleanRunHealthIsReported keeps the counts a verdict rests on beside the verdict.
+func TestCleanRunHealthIsReported(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.silent = map[uint64]bool{3: true}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Health == nil {
+		t.Fatal("Health = nil, want the clean run's counts")
+	}
+
+	want := report.Health{Messages: 3, Delivered: 3, Effects: 2, Silent: 1}
+	if *result.Health != want {
+		t.Errorf("Health = %+v, want %+v", *result.Health, want)
+	}
+
+	// A message that did nothing is not a reason to withhold the report: a handler that filters is
+	// entitled to ignore some of what it is sent.
+	if violations := result.Violations(); len(violations) != 0 {
+		t.Errorf("Violations() = %v, want none while some messages produced effects", violations)
 	}
 }
 

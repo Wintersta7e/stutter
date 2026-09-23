@@ -159,3 +159,20 @@ func TestDescribeNamesThePosition(t *testing.T) {
 		t.Errorf("Describe() = %q, want it to contain %q", got.Describe(), want)
 	}
 }
+
+// TestObservedRefusesAnEmptyReference: two empty sequences compare equal, so an empty reference is
+// the one input on which every comparison holds and proves nothing.
+func TestObservedRefusesAnEmptyReference(t *testing.T) {
+	t.Parallel()
+
+	for _, empty := range [][]effect.Effect{nil, {}} {
+		got := gate.Observed(empty)
+		if got.OK() || got.Class != gate.ClassUnobserved {
+			t.Errorf("Observed(%v) = %#v, want %q", empty, got, gate.ClassUnobserved)
+		}
+	}
+
+	if got := gate.Observed(seq("UPDATE stock")); !got.OK() {
+		t.Errorf("Observed(one effect) = %#v, want the gate held", got)
+	}
+}

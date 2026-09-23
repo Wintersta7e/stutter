@@ -1,0 +1,14 @@
+Scanned 1 consumer over 3 recorded messages.
+Gates held: determinism, differential re-keying.
+Clean run: 3 messages delivered 4 times, producing 5 effects.
+
+NOTE  1 of 4 delivery attempts failed on the clean run: a message the service refuses
+      does no work, so a fault aimed at it has nothing to repeat.
+
+NOTE  1 of 3 messages produced no effect on the clean run: a fault aimed there
+      had nothing to repeat.
+
+NOTE  2 late effects on the clean run: work that finished after its message's window
+      closed. Work a handler does not wait for is the likeliest source of instability.
+
+PASS  1 consumer

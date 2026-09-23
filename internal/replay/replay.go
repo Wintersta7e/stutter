@@ -235,6 +235,9 @@ type Result struct {
 	Failed int
 	// Late counts effects that arrived after their attribution window closed.
 	Late int
+	// Setup counts effects observed before the first delivery. When a run saw nothing else, it is
+	// what tells a service that never connected from one that connected and never consumed.
+	Setup int
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.
@@ -353,6 +356,7 @@ func (r *Runner) Run(
 
 	result.Effects = recorder.Effects()
 	result.Late = recorder.LateCount()
+	result.Setup = recorder.SetupCount()
 
 	return result, nil
 }

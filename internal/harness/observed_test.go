@@ -269,8 +269,8 @@ func TestObservedServiceIsFaultedOnTheWire(t *testing.T) {
 		t.Fatal("no fault was injected, so the finding proves nothing")
 	}
 
-	if len(result.Gates) != 1 || !result.Gates[0].Result.OK() {
-		t.Fatalf("the determinism gate did not hold for an undriven service:\n%s", result)
+	if len(result.Gates) == 0 || len(result.Violations()) != 0 {
+		t.Fatalf("the gates did not hold for an undriven service:\n%s", result)
 	}
 
 	if len(result.Findings) != 1 {
@@ -368,5 +368,66 @@ func TestAScopedObservedRunFaultsTheRecordedSequence(t *testing.T) {
 		if !strings.Contains(observed.Printable, "ORD-WIRE-2") {
 			t.Errorf("effect %d = %q, want the retained message's order", at, observed.Printable)
 		}
+	}
+}
+
+// absent is a service that started and never connected to anything, as a container handed an
+// address it cannot reach does.
+type absent struct{}
+
+func (absent) Close(context.Context) {}
+
+// TestAServiceThatNeverConnectedIsNotPassed is the false negative measured against a real container:
+// it never reached a proxy, three runs saw zero effects each, determinism held over two empty
+// sequences, and the report read PASS for a service Stutter never saw.
+func TestAServiceThatNeverConnectedIsNotPassed(t *testing.T) {
+	t.Parallel()
+
+	store, err := corpus.Start(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("corpus.Start() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	seq, err := store.Publish(t.Context(), toy.SubjectOrderCreated, orderPayload("ORD-ABSENT-1", "WIDGET-WIRE"))
+	if err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	config := observedConfig()
+
+	built, err := harness.New(harness.Config{
+		Corpus:  store,
+		HashKey: make([]byte, hashKeyLen),
+		Policy:  config,
+		Quiesce: toy.DefaultQuiesce,
+		// Nothing will ever arrive, so waiting out the derived redelivery horizon proves nothing more.
+		Drain: fetchWait,
+		Start: func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
+	})
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	result, err := check.Run(t.Context(), built, check.Options{
+		Messages: []uint64{seq},
+		Consumer: observedConsumer,
+		Config:   config,
+	})
+	if err != nil {
+		t.Fatalf("check.Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitGateViolated {
+		t.Fatalf("ExitCode() = %d, want %d (gate violated):\n%s", got, report.ExitGateViolated, result)
+	}
+
+	if violations := result.Violations(); len(violations) != 1 || violations[0].Name != report.GateObservation {
+		t.Errorf("Violations() = %v, want only %q", violations, report.GateObservation)
+	}
+
+	if want := "may never have connected"; !strings.Contains(result.String(), want) {
+		t.Errorf("report does not say where to look (%q):\n%s", want, result)
 	}
 }

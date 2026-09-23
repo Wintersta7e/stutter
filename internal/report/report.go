@@ -116,6 +116,9 @@ const (
 type Gate string
 
 const (
+	// GateObservation is the clean run having produced any effect at all. Every other gate compares
+	// sequences, and two empty ones are identical, so without it they hold for a service never seen.
+	GateObservation Gate = "observation"
 	// GateDeterminism is two unmutated clean runs compared against each other.
 	GateDeterminism Gate = "determinism"
 	// GateRekeying is two clean runs over corpora pseudonymised under different keys.
@@ -136,6 +139,29 @@ type Scan struct {
 	Consumers int
 	// Messages is how many recorded messages were replayed into them.
 	Messages int
+}
+
+// Health is what the clean reference run saw, before any fault was injected.
+//
+// A verdict is only as good as the run it is compared against. A service rejecting the corpus, or
+// never reaching its dependencies at all, produces a clean run that agrees with itself perfectly and
+// proves nothing — and the gates cannot tell, because they compare the clean run only with itself.
+type Health struct {
+	// Messages is how many recorded messages the run was given.
+	Messages int
+	// Delivered counts deliveries, redeliveries included.
+	Delivered int
+	// Failed counts deliveries the handler returned an error for or the service negatively
+	// acknowledged: both are the service refusing a message.
+	Failed int
+	// Effects counts the effects that may decide a verdict.
+	Effects int
+	// Silent counts messages that produced none of them.
+	Silent int
+	// Setup counts effects observed before the first delivery, which belong to no message.
+	Setup int
+	// Late counts effects that arrived after their message's window closed.
+	Late int
 }
 
 // Divergence is one mutated run that behaved differently from the reference run.
@@ -213,6 +239,8 @@ type Finding struct {
 type Report struct {
 	// Setup is non-nil when the run never started, in which case nothing else here is meaningful.
 	Setup error
+	// Health is the clean run's, rendered beside the verdict it qualifies. Nil when not measured.
+	Health *Health
 	// Gates are the checks that ran. A report naming no gates claims none ran.
 	Gates []GateCheck
 	// Findings are the divergences that were ruled on. Always empty when a gate was violated.
