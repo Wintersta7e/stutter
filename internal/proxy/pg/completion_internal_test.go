@@ -37,10 +37,21 @@ func answered(msgType byte, tag string) step {
 	return step{answer: msgType, tag: tag}
 }
 
+// ready is a ReadyForQuery reporting a transaction status. The runner appends a NUL to every answer;
+// a status byte is read from the front, so the extra byte is harmless.
+func ready(status byte) step {
+	return answered(msgReadyForQuery, string(status))
+}
+
+// idle is a ReadyForQuery outside any transaction block.
+func idle() step {
+	return ready(txIdle)
+}
+
 // afterStartup prefixes the ReadyForQuery that ends every connection's startup, as a real connection
 // has before its first request.
 func afterStartup(steps ...step) []step {
-	return append([]step{answered(msgReadyForQuery, "")}, steps...)
+	return append([]step{idle()}, steps...)
 }
 
 func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
@@ -50,6 +61,10 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 		upsert = "-- name: InsertStat :exec\nINSERT INTO stats VALUES ($1) ON CONFLICT DO NOTHING"
 		cte    = "WITH moved AS (SELECT 1 AS id) INSERT INTO stats (id) SELECT id FROM moved"
 		purge  = "DELETE FROM stock"
+		// Token names, and "begin" doubles as the statement it names.
+		first = "first"
+		claim = "claim"
+		begin = "begin"
 	)
 
 	cases := []struct {
@@ -61,19 +76,19 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 		{
 			name: "an insert that conflicted changed nothing; one that inserted did",
 			steps: afterStartup(
-				sent(requestExecute, "first", upsert), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "INSERT 0 1"), answered(msgReadyForQuery, ""),
+				sent(requestExecute, first, upsert), sent(requestSync, "", ""),
+				answered(msgCommandComplete, "INSERT 0 1"), idle(),
 				sent(requestExecute, "again", upsert), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "INSERT 0 0"), answered(msgReadyForQuery, ""),
+				answered(msgCommandComplete, "INSERT 0 0"), idle(),
 			),
 			rejected: []string{"again"},
-			answered: []string{"first"},
+			answered: []string{first},
 		},
 		{
 			name: "a ping is an empty query",
 			steps: afterStartup(
 				sent(requestSimple, "ping", "-- ping"),
-				answered(msgEmptyQuery, ""), answered(msgReadyForQuery, ""),
+				answered(msgEmptyQuery, ""), idle(),
 			),
 			rejected: []string{"ping"},
 		},
@@ -81,7 +96,7 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 			name: "a read that found nothing still happened",
 			steps: afterStartup(
 				sent(requestExecute, "read", "SELECT qty FROM stock"), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "SELECT 0"), answered(msgReadyForQuery, ""),
+				answered(msgCommandComplete, "SELECT 0"), idle(),
 			),
 			answered: []string{"read"},
 		},
@@ -90,19 +105,19 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 			name: "a writing CTE is not matched to its tag",
 			steps: afterStartup(
 				sent(requestExecute, "cte", cte), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "INSERT 0 0"), answered(msgReadyForQuery, ""),
+				answered(msgCommandComplete, "INSERT 0 0"), idle(),
 			),
 			answered: []string{"cte"},
 		},
 		{
 			name: "an error refuses its statement and everything skipped behind it",
 			steps: afterStartup(
-				sent(requestExecute, "claim", "INSERT INTO processed VALUES ($1)"),
+				sent(requestExecute, claim, "INSERT INTO processed VALUES ($1)"),
 				sent(requestExecute, "work", "UPDATE stock SET qty = qty - 1"),
 				sent(requestSync, "", ""),
-				answered(msgErrorResponse, ""), answered(msgReadyForQuery, ""),
+				answered(msgErrorResponse, ""), idle(),
 			),
-			rejected: []string{"claim", "work"},
+			rejected: []string{claim, "work"},
 		},
 		{
 			// Only the first statement can be matched to its tag; a second answer counts as a change.
@@ -110,7 +125,7 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 			steps: afterStartup(
 				sent(requestSimple, "multi", "DELETE FROM a; INSERT INTO b VALUES (1)"),
 				answered(msgCommandComplete, "DELETE 0"), answered(msgCommandComplete, "INSERT 0 1"),
-				answered(msgReadyForQuery, ""),
+				idle(),
 			),
 			answered: []string{"multi"},
 		},
@@ -119,7 +134,7 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 			steps: afterStartup(
 				answered(msgCommandComplete, "DELETE 0"),
 				sent(requestExecute, "after", purge), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "DELETE 0"), answered(msgReadyForQuery, ""),
+				answered(msgCommandComplete, "DELETE 0"), idle(),
 			),
 			answered: []string{"after"},
 		},
@@ -127,17 +142,71 @@ func TestAStatementThatChangedNothingIsRefused(t *testing.T) {
 			// Read as an answer, it would have broken the pairing before the first statement.
 			name: "the ReadyForQuery that ends startup settles nothing",
 			steps: afterStartup(
-				sent(requestExecute, "first", purge), sent(requestSync, "", ""),
-				answered(msgCommandComplete, "DELETE 0"), answered(msgReadyForQuery, ""),
+				sent(requestExecute, first, purge), sent(requestSync, "", ""),
+				answered(msgCommandComplete, "DELETE 0"), idle(),
 			),
-			rejected: []string{"first"},
+			rejected: []string{first},
+		},
+		{
+			// A unique-index dedupe guard under redelivery: the claim is refused and the handler rolls
+			// back. BEGIN answered success, but the transaction it opened changed nothing.
+			name: "a transaction that rolled back changed nothing, BEGIN and ROLLBACK included",
+			steps: afterStartup(
+				sent(requestSimple, begin, begin),
+				answered(msgCommandComplete, "BEGIN"), ready(txOpen),
+				sent(requestExecute, claim, "INSERT INTO processed VALUES ($1)"), sent(requestSync, "", ""),
+				answered(msgErrorResponse, ""), ready(txFailed),
+				sent(requestSimple, "rollback", "rollback"),
+				answered(msgCommandComplete, "ROLLBACK"), idle(),
+			),
+			rejected: []string{begin, claim, "rollback"},
+		},
+		{
+			name: "a committed transaction keeps each statement's own verdict",
+			steps: afterStartup(
+				sent(requestSimple, begin, begin),
+				answered(msgCommandComplete, "BEGIN"), ready(txOpen),
+				sent(requestExecute, claim, "INSERT INTO processed VALUES ($1) ON CONFLICT DO NOTHING"),
+				sent(requestSync, "", ""),
+				answered(msgCommandComplete, "INSERT 0 1"), ready(txOpen),
+				sent(requestExecute, "stale", purge), sent(requestSync, "", ""),
+				answered(msgCommandComplete, "DELETE 0"), ready(txOpen),
+				sent(requestSimple, "commit", "commit"),
+				answered(msgCommandComplete, "COMMIT"), idle(),
+			),
+			rejected: []string{"stale"},
+			answered: []string{begin, claim, "commit"},
+		},
+		{
+			name: "a COMMIT of a failed transaction is a rollback",
+			steps: afterStartup(
+				sent(requestSimple, begin, begin),
+				answered(msgCommandComplete, "BEGIN"), ready(txOpen),
+				sent(requestExecute, claim, "INSERT INTO processed VALUES ($1)"), sent(requestSync, "", ""),
+				answered(msgErrorResponse, ""), ready(txFailed),
+				sent(requestSimple, "commit", "commit"),
+				answered(msgCommandComplete, "ROLLBACK"), idle(),
+			),
+			rejected: []string{begin, claim, "commit"},
+		},
+		{
+			// With no explicit transaction a batch is one implicit transaction, and an error in it takes
+			// the statements that already succeeded down with it.
+			name: "an error undoes the implicit transaction of its batch",
+			steps: afterStartup(
+				sent(requestExecute, first, "INSERT INTO ledger VALUES ($1)"),
+				sent(requestExecute, "second", "INSERT INTO processed VALUES ($1)"),
+				sent(requestSync, "", ""),
+				answered(msgCommandComplete, "INSERT 0 1"), answered(msgErrorResponse, ""), idle(),
+			),
+			rejected: []string{first, "second"},
 		},
 		{
 			name: "a request queued before startup ended stops the pairing",
 			steps: []step{
 				sent(requestExecute, "early", purge), sent(requestSync, "", ""),
-				answered(msgReadyForQuery, ""),
-				answered(msgCommandComplete, "DELETE 0"), answered(msgReadyForQuery, ""),
+				idle(),
+				answered(msgCommandComplete, "DELETE 0"), idle(),
 			},
 			answered: []string{"early"},
 		},

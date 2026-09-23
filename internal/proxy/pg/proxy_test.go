@@ -147,3 +147,74 @@ func TestTheDatabaseSaysWhichStatementsChangedNothing(t *testing.T) {
 		)
 	}
 }
+
+// TestARolledBackTransactionChangedNothing is a unique-index dedupe guard as a real client runs it: on
+// redelivery the claim is refused and the transaction rolled back, so BEGIN, the claim and the
+// ROLLBACK changed nothing, while a transaction that committed keeps its work counted.
+func TestARolledBackTransactionChangedNothing(t *testing.T) {
+	t.Parallel()
+
+	conn, recorder := through(t)
+
+	table := "rollback_" + strings.ToLower(t.Name())
+
+	for _, setup := range []string{
+		"DROP TABLE IF EXISTS " + table,
+		"CREATE TABLE " + table + " (id int PRIMARY KEY)",
+	} {
+		if _, err := conn.Exec(t.Context(), setup); err != nil {
+			t.Fatalf("%s: %v", setup, err)
+		}
+	}
+
+	t.Cleanup(func() {
+		if _, err := conn.Exec(context.Background(), "DROP TABLE IF EXISTS "+table); err != nil {
+			t.Errorf("drop %s: %v", table, err)
+		}
+	})
+
+	recorder.Open("probe", 1, nil)
+
+	claim := "INSERT INTO " + table + " (id) VALUES ($1)"
+
+	// First delivery: the claim succeeds and the transaction commits.
+	committed, err := conn.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+
+	if _, claimErr := committed.Exec(t.Context(), claim, 1); claimErr != nil {
+		t.Fatalf("first claim: %v", claimErr)
+	}
+
+	if commitErr := committed.Commit(t.Context()); commitErr != nil {
+		t.Fatalf("Commit() error = %v", commitErr)
+	}
+
+	wrote := len(recorder.Effects())
+
+	// Redelivery: the claim violates the key and the handler rolls back.
+	undone, err := conn.Begin(t.Context())
+	if err != nil {
+		t.Fatalf("Begin() error = %v", err)
+	}
+
+	if _, err := undone.Exec(t.Context(), claim, 1); err == nil {
+		t.Fatal("the second claim succeeded; the guard under test never refused anything")
+	}
+
+	if err := undone.Rollback(t.Context()); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+
+	observed := recorder.Effects()
+	if wrote == 0 || len(observed) == wrote {
+		t.Fatalf("recorded %d effects for the commit and %d in all; the proxy saw too little", wrote, len(observed))
+	}
+
+	for at, item := range observed {
+		if want := at >= wrote; item.Rejected != want {
+			t.Errorf("effect %d %q: Rejected = %v, want %v", at, item.Canonical, item.Rejected, want)
+		}
+	}
+}

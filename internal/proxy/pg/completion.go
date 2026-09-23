@@ -19,6 +19,17 @@ const (
 	msgReadyForQuery   = 'Z'
 )
 
+// Transaction status, the one byte a ReadyForQuery carries.
+const (
+	txIdle   = 'I'
+	txOpen   = 'T'
+	txFailed = 'E'
+)
+
+// tagRollback is the completion tag of a transaction that was undone — by ROLLBACK, and by a COMMIT
+// the server refused because the transaction had already failed.
+const tagRollback = "ROLLBACK"
+
 // request is what a client asked the server to do, in the order it asked.
 type request int
 
@@ -50,6 +61,12 @@ type awaited struct {
 	failed         bool
 }
 
+// verdict is what the database said of one statement, held until its transaction's outcome is known.
+type verdict struct {
+	token          string
+	nothingChanged bool
+}
+
 // completions pairs each statement with the server's answer to it, to learn whether it changed
 // anything.
 //
@@ -59,17 +76,30 @@ type awaited struct {
 // that insert was reported as a double write. The answer is read to learn WHETHER the statement
 // changed something, never to interpret it.
 //
+// A statement's own answer is not the last word: one that succeeded inside a transaction that then
+// rolled back changed nothing after all. A dedupe guard built on a unique index does exactly that
+// under redelivery — BEGIN, a refused claim, ROLLBACK — so every verdict is held until the
+// transaction it ran in is over.
+//
 // Postgres answers strictly in request order on a connection, so a queue is enough. Anything that
 // breaks the pairing stops it for the rest of the connection: every statement is then answered as
 // having changed something, because hiding a write that happened would be a false clean.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type completions struct {
 	sink  Sink
 	queue []awaited
+	// held are verdicts on statements whose transaction has not ended.
+	held []verdict
+	mu   sync.Mutex
 	// started is set by the ReadyForQuery that ends connection startup. It answers no request, and a
 	// client may not send one before it, so it is the one ReadyForQuery with nothing to settle.
 	started bool
-	broken  bool
-	mu      sync.Mutex
+	// rolledBack and errored are what the answers since the last ReadyForQuery said about the
+	// transaction in progress.
+	rolledBack bool
+	errored    bool
+	broken     bool
 }
 
 // expect queues a request the client has just sent. It runs before the request is forwarded, so its
@@ -99,6 +129,10 @@ func (c *completions) settle(msgType byte, body []byte) {
 	switch msgType {
 	case msgCommandComplete:
 		tag, _ := (&reader{buf: body}).cstring()
+		if first, _, _ := strings.Cut(tag, " "); first == tagRollback {
+			c.rolledBack = true
+		}
+
 		c.complete(changedNothing(tag))
 	case msgEmptyQuery:
 		// An empty query has no verb and no tag; it did nothing by construction.
@@ -106,9 +140,10 @@ func (c *completions) settle(msgType byte, body []byte) {
 	case msgPortalSuspended:
 		c.complete(func(string) bool { return false })
 	case msgErrorResponse:
+		c.errored = true
 		c.fail()
 	case msgReadyForQuery:
-		c.ready()
+		c.ready(body)
 	default:
 		// Rows, descriptions, notices and parse or bind acknowledgements settle nothing.
 	}
@@ -127,12 +162,7 @@ func (c *completions) complete(nothing func(verb string) bool) {
 
 	switch head.kind {
 	case requestExecute:
-		if nothing(head.verb) {
-			c.refuse(head.token)
-		} else {
-			c.answer(head.token)
-		}
-
+		c.hold(head.token, nothing(head.verb))
 		c.queue = c.queue[1:]
 	case requestSimple:
 		// A multi-statement query cannot be matched verb for verb, so only its first answer is judged
@@ -157,7 +187,7 @@ func (c *completions) fail() {
 
 	switch head.kind {
 	case requestExecute:
-		c.refuse(head.token)
+		c.hold(head.token, true)
 		c.queue = c.queue[1:]
 	case requestSimple, requestCall:
 		head.failed = true
@@ -170,9 +200,9 @@ func (c *completions) fail() {
 	}
 }
 
-// ready settles everything a ReadyForQuery closes: a simple query or function call, or an extended
-// batch up to and including its Sync. An Execute still waiting there was skipped after an error.
-func (c *completions) ready() {
+// ready settles everything a ReadyForQuery closes — a simple query or function call, or an extended
+// batch up to and including its Sync — and then reads the transaction status it reports.
+func (c *completions) ready(body []byte) {
 	if !c.started {
 		c.started = true
 
@@ -194,12 +224,7 @@ func (c *completions) ready() {
 
 	switch head.kind {
 	case requestSimple:
-		if head.failed || (head.answers == 1 && head.nothingChanged) {
-			c.refuse(head.token)
-		} else {
-			c.answer(head.token)
-		}
-
+		c.hold(head.token, head.failed || (head.answers == 1 && head.nothingChanged))
 		c.queue = c.queue[1:]
 	case requestCall:
 		c.queue = c.queue[1:]
@@ -207,6 +232,10 @@ func (c *completions) ready() {
 		c.closeBatch()
 	default:
 		// Every request kind is listed above.
+	}
+
+	if !c.broken {
+		c.conclude(body)
 	}
 }
 
@@ -220,10 +249,49 @@ func (c *completions) closeBatch() {
 			return
 		}
 
-		c.refuse(next.token)
+		c.hold(next.token, true)
 	}
 
 	c.breakPairing()
+}
+
+// conclude releases the held verdicts once the transaction they ran in is over.
+//
+// Back at idle, the transaction either committed — each statement keeps its own verdict — or was
+// undone: rolled back explicitly, committed after failing, or an implicit transaction that hit an
+// error, which takes every statement since the last idle point with it. Still inside a transaction
+// block, its outcome is yet to come and the verdicts stay held.
+func (c *completions) conclude(body []byte) {
+	var status byte
+	if len(body) > 0 {
+		status = body[0]
+	}
+
+	undone := c.rolledBack || c.errored
+	c.rolledBack, c.errored = false, false
+
+	switch status {
+	case txIdle:
+		for _, held := range c.held {
+			if undone || held.nothingChanged {
+				c.refuse(held.token)
+			} else {
+				c.answer(held.token)
+			}
+		}
+
+		c.held = nil
+	case txOpen, txFailed:
+		// The transaction is still open. An error inside it leaves it failed, and whatever ends it
+		// will answer ROLLBACK.
+	default:
+		c.breakPairing()
+	}
+}
+
+// hold keeps a statement's verdict until its transaction is over.
+func (c *completions) hold(token string, nothingChanged bool) {
+	c.held = append(c.held, verdict{token: token, nothingChanged: nothingChanged})
 }
 
 // refuse marks a recorded statement as having changed nothing.
@@ -241,15 +309,20 @@ func (c *completions) answer(token string) {
 }
 
 // breakPairing gives up on the connection: an answer arrived that no request accounts for, so every
-// later pairing would be a guess. What is still waiting is treated as having changed something.
+// later pairing would be a guess. Everything still waiting or held is treated as having changed
+// something.
 func (c *completions) breakPairing() {
 	c.broken = true
+
+	for _, held := range c.held {
+		c.answer(held.token)
+	}
 
 	for _, waiting := range c.queue {
 		c.answer(waiting.token)
 	}
 
-	c.queue = nil
+	c.held, c.queue = nil, nil
 }
 
 // changedNothing reads a completion tag: INSERT, UPDATE, DELETE and MERGE report how many rows they
