@@ -61,8 +61,10 @@ smallest message sequence that still reproduces it.
 ## Status
 
 **Pre-alpha, and a personal project.** It runs end to end against its own
-reference consumer and finds the bug planted there. It cannot yet be pointed at
-your service.
+reference consumer and finds the bug planted there. Driven from Go, it has also
+been run against a third-party service in its own container, where it failed the
+handler that double-counts under redelivery and passed the idempotent one beside
+it. It cannot yet be pointed at your service from the command line.
 
 Built to explore the idea rather than to be adopted: clone it, take it apart,
 lift whatever is useful. There is no roadmap commitment, no support, and it is
@@ -80,6 +82,10 @@ outside that will be poor.
   outbound HTTP, and any dependency on a protocol it cannot parse — so a
   key/value idempotency claim, or one held behind an API call, is visible
   rather than invisible
+- A statement the database says changed nothing — an `ON CONFLICT DO NOTHING`
+  insert that conflicted, an update that matched no row, one that errored — is
+  not counted as work, so a handler made idempotent by its own SQL is not
+  reported for repeating it
 - An opaque fallback for the rest: a request to an unparsed dependency is the
   run of bytes that ends when the dependency answers, which detects a repeated
   request without claiming to understand it. A finding built on one says in the
@@ -108,6 +114,10 @@ outside that will be poor.
 - Postgres is the only datastore whose effects are read as statements. Any other
   engine goes through the opaque fallback, which notices a repeated request but
   cannot say what it was
+- Two idempotent patterns can still be reported as divergence: a transaction that
+  rolls back (its statements succeeded before the rollback undid them), and a
+  dedupe guard that is a `SELECT` — the extra read on redelivery is visible, and a
+  read cannot be told apart from a function call that writes
 - Stub replies are configured in Go, so without provisioning every HTTP endpoint
   answers an empty JSON object. A service that pins certificates or ships its own
   certificate pool cannot reach the stub at all; that stops the run loudly rather
