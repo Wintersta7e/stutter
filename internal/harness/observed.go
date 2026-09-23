@@ -187,9 +187,15 @@ type observedRun struct {
 	// recorded translates a sequence the rebuilt stream is using back to the one the message was
 	// recorded under.
 	recorded map[uint64]uint64
+	// began anchors activity to the monotonic clock. A wall-clock timestamp will not do: measured on
+	// WSL2, the wall clock steps forward by one to two seconds every thirty, and a step inside the drain
+	// period ends the run before a withheld acknowledgement's redelivery arrives — a clean sequence
+	// reported for a fault that never got to land.
+	began time.Time
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
-	stream    string
+	stream string
+	// activity is when the bus was last active, as an offset from began.
 	activity  atomic.Int64
 	delivered atomic.Int64
 	failed    atomic.Int64
@@ -213,6 +219,7 @@ func newObservedRun(
 		windows:  &windows{recorder: recorder, consumer: consumer, quiesce: quiesce},
 		recorder: recorder,
 		recorded: recorded,
+		began:    time.Now(),
 		stream:   stream,
 	}
 
@@ -283,7 +290,7 @@ func (r *observedRun) awaitQuiet(ctx context.Context, drain time.Duration) error
 		case <-ctx.Done():
 			return fmt.Errorf("observed run cancelled before the bus went quiet: %w", ctx.Err())
 		case <-ticker.C:
-			if time.Since(r.lastActivity()) >= drain {
+			if r.silence() >= drain {
 				return nil
 			}
 		}
@@ -325,11 +332,12 @@ func (r *observedRun) sequence(staged uint64) uint64 {
 }
 
 func (r *observedRun) touch() {
-	r.activity.Store(time.Now().UnixNano())
+	r.activity.Store(int64(time.Since(r.began)))
 }
 
-func (r *observedRun) lastActivity() time.Time {
-	return time.Unix(0, r.activity.Load())
+// silence is how long the bus has been quiet, measured on the monotonic clock.
+func (r *observedRun) silence() time.Duration {
+	return time.Since(r.began) - time.Duration(r.activity.Load())
 }
 
 // windows attributes effects to the message in flight for a service that pulls for itself.
