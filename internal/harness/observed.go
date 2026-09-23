@@ -179,6 +179,14 @@ func (s *Sandbox) begin(
 		}
 	}
 
+	// One message in flight, whatever batch the service asks for: across two connections, the order the
+	// proxy sees an acknowledgement and the next message's write is not the order they happened in.
+	if slices.Contains(consumers, target) {
+		if err := s.cfg.Corpus.Serialise(ctx, target); err != nil {
+			return fmt.Errorf("serialise the consumer under test: %w", err)
+		}
+	}
+
 	run.scope(target)
 
 	if err := s.cfg.Corpus.Fill(ctx, messages); err != nil {

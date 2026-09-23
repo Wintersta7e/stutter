@@ -176,6 +176,43 @@ func (c *Corpus) Pause(ctx context.Context, consumer string) error {
 	return nil
 }
 
+// Serialise limits a consumer on the corpus stream to one unacknowledged message at a time.
+//
+// Attribution needs one message in flight, and a service that pulls for itself picks its own batch.
+// With several delivered at once, the order the proxy sees them settle in is not the order the service
+// worked in: measured on a real target, the acknowledgement of one message — a buffered publish on the
+// bus connection — reached the proxy after the next message's write on the database connection, so
+// every effect was attributed one message early. With one in flight the server cannot deliver the next
+// message until the previous acknowledgement has reached it, through the proxy.
+//
+// It changes the run, not the verdict's licence: which faults are legal is still read off the
+// recorded configuration.
+func (c *Corpus) Serialise(ctx context.Context, consumer string) error {
+	stream, err := c.stream.Stream(ctx, c.topic.Stream)
+	if err != nil {
+		return fmt.Errorf("open the corpus stream: %w", err)
+	}
+
+	handle, err := stream.Consumer(ctx, consumer)
+	if err != nil {
+		return fmt.Errorf("find consumer %q: %w", consumer, err)
+	}
+
+	info, err := handle.Info(ctx)
+	if err != nil {
+		return fmt.Errorf("read consumer %q: %w", consumer, err)
+	}
+
+	config := info.Config
+	config.MaxAckPending = 1
+
+	if _, err := c.stream.UpdateConsumer(ctx, c.topic.Stream, config); err != nil {
+		return fmt.Errorf("serialise consumer %q: %w", consumer, err)
+	}
+
+	return nil
+}
+
 // streamConfig is the corpus stream's shape, in one place so a staged stream is identical to the one
 // Start created.
 func streamConfig(topic Topic) jetstream.StreamConfig {

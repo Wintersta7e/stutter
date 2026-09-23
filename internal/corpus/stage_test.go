@@ -181,6 +181,59 @@ func TestAPausedConsumerIsHandedNothing(t *testing.T) {
 	}
 }
 
+// TestASerialisedConsumerHasOneMessageInFlight: a service asking for a batch gets one message, and
+// the next only once that one is acknowledged. The service's own configuration asked for more.
+func TestASerialisedConsumerHasOneMessageInFlight(t *testing.T) {
+	t.Parallel()
+
+	store := stocked(t, firstOrder, "ORD-2", "ORD-3")
+
+	connection, err := nats.Connect(store.URL())
+	if err != nil {
+		t.Fatalf("nats.Connect() error = %v", err)
+	}
+
+	t.Cleanup(connection.Close)
+
+	stream, err := jetstream.New(connection)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+
+	consumer, err := stream.CreateOrUpdateConsumer(t.Context(), corpus.StreamName, jetstream.ConsumerConfig{
+		Durable:       "batching",
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		MaxAckPending: 100,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrUpdateConsumer() error = %v", err)
+	}
+
+	if err := store.Serialise(t.Context(), "batching"); err != nil {
+		t.Fatalf("Serialise() error = %v", err)
+	}
+
+	for want := range []string{firstOrder, "ORD-2"} {
+		batch, fetchErr := consumer.Fetch(3, jetstream.FetchMaxWait(500*time.Millisecond))
+		if fetchErr != nil {
+			t.Fatalf("Fetch() error = %v", fetchErr)
+		}
+
+		var handed []jetstream.Msg
+		for msg := range batch.Messages() {
+			handed = append(handed, msg)
+		}
+
+		if len(handed) != 1 {
+			t.Fatalf("pull %d handed over %d messages, want exactly 1 in flight", want, len(handed))
+		}
+
+		if ackErr := handed[0].Ack(); ackErr != nil {
+			t.Fatalf("Ack() error = %v", ackErr)
+		}
+	}
+}
+
 // fetched pulls once and counts what arrived. A paused consumer must look idle, not broken, so an
 // error here fails the test rather than counting as nothing.
 func fetched(t *testing.T, consumer jetstream.Consumer) int {
