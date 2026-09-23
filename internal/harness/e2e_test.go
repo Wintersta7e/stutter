@@ -64,7 +64,9 @@ const (
 	// run; this does not, which is what makes two runs comparable.
 	guardHost  = "guard.example.test"
 	hashKeyLen = 32
-	orderedQty = 3
+	// opaqueCache is the logical name of the unparsed dependency the opaque-path services write to.
+	opaqueCache = "cache"
+	orderedQty  = 3
 )
 
 // guarded closes both the consumer and its claim guard. The guard holds its own bus connection, and
@@ -796,14 +798,14 @@ func TestOpaqueDependencyIsObservedWithoutADatabase(t *testing.T) {
 
 	built, err := harness.New(harness.Config{
 		Corpus:  store,
-		Opaque:  map[string]string{"cache": dependency},
+		Opaque:  map[string]string{opaqueCache: dependency},
 		HashKey: key,
 		Policy:  config,
 		Quiesce: 50 * time.Millisecond,
 		Connect: func(ctx context.Context, at harness.Addresses) (harness.Service, error) {
 			dialer := net.Dialer{Timeout: time.Second}
 
-			connection, dialErr := dialer.DialContext(ctx, "tcp", at.Opaque["cache"])
+			connection, dialErr := dialer.DialContext(ctx, "tcp", at.Opaque[opaqueCache])
 			if dialErr != nil {
 				return nil, fmt.Errorf("dial the unparsed dependency: %w", dialErr)
 			}

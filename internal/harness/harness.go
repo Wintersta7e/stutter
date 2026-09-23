@@ -115,6 +115,11 @@ type Config struct {
 	// proxies bound. A container reaches its host by a name of its own and never by the host's
 	// loopback, so the address that works for the listener is not the address to hand out.
 	AdvertiseHost string
+	// Consumer names the consumer under test, for a service that consumes for itself and creates more
+	// than one on the corpus stream. Every other one is paused for the whole run, because effects from
+	// consumers sharing a process interleave with no way to tell them apart. Empty picks the only
+	// consumer there is, and is refused when there are several.
+	Consumer string
 	// HashKey keys the raw-effect hash. Every run in a comparison must share one.
 	HashKey []byte
 	// Policy is the recorded consumer configuration.
@@ -125,6 +130,9 @@ type Config struct {
 	// drained. Zero derives one from the recorded configuration's redelivery deadlines. It is unused
 	// when Stutter dispatches, because there the driver knows when it has stopped delivering.
 	Drain time.Duration
+	// Startup is how long a service that consumes for itself may take to create a consumer on the
+	// corpus stream before the corpus is published regardless. Zero is ten seconds.
+	Startup time.Duration
 	// HTTPTLS serves the stub over TLS instead of cleartext, for a service that will not talk to a
 	// dependency any other way. Addresses.HTTPCACert is then what the service must trust.
 	HTTPTLS bool

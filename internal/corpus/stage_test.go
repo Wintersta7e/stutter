@@ -1,8 +1,13 @@
 package corpus_test
 
 import (
+	"errors"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
 )
@@ -25,10 +30,7 @@ func TestStageKeepsOnlyTheChosenMessages(t *testing.T) {
 
 	keep := []corpus.Message{snapshot[0], snapshot[2]}
 
-	staged, err := store.Stage(t.Context(), keep)
-	if err != nil {
-		t.Fatalf("Stage() error = %v", err)
-	}
+	staged := stage(t, store, keep)
 
 	if len(staged) != len(keep) {
 		t.Fatalf("staged %d messages, want %d", len(staged), len(keep))
@@ -70,17 +72,13 @@ func TestSnapshotStagesTheWholeCorpusAgainAfterASubset(t *testing.T) {
 		t.Fatalf("Snapshot() error = %v", err)
 	}
 
-	if _, err := store.Stage(t.Context(), []corpus.Message{snapshot[1]}); err != nil {
-		t.Fatalf("Stage() a subset error = %v", err)
-	}
+	stage(t, store, []corpus.Message{snapshot[1]})
 
 	if delivered := drainSubjects(t, store); len(delivered) != 1 {
 		t.Fatalf("the subset corpus delivered %q, want ORD-2 alone", delivered)
 	}
 
-	if _, err := store.Stage(t.Context(), snapshot); err != nil {
-		t.Fatalf("Stage() the whole snapshot again error = %v", err)
-	}
+	stage(t, store, snapshot)
 
 	delivered := drainSubjects(t, store)
 	if len(delivered) != len(snapshot) {
@@ -90,6 +88,134 @@ func TestSnapshotStagesTheWholeCorpusAgainAfterASubset(t *testing.T) {
 	if delivered[0] != firstOrder || delivered[2] != "ORD-3" {
 		t.Errorf("delivered %q, want the recorded order back", delivered)
 	}
+}
+
+// TestFillRefusesAStreamSomethingElsePublishedInto: the translation is computed before publishing,
+// so a message that lands elsewhere would have every fault aimed by sequence hit the wrong message.
+func TestFillRefusesAStreamSomethingElsePublishedInto(t *testing.T) {
+	t.Parallel()
+
+	store := stocked(t, firstOrder)
+
+	snapshot, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+
+	if err := store.Clear(t.Context()); err != nil {
+		t.Fatalf("Clear() error = %v", err)
+	}
+
+	// The service under test publishing into the stream it consumes, between Clear and Fill.
+	if _, err := store.Publish(t.Context(), corpus.SubjectPrefix+"orders", []byte("FOREIGN")); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	if err := store.Fill(t.Context(), snapshot); err == nil {
+		t.Fatal("Fill() error = nil, want a refusal: the message landed at 2, not 1")
+	}
+}
+
+// TestAPausedConsumerIsHandedNothing is how a run is scoped to one consumer of a service running
+// several. The pause has to hold while the corpus is published AND survive the service re-creating
+// the consumer with its own configuration, which is what a real service does on startup.
+func TestAPausedConsumerIsHandedNothing(t *testing.T) {
+	t.Parallel()
+
+	store := stocked(t)
+
+	connection, err := nats.Connect(store.URL())
+	if err != nil {
+		t.Fatalf("nats.Connect() error = %v", err)
+	}
+
+	t.Cleanup(connection.Close)
+
+	stream, err := jetstream.New(connection)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+
+	consumers := make(map[string]jetstream.Consumer, 2)
+
+	create := func(name string) {
+		created, createErr := stream.CreateOrUpdateConsumer(t.Context(), corpus.StreamName, jetstream.ConsumerConfig{
+			Durable:   name,
+			AckPolicy: jetstream.AckExplicitPolicy,
+		})
+		if createErr != nil {
+			t.Fatalf("CreateOrUpdateConsumer(%q) error = %v", name, createErr)
+		}
+
+		consumers[name] = created
+	}
+
+	create("paused")
+	create("scoped")
+
+	names, err := store.Consumers(t.Context())
+	if err != nil {
+		t.Fatalf("Consumers() error = %v", err)
+	}
+
+	if !slices.Equal(names, []string{"paused", "scoped"}) {
+		t.Fatalf("Consumers() = %q, want both, in name order", names)
+	}
+
+	if err := store.Pause(t.Context(), "paused"); err != nil {
+		t.Fatalf("Pause() error = %v", err)
+	}
+
+	create("paused")
+
+	if _, err := store.Publish(t.Context(), corpus.SubjectPrefix+"orders", []byte(firstOrder)); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	if got := fetched(t, consumers["scoped"]); got != 1 {
+		t.Errorf("the scoped consumer was handed %d messages, want 1", got)
+	}
+
+	if got := fetched(t, consumers["paused"]); got != 0 {
+		t.Errorf("the paused consumer was handed %d messages, want none", got)
+	}
+}
+
+// fetched pulls once and counts what arrived. A paused consumer must look idle, not broken, so an
+// error here fails the test rather than counting as nothing.
+func fetched(t *testing.T, consumer jetstream.Consumer) int {
+	t.Helper()
+
+	batch, err := consumer.Fetch(1, jetstream.FetchMaxWait(500*time.Millisecond))
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+
+	count := 0
+	for range batch.Messages() {
+		count++
+	}
+
+	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) {
+		t.Fatalf("batch error = %v, want an idle consumer to look idle", err)
+	}
+
+	return count
+}
+
+// stage scopes the corpus as a run does: clear, fill, and hand back the translation.
+func stage(t *testing.T, store *corpus.Corpus, messages []corpus.Message) []corpus.Staged {
+	t.Helper()
+
+	if err := store.Clear(t.Context()); err != nil {
+		t.Fatalf("Clear() error = %v", err)
+	}
+
+	if err := store.Fill(t.Context(), messages); err != nil {
+		t.Fatalf("Fill() error = %v", err)
+	}
+
+	return corpus.Numbering(messages)
 }
 
 // stocked starts a corpus holding one message per payload, in the order given.

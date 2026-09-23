@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,7 +16,26 @@ import (
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
+var (
+	// errAmbiguousConsumer means the service runs several consumers on the corpus stream and nothing
+	// said which one is under test.
+	errAmbiguousConsumer = errors.New("the service under test runs more than one consumer on the corpus stream; " +
+		"set Config.Consumer to the one under test")
+	// errNoSuchConsumer means the consumer named as under test is not one the service created.
+	errNoSuchConsumer = errors.New("the consumer under test is not one the service created on the corpus stream")
+	// errUnscoped means a consumer that was not under test took deliveries anyway, so its effects are
+	// mixed into the run's with no way to separate them.
+	errUnscoped = errors.New("a consumer other than the one under test took deliveries during the run")
+)
+
 const (
+	// settleMargin multiplies the quiesce to get how long a starting service must stay quiet before
+	// the corpus is published. Startup work is the same scale of thing as a handler's trailing writes,
+	// and a few of them in a row is what separates a finished startup from a pause inside one.
+	settleMargin = 5
+	// defaultStartup is how long a service may take to create a consumer. Generous, because it is only
+	// ever spent in full on a service that never does, and that run is already a failed one.
+	defaultStartup = 10 * time.Second
 	// drainMargin multiplies the longest redelivery deadline to get a default drain wait. A
 	// redelivery lands at the deadline, not before it, so the margin is what stops a run that is
 	// merely waiting from being called finished.
@@ -59,13 +80,13 @@ func (s *Sandbox) runObserved(
 		return replay.Result{}, fmt.Errorf("express %s on the wire: %w", mutation.Fault(), err)
 	}
 
-	staged, err := s.stage(ctx, retain)
+	messages, err := s.prepare(ctx, retain)
 	if err != nil {
 		return replay.Result{}, err
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), s.cfg.HashKey)
-	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, staged, s.quiesce())
+	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, corpus.Numbering(messages), s.quiesce())
 
 	observed, err := s.observe(ctx, recorder, natsproxy.Options{Acks: run, Deliveries: run})
 	if err != nil {
@@ -81,7 +102,11 @@ func (s *Sandbox) runObserved(
 		)
 	}
 
-	runErr := run.awaitQuiet(ctx, s.drainWait())
+	runErr := s.begin(ctx, run, recorder, messages)
+	if runErr == nil {
+		runErr = run.awaitQuiet(ctx, s.drainWait())
+	}
+
 	run.finish()
 
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
@@ -92,17 +117,18 @@ func (s *Sandbox) runObserved(
 		return replay.Result{}, err
 	}
 
-	return run.result(verdict.Clause), nil
+	return run.result(verdict.Clause)
 }
 
-// stage rebuilds the corpus stream so it holds only the messages this run is scoped to.
+// prepare returns the part of the corpus this run replays, and clears the stream to receive it.
 //
-// It is both the run's scoping and its bus-side reset: rebuilding takes the previous run's consumer
-// with it, which is what stops a second run resuming where the first one stopped.
+// Cleared rather than staged outright: the service starts against a stream holding nothing, and the
+// corpus arrives only once it has finished starting. Clearing is also the bus-side reset, since it
+// takes the previous run's consumers with the stream.
 //
 // The corpus is snapshotted once, before the first run reduces it. Sandbox runs are serial — a check
 // compares one run against the next — so the snapshot needs no guard of its own.
-func (s *Sandbox) stage(ctx context.Context, retain []uint64) ([]corpus.Staged, error) {
+func (s *Sandbox) prepare(ctx context.Context, retain []uint64) ([]corpus.Message, error) {
 	if s.recorded == nil {
 		snapshot, err := s.cfg.Corpus.Snapshot(ctx)
 		if err != nil {
@@ -112,12 +138,132 @@ func (s *Sandbox) stage(ctx context.Context, retain []uint64) ([]corpus.Staged, 
 		s.recorded = snapshot
 	}
 
-	staged, err := s.cfg.Corpus.Stage(ctx, scope(s.recorded, retain))
-	if err != nil {
-		return nil, fmt.Errorf("stage the corpus: %w", err)
+	if err := s.cfg.Corpus.Clear(ctx); err != nil {
+		return nil, fmt.Errorf("clear the corpus: %w", err)
 	}
 
-	return staged, nil
+	return scope(s.recorded, retain), nil
+}
+
+// begin publishes the corpus once the service has finished starting, with every consumer but the one
+// under test paused.
+//
+// Both halves exist because a real service does not start the way a test fixture does. It runs its
+// own startup work — a cleanup timer's first pass fired inside the first message's window on a real
+// target — and it may run several consumers in one process, whose effects interleave on shared
+// connections with no way to tell them apart. Holding the corpus back makes the first a setup effect;
+// pausing makes the second a service with one consumer.
+func (s *Sandbox) begin(
+	ctx context.Context,
+	run *observedRun,
+	recorder *effect.Recorder,
+	messages []corpus.Message,
+) error {
+	consumers, err := s.awaitStartup(ctx, recorder)
+	if err != nil {
+		return err
+	}
+
+	target, err := s.target(consumers)
+	if err != nil {
+		return err
+	}
+
+	for _, other := range consumers {
+		if other == target {
+			continue
+		}
+
+		if err := s.cfg.Corpus.Pause(ctx, other); err != nil {
+			return fmt.Errorf("scope the run to consumer %q: %w", target, err)
+		}
+	}
+
+	run.scope(target)
+
+	if err := s.cfg.Corpus.Fill(ctx, messages); err != nil {
+		return fmt.Errorf("stage the corpus: %w", err)
+	}
+
+	return nil
+}
+
+// awaitStartup waits for the service to create a consumer on the corpus stream and then fall quiet,
+// and returns the consumers it created.
+//
+// Quiet means no effect for the settle period. Nothing is attributed to a message yet, so whatever
+// the service does meanwhile is counted as setup, and a pull request is bookkeeping rather than an
+// effect, so a service polling an empty stream is already quiet.
+//
+// A service that never creates a consumer is given up on at the startup limit and the corpus is
+// published regardless: the run then observes nothing, and the observation gate says so and says
+// where to look. Returning an error instead would bury that diagnosis under a timeout.
+func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) ([]string, error) {
+	ticker := time.NewTicker(drainPoll)
+	defer ticker.Stop()
+
+	started := time.Now()
+	quietSince, setup := started, recorder.SetupCount()
+
+	for {
+		consumers, err := s.cfg.Corpus.Consumers(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("watch the service under test start: %w", err)
+		}
+
+		if count := recorder.SetupCount(); count != setup {
+			quietSince, setup = time.Now(), count
+		}
+
+		settled := len(consumers) > 0 && time.Since(quietSince) >= s.settle()
+		if settled || time.Since(started) >= s.startupLimit() {
+			return consumers, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("cancelled while the service under test was starting: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+// target picks the consumer under test from those the service created.
+//
+// A service with one consumer needs no declaration, which keeps local setup at zero for the common
+// case. One with several has to be told which: guessing would put a verdict on the wrong handler.
+func (s *Sandbox) target(consumers []string) (string, error) {
+	switch {
+	case s.cfg.Consumer != "":
+		if len(consumers) > 0 && !slices.Contains(consumers, s.cfg.Consumer) {
+			return "", fmt.Errorf("%w: %q is not among them (%s)",
+				errNoSuchConsumer, s.cfg.Consumer, strings.Join(consumers, ", "))
+		}
+
+		return s.cfg.Consumer, nil
+	case len(consumers) > 1:
+		return "", fmt.Errorf("%w: it created %s", errAmbiguousConsumer, strings.Join(consumers, ", "))
+	case len(consumers) == 1:
+		return consumers[0], nil
+	default:
+		// None at all: the service never got as far as consuming, and nothing needs pausing.
+		return "", nil
+	}
+}
+
+// settle is how long the service must stay quiet before its startup is considered over.
+func (s *Sandbox) settle() time.Duration {
+	return s.quiesce() * settleMargin
+}
+
+// startupLimit is how long the service may take to create a consumer before the corpus is published
+// regardless.
+func (s *Sandbox) startupLimit() time.Duration {
+	if s.cfg.Startup > 0 {
+		return s.cfg.Startup
+	}
+
+	return defaultStartup
 }
 
 // scope narrows a snapshot to the retained sequences, keeping recorded order. An empty retain set is
@@ -192,6 +338,9 @@ type observedRun struct {
 	// period ends the run before a withheld acknowledgement's redelivery arrives — a clean sequence
 	// reported for a fault that never got to land.
 	began time.Time
+	// target is the consumer under test. Nil until the service has started, and for good if it never
+	// created one; while nil, every consumer on the stream counts.
+	target atomic.Pointer[string]
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
 	stream string
@@ -199,6 +348,8 @@ type observedRun struct {
 	activity  atomic.Int64
 	delivered atomic.Int64
 	failed    atomic.Int64
+	// foreign counts deliveries to a consumer that is not under test.
+	foreign atomic.Int64
 }
 
 func newObservedRun(
@@ -238,6 +389,13 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 		return
 	}
 
+	// Opening a window for it would hand the consumer under test's window to a message it never saw.
+	if !r.targets(delivery.Ack.Consumer) {
+		r.foreign.Add(1)
+
+		return
+	}
+
 	r.touch()
 	r.delivered.Add(1)
 	r.windows.open(r.sequence(delivery.Ack.StreamSeq), delivery.Payload)
@@ -245,7 +403,9 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 
 // Withhold decides the fate of one acknowledgement and closes the window of the message it settles.
 func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
-	if ack.Stream != r.stream {
+	// Another consumer's acknowledgement of the same sequence is not the fault's target: swallowing it
+	// would fault a handler nobody chose.
+	if ack.Stream != r.stream || !r.targets(ack.Consumer) {
 		return false
 	}
 
@@ -302,12 +462,45 @@ func (r *observedRun) finish() {
 	r.windows.finish()
 }
 
-// result is what the run observed, in the shape a driven run reports.
+// scope names the consumer under test, just before the corpus is published. It restarts the drain
+// clock too: the run begins at publication, and a service that took longer to start than the drain
+// period would otherwise be called finished before its first delivery.
+func (r *observedRun) scope(consumer string) {
+	if consumer != "" {
+		r.target.Store(&consumer)
+	}
+
+	r.touch()
+}
+
+// targets reports whether a consumer is the one under test.
+func (r *observedRun) targets(consumer string) bool {
+	target := r.target.Load()
+
+	return target == nil || *target == consumer
+}
+
+// unscoped fails a run in which a consumer that was not under test took deliveries. Its effects sit in
+// the run's sequence with no way to separate them, so a verdict would be on two handlers at once.
+func (r *observedRun) unscoped() error {
+	if count := r.foreign.Load(); count > 0 {
+		return fmt.Errorf("%w: %d deliveries to a consumer that was not paused, "+
+			"most likely one created after the service had finished starting", errUnscoped, count)
+	}
+
+	return nil
+}
+
+// result is what the run observed, in the shape a driven run reports, or why it cannot be used.
 //
 // Failed counts negative acknowledgements rather than handler errors: a service Stutter does not
 // call has no return value to read, so asking the bus for redelivery is the only way it can say a
 // delivery failed.
-func (r *observedRun) result(clause string) replay.Result {
+func (r *observedRun) result(clause string) (replay.Result, error) {
+	if err := r.unscoped(); err != nil {
+		return replay.Result{}, err
+	}
+
 	return replay.Result{
 		Clause:    clause,
 		Effects:   r.recorder.Effects(),
@@ -315,7 +508,7 @@ func (r *observedRun) result(clause string) replay.Result {
 		Failed:    int(r.failed.Load()),
 		Late:      r.recorder.LateCount(),
 		Setup:     r.recorder.SetupCount(),
-	}
+	}, nil
 }
 
 // sequence translates a stream sequence the bus is using into the one the message was recorded

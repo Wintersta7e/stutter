@@ -63,7 +63,7 @@ func startPulling(
 ) (*pulling, error) {
 	dialer := net.Dialer{Timeout: time.Second}
 
-	dependency, err := dialer.DialContext(ctx, "tcp", at.Opaque["cache"])
+	dependency, err := dialer.DialContext(ctx, "tcp", at.Opaque[opaqueCache])
 	if err != nil {
 		return nil, fmt.Errorf("dial the unparsed dependency: %w", err)
 	}
@@ -209,7 +209,7 @@ func observedSandbox(
 
 	built, err := harness.New(harness.Config{
 		Corpus:  store,
-		Opaque:  map[string]string{"cache": upstream},
+		Opaque:  map[string]string{opaqueCache: upstream},
 		HashKey: key,
 		Policy:  config,
 		Quiesce: toy.DefaultQuiesce,
@@ -402,9 +402,10 @@ func TestAServiceThatNeverConnectedIsNotPassed(t *testing.T) {
 		HashKey: make([]byte, hashKeyLen),
 		Policy:  config,
 		Quiesce: toy.DefaultQuiesce,
-		// Nothing will ever arrive, so waiting out the derived redelivery horizon proves nothing more.
-		Drain: fetchWait,
-		Start: func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
+		// Nothing will ever arrive, so waiting out the derived horizons proves nothing more.
+		Drain:   fetchWait,
+		Startup: fetchWait,
+		Start:   func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
 	})
 	if err != nil {
 		t.Fatalf("harness.New() error = %v", err)

@@ -90,6 +90,14 @@ outside that will be poor.
   stub before it diverged is marked `guard-dependent` rather than trusted
 - A determinism gate: no findings are reported until two unmutated runs agree
   byte for byte
+- An observation gate in front of it: two runs that saw nothing agree perfectly,
+  so a clean run with no effects at all is withheld rather than passed, and the
+  report says whether the service never connected, never consumed, or never
+  touched a proxied dependency
+- For a service that pulls for itself, the corpus is published only once the
+  service has finished starting, and every consumer but the one under test is
+  paused — so startup work and a second consumer in the same process are kept
+  out of the comparison
 - Delta-debugging shrink to a minimal reproducing message set
 - A report that names the consumer, the fault, the configuration clause that made
   the fault legal, and the minimal repro — plus exit codes for CI
@@ -109,6 +117,10 @@ outside that will be poor.
 - `concurrent` delivery is refused rather than injected — it needs per-connection
   effect attribution, and injecting it today would mis-attribute effects and
   manufacture false positives
+- A check covers one consumer. A service running several has the rest paused, and
+  the one under test has to be named (in Go config, for now). Work the service does on
+  its own timer in the middle of a run cannot be told apart from a handler's, so
+  it violates the determinism gate: the report is withheld, not wrong
 - No recorder against a live bus, and therefore no redaction pipeline: everything
   runs on a synthetic corpus
 
@@ -122,7 +134,8 @@ outside that will be poor.
 $ stutter check --postgres "$DSN" --max-runs 3
 
 Scanned 1 consumer over 3 recorded messages.
-Gates held: determinism.
+Gates held: observation, determinism.
+Clean run: 3 messages delivered 3 times, producing 7 effects.
 
 FAIL  reserve_stock          duplicate delivery       the service did different work under the fault
       minimal repro: messages #1
