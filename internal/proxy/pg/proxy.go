@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
 )
@@ -43,9 +45,13 @@ const (
 var errEncrypted = errors.New("client negotiated TLS with the database; " +
 	"effects cannot be observed — disable TLS on the sandbox connection")
 
-// Sink receives the effects the proxy observes.
+// Sink receives the effects the proxy observes, and what the database made of each.
 type Sink interface {
 	Record(observed effect.Observation)
+	// Reject marks the recorded statement as having changed nothing.
+	Reject(correlation string)
+	// Answered releases a recorded statement that did change something.
+	Answered(correlation string)
 }
 
 // Proxy accepts Postgres connections and forwards them to an upstream server.
@@ -55,6 +61,8 @@ type Proxy struct {
 	upstream string
 	dialer   net.Dialer
 	wg       sync.WaitGroup
+	// sessions numbers connections, so a statement's correlation token is unique across all of them.
+	sessions atomic.Uint64
 }
 
 // Listen binds a proxy on addr, forwarding to the Postgres server at upstream.
@@ -115,11 +123,13 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	defer func() { _ = upstream.Close() }()
 
 	current := &session{
-		client:     client,
-		upstream:   upstream,
-		sink:       p.sink,
-		statements: make(map[string]statement),
-		portals:    make(map[string]portal),
+		client:      client,
+		upstream:    upstream,
+		sink:        p.sink,
+		completions: &completions{sink: p.sink},
+		statements:  make(map[string]statement),
+		portals:     make(map[string]portal),
+		id:          p.sessions.Add(1),
 	}
 
 	if err := current.negotiate(); err != nil {
@@ -143,13 +153,18 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 //
 // The two pumps run concurrently and both touch the statement map, so it is guarded.
 type session struct {
-	client     net.Conn
-	upstream   net.Conn
-	sink       Sink
-	statements map[string]statement
-	portals    map[string]portal
-	describing string
-	mu         sync.Mutex
+	client      net.Conn
+	upstream    net.Conn
+	sink        Sink
+	completions *completions
+	statements  map[string]statement
+	portals     map[string]portal
+	describing  string
+	// id and issued make each recorded statement's correlation token. Only the frontend pump issues
+	// tokens, so issued needs no guard.
+	id     uint64
+	issued uint64
+	mu     sync.Mutex
 }
 
 // negotiate forwards the untyped startup exchange that precedes the typed message stream.
@@ -198,10 +213,11 @@ func (s *session) pumpFrontend() {
 	}
 }
 
-// pumpBackend forwards server messages, inspecting only ParameterDescription.
+// pumpBackend forwards server messages, inspecting ParameterDescription and the answers that settle
+// a statement.
 //
-// Divergence is decided by what the service asked for, never by what the database answered, so
-// nothing here becomes an effect. It exists solely to learn parameter types.
+// Nothing here becomes an effect. Divergence is decided by what the service asked for; the answer is
+// read only to learn a parameter's type, and whether a statement changed anything at all.
 func (s *session) pumpBackend() {
 	for {
 		msgType, body, err := readTyped(s.upstream)
@@ -213,18 +229,21 @@ func (s *session) pumpBackend() {
 			s.attachParameterTypes(body)
 		}
 
+		s.completions.settle(msgType, body)
+
 		if err := writeTyped(s.client, msgType, body); err != nil {
 			return
 		}
 	}
 }
 
+// inspectFrontend records any statement a client message carries, and queues every message the
+// server will answer — recorded or not, since an unqueued request would shift every pairing after it.
 func (s *session) inspectFrontend(msgType byte, body []byte) {
 	switch msgType {
 	case msgQuery:
-		if sql, ok := (&reader{buf: body}).cstring(); ok {
-			s.emit(sql, nil)
-		}
+		sql, _ := (&reader{buf: body}).cstring()
+		s.completions.expect(requestSimple, s.emit(sql, nil), sql)
 	case msgParse:
 		s.recordParse(body)
 	case msgDescribe:
@@ -233,8 +252,12 @@ func (s *session) inspectFrontend(msgType byte, body []byte) {
 		s.recordBind(body)
 	case msgExecute:
 		s.execute(body)
+	case msgSync:
+		s.completions.expect(requestSync, "", "")
+	case msgFunctionCall:
+		s.completions.expect(requestCall, "", "")
 	default:
-		// Every other frontend message is forwarded uninspected. Sync, Close and Terminate carry no
+		// Every other frontend message is forwarded uninspected. Close, Flush and Terminate carry no
 		// statement, and a message Stutter does not understand must not become an effect.
 	}
 }
@@ -296,11 +319,10 @@ func (s *session) recordBind(body []byte) {
 	s.portals[name] = bound
 }
 
+// execute records the statement an Execute runs and queues it for its answer. An unknown portal
+// records nothing but is queued all the same: the server answers it either way.
 func (s *session) execute(body []byte) {
-	name, ok := (&reader{buf: body}).cstring()
-	if !ok {
-		return
-	}
+	name, _ := (&reader{buf: body}).cstring()
 
 	s.mu.Lock()
 
@@ -310,19 +332,29 @@ func (s *session) execute(body []byte) {
 	s.mu.Unlock()
 
 	if !hasPortal || !hasStatement {
+		s.completions.expect(requestExecute, "", "")
+
 		return
 	}
 
-	s.emit(prepared.sql, renderParams(bound.params, prepared.oids))
+	token := s.emit(prepared.sql, renderParams(bound.params, prepared.oids))
+	s.completions.expect(requestExecute, token, prepared.sql)
 }
 
-func (s *session) emit(sql string, params []string) {
+// emit records one statement and returns the token its answer will be matched by, or empty when
+// there was no statement to record.
+func (s *session) emit(sql string, params []string) string {
 	if sql == "" {
-		return
+		return ""
 	}
 
+	s.issued++
+	token := "pg/" + strconv.FormatUint(s.id, 10) + "/" + strconv.FormatUint(s.issued, 10)
+
 	text := render(sql, params)
-	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindPostgres})
+	s.sink.Record(effect.Observation{Raw: text, Printable: text, Kind: effect.KindPostgres, Correlation: token})
+
+	return token
 }
 
 func (s *session) forwardUntyped() ([]byte, error) {
