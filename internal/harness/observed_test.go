@@ -111,6 +111,9 @@ type quirks struct {
 	// ephemeral makes the service create its consumer with no name, so the client names it afresh on
 	// every start.
 	ephemeral bool
+	// conflictingStream makes the service try, at startup, to create the corpus stream over other
+	// subjects — which the bus refuses — and carry on.
+	conflictingStream bool
 }
 
 // The service's own stream, under the sideStream quirk.
@@ -374,6 +377,13 @@ func (p *pulling) startup(ctx context.Context, stream jetstream.JetStream) error
 	}
 
 	p.stream = stream
+
+	if p.quirks.conflictingStream {
+		// Refused, as a service's own create is when the stream exists with other subjects; the
+		// service carries on regardless, as one that only logs the error does.
+		//nolint:errcheck // the refusal is the point, and the bus's answer is what the test reads.
+		_, _ = stream.CreateStream(ctx, jetstream.StreamConfig{Name: corpus.StreamName, Subjects: []string{"other.>"}})
+	}
 
 	if p.quirks.sideStream {
 		if _, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{

@@ -728,14 +728,17 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 	}
 
 	return replay.Result{
-		Clause:    clause,
-		Effects:   effects,
-		Delivered: int(r.delivered.Load()),
-		Failed:    int(r.failed.Load()),
-		Late:      r.recorder.LateCount(),
-		Setup:     r.recorder.SetupCount(),
-		FedBack:   len(unstaged),
-		Elsewhere: int(r.elsewhere.Load()),
+		Clause:          clause,
+		Effects:         effects,
+		Delivered:       int(r.delivered.Load()),
+		Failed:          int(r.failed.Load()),
+		Late:            r.recorder.LateCount(),
+		Setup:           r.recorder.SetupCount(),
+		FedBack:         len(unstaged),
+		Elsewhere:       int(r.elsewhere.Load()),
+		Refusals:        r.recorder.Refusals(),
+		NoResponders:    r.recorder.NoResponders(),
+		ClosedAfterInfo: r.recorder.ClosedAfterInfoCount(),
 	}, nil
 }
 

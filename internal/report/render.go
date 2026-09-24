@@ -256,7 +256,49 @@ func (h *Health) noteLines() []string {
 			detailIndent+"closed. Work a handler does not wait for is the likeliest source of instability.")
 	}
 
-	return lines
+	return append(lines, h.busNoteLines()...)
+}
+
+// busNoteLines names what the bus refused and counted on the clean run. Each renders only when there
+// is something to say, so a run that saw none of it renders as it always did.
+func (h *Health) busNoteLines() []string {
+	var lines []string
+
+	if len(h.Refusals) > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+"the bus refused "+plural(len(h.Refusals), "request")+
+				" before the first delivery; a service whose startup",
+			detailIndent+"is refused may never consume:")
+
+		for _, refusal := range h.Refusals {
+			lines = append(lines, detailIndent+oneLine(refusal.Subject+" "+strconv.Itoa(refusal.ErrCode)+" "+
+				refusal.Description))
+		}
+	}
+
+	lines = appendCount(lines, h.NoResponders, "request", " found no responder on the clean run:",
+		"nothing was subscribed to answer them. Each still counts as the service's work.")
+	lines = appendCount(lines, h.FedBack, "message", " Stutter did not publish reached the consumer and did nothing:",
+		"its own output, fed back through the stream it consumes, left out of the comparison.")
+	lines = appendCount(lines, h.Elsewhere, "message", " on another stream arrived inside a message's window:",
+		"the service's own bus work, neither scoped nor checked.")
+
+	return appendCount(lines, h.ClosedAfterInfo, "bus client", " hung up after the greeting without sending a byte:",
+		"likely a client that requires TLS, or a script waiting for the port to open.")
+}
+
+// appendCount adds one NOTE for a non-zero count: the count and what it is, then what it means.
+func appendCount(lines []string, count int, noun, what, meaning string) []string {
+	if count == 0 {
+		return lines
+	}
+
+	return append(lines, "", pad("NOTE", statusColumn)+plural(count, noun)+what, detailIndent+meaning)
+}
+
+// oneLine collapses every run of whitespace to one space: one value renders on one line.
+func oneLine(text string) string {
+	return strings.Join(strings.Fields(text), " ")
 }
 
 // findingLines renders one finding: the verdict line, then everything needed to act on it without

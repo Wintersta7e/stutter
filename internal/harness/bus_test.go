@@ -3,10 +3,12 @@ package harness_test
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/Wintersta7e/stutter/internal/check"
+	"github.com/Wintersta7e/stutter/internal/effect"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/toy"
@@ -133,5 +135,40 @@ func TestASoleEphemeralConsumerIsCheckedAcrossRuns(t *testing.T) {
 		if names[at] == names[at-1] {
 			t.Errorf("starts %d and %d both named the consumer %q, want a fresh name each start", at, at+1, names[at])
 		}
+	}
+}
+
+// TestARefusedStartupRequestReachesHealth: a request the bus refused before the first delivery is the
+// likeliest reason a service never consumed, so its code and description reach the report.
+func TestARefusedStartupRequestReachesHealth(t *testing.T) {
+	t.Parallel()
+
+	config := observedConfig()
+	built, recorded := quirkySandbox(t, config, quirks{conflictingStream: true, idempotent: true}, nil,
+		"ORD-REFUSED-1")
+
+	result, err := check.Run(t.Context(), built, check.Options{
+		Messages: recorded,
+		Consumer: observedConsumer,
+		Config:   config,
+		MaxRuns:  1,
+	})
+	if err != nil {
+		t.Fatalf("check.Run() error = %v", err)
+	}
+
+	if result.Health == nil {
+		t.Fatal("Health = nil")
+	}
+
+	refused := slices.ContainsFunc(result.Health.Refusals, func(refusal effect.Refusal) bool {
+		return refusal.ErrCode == 10058 && refusal.Description != ""
+	})
+	if !refused {
+		t.Errorf("Health.Refusals = %+v, want the 10058 refusal with its description", result.Health.Refusals)
+	}
+
+	if rendered := result.String(); !strings.Contains(rendered, "10058") {
+		t.Errorf("the report does not name 10058:\n%s", rendered)
 	}
 }
