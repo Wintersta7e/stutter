@@ -31,9 +31,11 @@ var (
 	cgoDefaultPattern = regexp.MustCompile(`^\s*(export\s+|override\s+)?CGO\s*(?:(\?=|::?=|\+=|!=|=)\s*(\S*)\s*)?$`)
 	// makeCgoPattern matches CGO passed to make on its command line, which overrides the default.
 	makeCgoPattern = regexp.MustCompile(`(?:\bmake|\$\(MAKE\))\s[^|;&]*\bCGO=(\S*)`)
-	// makeEnvPattern matches make told to let the environment override the Makefile, spelled so this
-	// source never holds the words it looks for.
-	makeEnvPattern = regexp.MustCompile(`(?:(?:\bmake|\$\(MAKE\))(?:\s[^|;&]*)?\s-e(?:\s|$)|\bMAKE(?:FLAGS)\b)`)
+	// makeEnvPattern matches make told to let the environment override the Makefile: its -e flag, or
+	// its flags variable assigned or exported. Naming the variable, as a list that strips it does, is
+	// not setting it. Spelled so this source never holds the words it looks for.
+	makeEnvPattern = regexp.MustCompile(`(?:(?:\bmake|\$\(MAKE\))(?:\s[^|;&]*)?\s-e(?:\s|$)` +
+		`|\bexport\s+MAKE(?:FLAGS)\b|\bMAKE(?:FLAGS)\s*(?:\+|:|::|\?)?=)`)
 )
 
 // errBuilds means the tree does not hold exactly one build of the product, in the Makefile's build

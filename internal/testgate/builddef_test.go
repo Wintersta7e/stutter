@@ -221,6 +221,20 @@ func TestTheMakefileDefaultIsCGOZero(t *testing.T) {
 			cgoDefault: "0",
 		},
 		{
+			name: "make's flags set to let the environment win",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file("scripts/release.sh", "MAKE"+"FLAGS=e make build\n"),
+			},
+			cgoDefault: "0",
+		},
+		{
+			name: "a list naming make's flags variable to strip it",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file("build.go", `var strip = []string{"CGO", "MAKE`+`FLAGS"}`),
+			},
+			cgoDefault: "0", pass: true,
+		},
+		{
 			name: "a shell CGO in the environment is harmless",
 			files: []testgate.SourceFile{
 				file("Makefile", makefile), file(".github/workflows/ci.yml", "      - run: CGO=1 make build BIN=x\n"),
