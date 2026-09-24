@@ -11,6 +11,7 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/check"
 	"github.com/Wintersta7e/stutter/internal/effect"
+	"github.com/Wintersta7e/stutter/internal/gate"
 	"github.com/Wintersta7e/stutter/internal/policy"
 	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/report"
@@ -44,6 +45,9 @@ type session struct {
 	failOnReset bool
 	// refusesAll marks every effect as refused by its dependency, so nothing it does changes anything.
 	refusesAll bool
+	// flaky repeats a non-idempotent write only on a hunt's faulted run, never when a shrink replays
+	// the same fault: a divergence that does not reproduce.
+	flaky bool
 }
 
 func newSession() *session {
@@ -101,7 +105,7 @@ func (s *session) Run(
 			effects = append(effects, claimLookup(seq))
 		}
 
-		if s.repeats(mutation, seq) {
+		if s.repeats(mutation, seq) && (!s.flaky || !strings.HasPrefix(name, "shrink")) {
 			effects = append(effects, write(seq))
 		}
 	}
@@ -275,6 +279,53 @@ func TestViolatedGateStopsTheRun(t *testing.T) {
 
 	if len(result.Violations()) != 1 {
 		t.Errorf("Violations() = %d, want 1", len(result.Violations()))
+	}
+}
+
+// TestANonReproducingDivergenceViolatesDeterminism: a fault that diverged once and not again when the
+// shrink replayed it says the service is not deterministic under that fault, which is the determinism
+// gate's business — not a broken sandbox. Reported as a setup error, it sent the reader to the wrong
+// place and hid which fault and message did it.
+func TestANonReproducingDivergenceViolatesDeterminism(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.flaky = true
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	t.Logf("report:\n%s", result)
+
+	if got := result.ExitCode(); got != report.ExitGateViolated {
+		t.Fatalf("ExitCode() = %d, want %d (gate violated)\n%s", got, report.ExitGateViolated, result)
+	}
+
+	violations := result.Violations()
+	if len(violations) != 1 || violations[0].Name != report.GateDeterminism {
+		t.Fatalf("Violations() = %+v, want the determinism gate alone", violations)
+	}
+
+	violated := violations[0]
+	if violated.Result.Class != gate.ClassNotReproducible {
+		t.Errorf("Class = %q, want %q", violated.Result.Class, gate.ClassNotReproducible)
+	}
+
+	if violated.Fault != policy.FaultDuplicate || violated.Result.Message != 1 {
+		t.Errorf("violation names %q on message %d, want %q on message 1",
+			violated.Fault, violated.Result.Message, policy.FaultDuplicate)
+	}
+
+	if len(result.Findings) != 0 {
+		t.Errorf("Findings = %d, want none beside a violated gate", len(result.Findings))
+	}
+
+	for _, want := range []string{"duplicate delivery", "message #1"} {
+		if !strings.Contains(result.String(), want) {
+			t.Errorf("the report does not name %q:\n%s", want, result)
+		}
 	}
 }
 

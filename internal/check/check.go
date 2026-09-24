@@ -153,8 +153,9 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 
 	// Observation leads: a reference that saw nothing makes determinism hold over two empty
 	// sequences, and naming that as the violation would send the reader hunting for instability.
+	observation := report.GateCheck{Name: report.GateObservation, Result: gate.Observed(referenceEffects)}
 	gates := []report.GateCheck{
-		{Name: report.GateObservation, Result: gate.Observed(referenceEffects)},
+		observation,
 		{Name: report.GateDeterminism, Result: c.comparer.Compare(referenceEffects, effect.Compared(repeat.Effects))},
 	}
 
@@ -171,6 +172,13 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 	}
 
 	divergences, err := c.hunt(ctx, reference)
+
+	// The clean runs agreed and the service did not under a fault. That is determinism violated, not a
+	// broken sandbox, and every finding made so far rests on the same unstable service.
+	if unreproduced, found := errors.AsType[*notReproducibleError](err); found {
+		gates, err = []report.GateCheck{observation, unreproduced.violation}, nil
+	}
+
 	if err != nil {
 		return report.SetupFailed(err), nil
 	}
@@ -277,6 +285,10 @@ func (c *check) attempt(
 	}
 
 	repro, err := c.shrink(ctx, mutation)
+	if errors.Is(err, shrink.ErrNotReproducible) {
+		return report.Divergence{}, false, notReproducible(fault, seq, outcome)
+	}
+
 	if err != nil {
 		return report.Divergence{}, false, err
 	}
@@ -288,6 +300,34 @@ func (c *check) attempt(
 	)
 
 	return divergence, true, nil
+}
+
+// notReproducibleError ends a hunt whose divergence the shrink could not reproduce, carrying the
+// determinism violation it amounts to out of the hunt so the check reports it as one.
+type notReproducibleError struct {
+	violation report.GateCheck
+}
+
+func (e *notReproducibleError) Error() string {
+	return "a divergence under " + string(e.violation.Fault) + " against message " +
+		strconv.FormatUint(e.violation.Result.Message, 10) + " did not reproduce"
+}
+
+// notReproducible is the determinism violation a divergence amounts to when replaying its fault did
+// not diverge again. It names the fault and the message it was aimed at, and keeps the first
+// difference the faulted run showed.
+func notReproducible(fault policy.Fault, seq uint64, outcome gate.Result) error {
+	return &notReproducibleError{violation: report.GateCheck{
+		Name:  report.GateDeterminism,
+		Fault: fault,
+		Result: gate.Result{
+			Class:   gate.ClassNotReproducible,
+			Want:    outcome.Want,
+			Got:     outcome.Got,
+			Message: seq,
+			Index:   -1,
+		},
+	}}
 }
 
 // readsOnly reports whether everything that differs between two runs' effects for one message is a
@@ -510,6 +550,8 @@ func summarise(outcome gate.Result) string {
 		return "no divergence"
 	case gate.ClassUnobserved:
 		return "nothing was observed to compare"
+	case gate.ClassNotReproducible:
+		return "the divergence did not reproduce"
 	default:
 		return "the effect sequence differed"
 	}

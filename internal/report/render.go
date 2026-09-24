@@ -163,7 +163,7 @@ func (r Report) violationLines() []string {
 	for _, check := range r.Violations() {
 		lines = append(lines, "",
 			trim(pad("GATE", statusColumn)+pad(string(check.Name), consumerColumn)+"violated"))
-		lines = append(lines, indent(check.Result.Describe(), detailIndent)...)
+		lines = append(lines, indent(check.describe(), detailIndent)...)
 	}
 
 	// The clean run's health is the diagnosis: it is what says where to look next.
@@ -177,6 +177,15 @@ func (r Report) violationLines() []string {
 	return append(lines, "",
 		"No findings were computed. Every comparison downstream of a violated gate is noise, so the",
 		"report is withheld rather than qualified. This is not a test failure.")
+}
+
+// describe explains a violated gate, naming the fault that exposed it when one did.
+func (c GateCheck) describe() string {
+	if c.Fault == policy.FaultNone {
+		return c.Result.Describe()
+	}
+
+	return describeFault(c.Fault) + ": " + c.Result.Describe()
 }
 
 // summaryLines states what the clean run saw, so a verdict shows the evidence it rests on. When the

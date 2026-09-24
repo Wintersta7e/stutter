@@ -133,9 +133,14 @@ const (
 )
 
 // GateCheck is one gate's outcome.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type GateCheck struct {
 	// Name identifies which gate ran.
 	Name Gate
+	// Fault is the fault that exposed the violation, when one did: a divergence that did not
+	// reproduce violates determinism under that fault. Empty for a gate that compared clean runs.
+	Fault policy.Fault
 	// Result is what the comparison found, and how it classified any failure.
 	Result gate.Result
 }

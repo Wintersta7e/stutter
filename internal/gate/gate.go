@@ -36,6 +36,11 @@ const (
 	// ClassUnobserved means the reference run produced no effects at all. Two empty sequences are
 	// identical, so every other gate holds over them without having compared anything.
 	ClassUnobserved Class = "unobserved"
+	// ClassNotReproducible means a faulted run diverged from the clean run once, and the same fault
+	// replayed again did not: the service is not deterministic under the fault, so no divergence it
+	// produces can be told from noise. Message names the message the fault was aimed at, Want and Got
+	// the first difference the faulted run showed, and Index is -1.
+	ClassNotReproducible Class = "not-reproducible"
 )
 
 // Result reports whether two effect sequences matched, and where they first diverged.
@@ -80,6 +85,10 @@ func (r Result) Describe() string {
 	case ClassUnobserved:
 		return "the clean run produced no effects at all, so there was nothing to compare —\n" +
 			"a service that never reached its proxied dependencies reads exactly like this"
+	case ClassNotReproducible:
+		return "message #" + strconv.FormatUint(r.Message, 10) +
+			" diverged once under the fault, then matched the clean run when replayed —\n" +
+			"the service under test is not deterministic under this fault:\n  want: " + r.Want + "\n   got: " + r.Got
 	default:
 		return "unclassified gate failure at " + position
 	}
