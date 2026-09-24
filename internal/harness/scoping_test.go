@@ -77,12 +77,15 @@ func startCrowded(ctx context.Context, at harness.Addresses, config policy.Confi
 	verbs := map[string]string{consumerReserve: "RESERVE", consumerAudit: "AUDIT"}
 
 	for _, name := range []string{consumerReserve, consumerAudit} {
+		// Each consumer is the configuration the check was handed, which is what legality is read from.
 		consumer, createErr := stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
-			Durable:       name,
-			AckPolicy:     jetstream.AckExplicitPolicy,
-			AckWait:       config.AckWait,
-			MaxDeliver:    config.MaxDeliver,
-			MaxAckPending: config.MaxAckPending,
+			Durable:        name,
+			FilterSubjects: config.FilterSubjects,
+			AckPolicy:      jetstream.AckExplicitPolicy,
+			AckWait:        config.AckWait,
+			BackOff:        config.BackOff,
+			MaxDeliver:     config.MaxDeliver,
+			MaxAckPending:  config.MaxAckPending,
 		})
 		if createErr != nil {
 			return nil, fmt.Errorf("create consumer %q: %w", name, createErr)

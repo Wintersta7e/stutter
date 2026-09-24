@@ -65,7 +65,10 @@ type pulling struct {
 	keys    map[string]bool
 	done    chan struct{}
 	stopped chan struct{}
-	quirks  quirks
+	// consumes is the stream the consumer is on, and created the configuration it was created with.
+	consumes string
+	created  jetstream.ConsumerConfig
+	quirks   quirks
 }
 
 // quirks are the ways a pulling service departs from the plain one, each for the test that needs it.
@@ -76,8 +79,6 @@ type quirks struct {
 	seen *startups
 	// onStop is called when the service stops consuming under stopAfter.
 	onStop func()
-	// filter is the one subject the service's consumer admits. Empty admits the whole stream.
-	filter string
 	// stream is the stream the service consumes from. Empty is the corpus stream's default name.
 	stream string
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
@@ -125,6 +126,9 @@ type quirks struct {
 	// headerGuard makes the handler skip a message whose Idempotency-Key header it has already seen.
 	// A message without the header is never skipped.
 	headerGuard bool
+	// recreate makes the service create its consumer again, with its own configuration, once it has
+	// handled its first delivery — as a service that reconnects mid-run does.
+	recreate bool
 }
 
 // idempotencyKey is the header a header-keyed dedupe guard reads.
@@ -309,14 +313,21 @@ func startPulling(
 		consumes = behaviour.stream
 	}
 
-	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, consumes, jetstream.ConsumerConfig{
-		Name:          name,
-		FilterSubject: behaviour.filter,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       config.AckWait,
-		MaxDeliver:    config.MaxDeliver,
-		MaxAckPending: config.MaxAckPending,
-	})
+	// The consumer is the configuration it was handed, field for field: that configuration is what
+	// legality is read from, and a consumer that differed from it would be faulted under a contract it
+	// does not have.
+	service.consumes = consumes
+	service.created = jetstream.ConsumerConfig{
+		Name:           name,
+		FilterSubjects: config.FilterSubjects,
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		AckWait:        config.AckWait,
+		BackOff:        config.BackOff,
+		MaxDeliver:     config.MaxDeliver,
+		MaxAckPending:  config.MaxAckPending,
+	}
+
+	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, consumes, service.created)
 	if err != nil {
 		return nil, fmt.Errorf("create the consumer: %w", err)
 	}
@@ -483,6 +494,12 @@ func (p *pulling) pump(ctx context.Context) {
 			p.handle(ctx, msg)
 
 			handled++
+
+			if p.quirks.recreate && handled == 1 {
+				//nolint:errcheck // a re-creation that fails leaves the rewrite in force, which the test's
+				// own assertion reports.
+				_, _ = p.stream.CreateOrUpdateConsumer(ctx, p.consumes, p.created)
+			}
 		}
 
 		if p.quirks.stopAfter > 0 && handled >= p.quirks.stopAfter {

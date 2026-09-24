@@ -41,6 +41,10 @@ var (
 		"and handling it did work")
 	// errRestarted means the engine restarted the service under test during the run.
 	errRestarted = errors.New("the service under test restarted")
+	// errDrifted means the consumer under test is not the configuration legality was read from, or
+	// stopped being the one Serialise left behind: faults would be licensed by a contract it does not
+	// have, or its effects could no longer be attributed.
+	errDrifted = errors.New("the consumer under test differs from the configuration discovery read")
 )
 
 // fedBack is the identity a delivery takes when Stutter did not publish its message. No corpus
@@ -161,6 +165,10 @@ func (s *Sandbox) watch(
 	ended, runErr := s.begin(ctx, observed, service.Exited(), run, recorder, messages)
 	if runErr == nil && ended == finished {
 		ended, runErr = s.drain(ctx, observed, service.Exited(), run)
+	}
+
+	if runErr == nil {
+		runErr = s.stillSerialised(ctx, run, ended)
 	}
 
 	run.finish()
@@ -298,17 +306,117 @@ func (s *Sandbox) begin(
 	// exists by now; an empty one means the service created no consumer at all, and scope then refuses
 	// whatever consumer it creates later.
 	if target != "" {
-		discovered, err := s.cfg.Corpus.Serialise(ctx, target, DeliveryCap)
-		if err != nil {
-			return finished, fmt.Errorf("serialise the consumer under test: %w", err)
+		if err := s.serialise(ctx, run, target); err != nil {
+			return finished, err
 		}
-
-		run.discovered = discovered
 	}
 
 	run.scope(target, s.startupLimit())
 
 	return finished, s.fill(ctx, run, target, messages)
+}
+
+// serialise holds the consumer under test to one message in flight and to the delivery cap, and
+// refuses one that is not the configuration legality was read from.
+func (s *Sandbox) serialise(ctx context.Context, run *observedRun, target string) error {
+	discovered, err := s.cfg.Corpus.Serialise(ctx, target, DeliveryCap)
+	if err != nil {
+		return fmt.Errorf("serialise the consumer under test: %w", err)
+	}
+
+	if differs := drift(s.cfg.Policy, discovered); len(differs) > 0 {
+		return fmt.Errorf("%w: %s", errDrifted, strings.Join(differs, ", "))
+	}
+
+	run.discovered = discovered
+
+	return nil
+}
+
+// stillSerialised reads the consumer under test back once its run is over, and refuses the run if the
+// rewrite that held it to one message in flight and to the delivery cap is no longer in force: the
+// service re-created its consumer mid-run, and nothing it did after that can be attributed.
+func (s *Sandbox) stillSerialised(ctx context.Context, run *observedRun, ended interruption) error {
+	target := run.serialised()
+	if target == "" {
+		return nil
+	}
+
+	after, err := s.cfg.Corpus.Policy(ctx, target)
+	if err != nil {
+		// A service that exited can take its consumer with it, and then the exit is the outcome.
+		if ended == targetExited && s.gone(ctx, target) {
+			return nil
+		}
+
+		return fmt.Errorf("%w: read it back after the run: %w", errDrifted, err)
+	}
+
+	capped := run.discovered.EffectiveCap(DeliveryCap)
+
+	var changed []string
+	if after.MaxAckPending != 1 {
+		changed = append(changed, fmt.Sprintf("MaxAckPending %d, want 1", after.MaxAckPending))
+	}
+
+	if after.MaxDeliver != capped {
+		changed = append(changed, fmt.Sprintf("MaxDeliver %d, want %d", after.MaxDeliver, capped))
+	}
+
+	if len(changed) > 0 {
+		return fmt.Errorf("%w: it was re-created during the run (%s)", errDrifted, strings.Join(changed, "; "))
+	}
+
+	return nil
+}
+
+// gone reports whether a consumer is no longer on the corpus stream.
+func (s *Sandbox) gone(ctx context.Context, consumer string) bool {
+	listing, err := s.cfg.Corpus.Consumers(ctx)
+
+	return err == nil && !slices.Contains(listing.Corpus, consumer)
+}
+
+// drift names every field in which got differs from want, in policy.Config's order. Filter subjects are
+// compared as sets and every non-positive MaxDeliver is the same unlimited value, because the delivery
+// contract reads them so; nothing else is normalised.
+func drift(want, got policy.Config) []string {
+	var fields []string
+
+	if want.AckMode != got.AckMode {
+		fields = append(fields, "AckMode")
+	}
+
+	if !slices.Equal(want.BackOff, got.BackOff) {
+		fields = append(fields, "BackOff")
+	}
+
+	if !sameSubjects(want.FilterSubjects, got.FilterSubjects) {
+		fields = append(fields, "FilterSubjects")
+	}
+
+	if want.AckWait != got.AckWait {
+		fields = append(fields, "AckWait")
+	}
+
+	if want.MaxDeliver != got.MaxDeliver && (want.MaxDeliver > 0 || got.MaxDeliver > 0) {
+		fields = append(fields, "MaxDeliver")
+	}
+
+	if want.MaxAckPending != got.MaxAckPending {
+		fields = append(fields, "MaxAckPending")
+	}
+
+	return fields
+}
+
+// sameSubjects compares two filters as sets.
+func sameSubjects(first, second []string) bool {
+	first, second = slices.Clone(first), slices.Clone(second)
+	slices.Sort(first)
+	slices.Sort(second)
+
+	return slices.Equal(slices.Compact(first), slices.Compact(second))
 }
 
 // awaitStartup waits for the service to create a consumer on the corpus stream — the named one, when
@@ -729,6 +837,16 @@ func (r *observedRun) scope(consumer string, startup time.Duration) {
 	r.target.Store(&consumer)
 	r.startup = startup
 	r.touch()
+}
+
+// serialised is the consumer under test once Serialise has held it: empty before, and when the service
+// had created none.
+func (r *observedRun) serialised() string {
+	if target := r.target.Load(); target != nil {
+		return *target
+	}
+
+	return ""
 }
 
 // targets reports whether a consumer is the one under test.
