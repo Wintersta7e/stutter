@@ -99,6 +99,46 @@ func TestVerifyGivesUpAtItsDialDeadline(t *testing.T) {
 	}
 }
 
+// TestVerifyWaitsForAListenerThatOpensLate keeps verifying until the deadline while the host refuses:
+// measured on Docker Desktop, a listener the host has just opened is refused through
+// host.docker.internal for 0.73 to 0.82 s, until WSL's localhost forwarding notices it.
+func TestVerifyWaitsForAListenerThatOpensLate(t *testing.T) {
+	t.Parallel()
+
+	token := testToken(t)
+	late := loopback(unusedPort(t))
+
+	run := runSystem(t, system{}, verifyArgs(token, "127.0.0.1", late.Port(), 3*time.Second))
+
+	time.Sleep(500 * time.Millisecond)
+
+	var config net.ListenConfig
+
+	listener, err := config.Listen(t.Context(), "tcp4", late.String())
+	if err != nil {
+		t.Fatalf("listen late: %v", err)
+	}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+
+		defer func() { _ = conn.Close() }()
+
+		if probe, probeErr := Accept(conn, token); probeErr == nil {
+			_ = WriteAck(probe) //nolint:errcheck // the verifier's exit judges it.
+		}
+	}()
+
+	if code := run.wait(t); code != 0 {
+		t.Errorf("a listener that opened 500ms late: exit = %d, want 0 (stderr %q)", code, run.stderr)
+	}
+}
+
 // TestVerifyNamesEachFailure keeps every failure distinguishable: the verification's error is the one
 // line an unreachable host leaves for its user.
 func TestVerifyNamesEachFailure(t *testing.T) {

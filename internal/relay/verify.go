@@ -10,7 +10,11 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 )
+
+// refusedRetry is how long the verifier waits to dial again after a refusal.
+const refusedRetry = 100 * time.Millisecond
 
 var (
 	// errResolve means the host's name did not resolve to exactly one IPv4 address.
@@ -87,9 +91,7 @@ func (s system) resolveTarget(ctx context.Context, target string) (netip.Addr, e
 // probe dials the verification listener, sends a probe and requires the magic back, all before ctx's
 // deadline.
 func probe(ctx context.Context, address netip.AddrPort, token Token) error {
-	var dialer net.Dialer
-
-	conn, err := dialer.DialContext(ctx, "tcp4", address.String())
+	conn, err := dialRefused(ctx, address)
 	if err != nil {
 		return describe(err)
 	}
@@ -116,6 +118,27 @@ func probe(ctx context.Context, address netip.AddrPort, token Token) error {
 	}
 
 	return nil
+}
+
+// dialRefused dials address, and dials again while it is refused, until ctx ends. The host opens its
+// verification listener just before the verifier starts, and a listener that new is refused for a
+// while through the engine's host alias: measured on Docker Desktop, 0.73 to 0.82 s until WSL's
+// localhost forwarding notices it. Any other failure, or the deadline, ends the dial.
+func dialRefused(ctx context.Context, address netip.AddrPort) (net.Conn, error) {
+	var dialer net.Dialer
+
+	for {
+		conn, err := dialer.DialContext(ctx, "tcp4", address.String())
+		if err == nil || !errors.Is(err, syscall.ECONNREFUSED) {
+			return conn, err //nolint:wrapcheck // describe names the failure; the error is the dial's own.
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, err //nolint:wrapcheck // as above: the last refusal is the cause.
+		case <-time.After(refusedRetry):
+		}
+	}
 }
 
 // describe names a probe failure by its likely cause.
