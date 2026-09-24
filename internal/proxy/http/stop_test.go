@@ -145,10 +145,14 @@ func stopRows() []stopRow {
 			drive: cleartextStop([]byte(connectRequest)),
 		},
 		{
-			name:      "cleartext-on-tls",
-			class:     proxyhttp.StopCleartextOnTLS,
-			want:      "egress stop cleartext-on-tls on port 443: the client sent cleartext where TLS is served",
-			construct: &proxyhttp.EgressStop{Class: proxyhttp.StopCleartextOnTLS, Port: 443},
+			name:  "cleartext-on-tls",
+			class: proxyhttp.StopCleartextOnTLS,
+			want:  "egress stop cleartext-on-tls on port 443: the client sent cleartext where TLS is served",
+			drive: tlsStop(func(t *testing.T, address string, _ *x509.CertPool) {
+				t.Helper()
+
+				dialRaw(t, address).write(t, getRequest("/"))
+			}),
 		},
 		{
 			name:  "silent",

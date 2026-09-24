@@ -88,16 +88,6 @@ func TestTLSStubStopsOnSilentOutcomes(t *testing.T) {
 				return nil
 			},
 		},
-		{
-			name: "handshake then idle",
-			want: "sent no request",
-			client: func(t *testing.T, address string, trust *x509.CertPool) net.Conn {
-				t.Helper()
-
-				// Held open past the header bound; closed only after the stop is seen.
-				return mustDialTLS(t, address, trust)
-			},
-		},
 	}
 
 	for _, testCase := range cases {

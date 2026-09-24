@@ -119,8 +119,7 @@ func (e *entry) listen() {
 func (e *entry) judge(conn net.Conn) {
 	switch e.class {
 	case entryTLS:
-		e.proxy.release(conn)
-		e.handOver(&tunnel{Conn: tls.Server(conn, e.proxy.tlsConfig), proxy: e.proxy, port: e.port})
+		e.judgeTLS(conn)
 	case entryCleartext:
 		e.judgeCleartext(conn)
 	default:
@@ -157,6 +156,48 @@ func (e *entry) judgeCleartext(conn net.Conn) {
 
 	e.proxy.release(conn)
 	e.handOver(checked)
+}
+
+// judgeTLS applies the TLS rows before the handshake. A connection that sends nothing is held and one
+// that closes first is ignored, as in cleartext; a first byte that does not open TLS stops the run.
+// Anything else is handed to net/http for its handshake, which it bounds from about that first byte.
+// The connection stays held until its first request's first byte, so a close still reaches it.
+func (e *entry) judgeTLS(conn net.Conn) {
+	first, err := firstByte(conn)
+	if err != nil {
+		e.proxy.drop(conn)
+
+		return
+	}
+
+	if first[0] != tlsRecord {
+		e.proxy.drop(conn)
+		e.proxy.stopOn(&EgressStop{Class: StopCleartextOnTLS, Port: e.port})
+
+		return
+	}
+
+	replaying := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(first), conn), port: e.port}
+
+	e.handOver(&tunnel{Conn: tls.Server(replaying, e.proxy.tlsConfig), raw: conn, proxy: e.proxy, port: e.port})
+}
+
+// MarkTeardown marks the teardown point: the harness has begun removing the service under test. A TLS
+// connection that closes after it having sent no request is the service going away, not a client that
+// could not talk to the stub. It closes nothing.
+func (p *Proxy) MarkTeardown() {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	p.teardown = true
+}
+
+// tornDown reports whether the teardown point has passed.
+func (p *Proxy) tornDown() bool {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	return p.teardown
 }
 
 // handOver gives a judged connection to net/http, or closes it when the entry is closing.

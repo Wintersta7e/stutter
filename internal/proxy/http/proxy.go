@@ -44,7 +44,6 @@ const (
 var (
 	errActiveRun       = errors.New("HTTP script already has an active run")
 	errServerLog       = errors.New("the HTTP stub could not serve a connection")
-	errEncrypted       = errors.New("client used TLS with the HTTP stub; cleartext HTTP/1.1 is required")
 	errInactiveRun     = errors.New("HTTP script run is not active")
 	errMissingHost     = errors.New("HTTP proxy requires a stable logical host")
 	errMissingScript   = errors.New("HTTP proxy requires a script")
@@ -52,7 +51,6 @@ var (
 	errOversizeRequest = errors.New("HTTP request body exceeds configured limit")
 	errUnparseable     = errors.New("client traffic is not parseable HTTP/1.1; effects cannot be observed")
 	errPreface         = errors.New("client sent the HTTP/2 connection preface")
-	errNoRequest       = errors.New(detailNoRequest)
 )
 
 // Sink receives the effects the stub observes and supplies the run canonical form used as a
@@ -206,6 +204,8 @@ type Proxy struct {
 	heldMu    sync.Mutex
 	// closing is set once the stub has begun to close, so its own closes are never read as a client's.
 	closing bool
+	// teardown is set at the teardown point (MarkTeardown).
+	teardown bool
 }
 
 // New builds a stub serving entries. logicalHost replaces the addresses a service was told to dial in
@@ -285,6 +285,8 @@ type destination interface {
 type tunnel struct {
 	*tls.Conn
 
+	// raw is the connection under TLS, held by the stub until the first request's first byte.
+	raw        net.Conn
 	checked    net.Conn
 	failure    error
 	proxy      *Proxy
@@ -312,31 +314,17 @@ func (t *tunnel) HandshakeContext(ctx context.Context) error {
 			stop.Class, stop.Detail = StopALPN, alpnDetail(t.offered)
 		}
 
+		t.proxy.release(t.raw)
 		t.proxy.stopOn(stop)
 	}
 
 	return err //nolint:wrapcheck // net/http type-checks this error to answer a cleartext client.
 }
 
-// Read applies the cleartext first-request check to the decrypted stream before net/http sees any
-// of it. net/http reads first right after the handshake, so the header bound runs from there.
+// Read applies the first-request check to the decrypted stream before net/http sees any of it.
 func (t *tunnel) Read(buffer []byte) (int, error) {
 	if t.checked == nil && t.failure == nil {
-		t.checked, t.failure = checkConnection(t.Conn, headerBound, errNoRequest, t.port)
-
-		switch {
-		case t.failure == nil:
-			t.proxy.served.Store(t.serverName, struct{}{})
-		case errors.Is(t.failure, errNoRequest) && t.proxy.wasServed(t.serverName):
-			// Go's http.Transport dials for a waiting request, hands that request a connection that
-			// freed first, and pools the fresh one unused. Once this server name has been served, a
-			// connection that sends nothing is that pool, so it closes quietly. A client that pins
-			// certificates never gets a first connection through, so it still stops the run.
-			t.failure = io.EOF
-		default:
-			t.failure = asStop(t.failure, t.port, t.serverName)
-			t.proxy.stopOn(t.failure)
-		}
+		t.checked, t.failure = t.firstRequest()
 	}
 
 	if t.failure != nil {
@@ -344,6 +332,54 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 	}
 
 	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
+}
+
+// firstRequest waits, with no deadline, for the first byte of the connection's first request — a
+// client may keep a connection it has not used yet, and one it never uses hides nothing — and then
+// requires an HTTP/1.x request header within the header bound of that byte. net/http has already
+// bounded the read from the handshake, so that bound is lifted first.
+func (t *tunnel) firstRequest() (net.Conn, error) {
+	if err := t.SetReadDeadline(time.Time{}); err != nil {
+		t.proxy.release(t.raw)
+
+		return nil, fmt.Errorf("lift the first-request deadline: %w", err)
+	}
+
+	first, err := firstByte(t.Conn)
+
+	t.proxy.release(t.raw)
+
+	if err != nil {
+		return nil, t.closedUnused()
+	}
+
+	checked, err := checkRequest(t.Conn, first, t.port)
+	if err != nil {
+		stop := asStop(err, t.port, t.serverName)
+		t.proxy.stopOn(stop)
+
+		return nil, stop
+	}
+
+	t.proxy.served.Store(t.serverName, struct{}{})
+
+	return checked, nil
+}
+
+// closedUnused judges a connection that completed its handshake and closed without a request. After
+// the teardown point it is the service going away. Beside a served connection to the same server name
+// it is Go's http.Transport, which dials for a waiting request, hands that request a connection that
+// freed first, and pools the fresh one unused; a client that pins certificates never gets a first
+// connection through, so it still stops the run. Otherwise it is a client that cannot talk to the stub.
+func (t *tunnel) closedUnused() error {
+	if t.proxy.tornDown() || t.proxy.wasServed(t.serverName) {
+		return io.EOF
+	}
+
+	stop := &EgressStop{Name: t.serverName, Class: StopNoRequest, Port: t.port}
+	t.proxy.stopOn(stop)
+
+	return stop
 }
 
 func (t *tunnel) destination() (uint16, string) { return t.port, t.serverName }
@@ -378,26 +414,7 @@ func (c *replayConn) Read(buffer []byte) (int, error) {
 
 func (c *replayConn) destination() (uint16, string) { return c.port, "" }
 
-// checkConnection admits a connection only once its first request header parses as HTTP/1.x.
-// noRequest is the error for one that closes, or stays silent past timeout, before its first byte.
-func checkConnection(connection net.Conn, timeout time.Duration, noRequest error, port uint16) (net.Conn, error) {
-	if err := connection.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, fmt.Errorf("bound HTTP header read: %w", err)
-	}
-
-	first, err := firstByte(connection)
-	if err != nil {
-		return nil, noRequest
-	}
-
-	if first[0] == tlsRecord {
-		return nil, errEncrypted
-	}
-
-	return checkRequest(connection, first, port)
-}
-
-// asStop turns checkConnection's verdict on a connection to the entry at port into the stop it is.
+// asStop turns checkRequest's verdict on a connection to the entry at port into the stop it is.
 // name is the server name a TLS client asked for, empty in cleartext.
 func asStop(err error, port uint16, name string) error {
 	stop := &EgressStop{Name: name, Port: port}
@@ -409,13 +426,9 @@ func asStop(err error, port uint16, name string) error {
 	}
 
 	switch {
-	case errors.Is(err, errEncrypted) && port == cleartextPort:
-		stop.Class = StopTLSOnCleartext
-	case errors.Is(err, errNoRequest):
-		stop.Class = StopNoRequest
 	case errors.Is(err, errPreface):
 		stop.Class, stop.Detail = StopNotHTTP, detailPreface
-	case errors.Is(err, errEncrypted), errors.Is(err, errUnparseable):
+	case errors.Is(err, errUnparseable):
 		stop.Class = StopNotHTTP
 	default:
 		return err
