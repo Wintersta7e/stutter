@@ -3,6 +3,8 @@
 // exits 1 when its gate fails.
 //
 //	git ls-files -z | testgate builddef [extra paths...]
+//	go test -json ./... | testgate count [-docker=suite|excluded]
+//	go test -json -run ... | testgate expect -test T -action pass|fail|skip [-reason P]
 package main
 
 import (
@@ -23,30 +25,44 @@ const (
 	exitUsage = 2
 )
 
+// streams is a run's input, output and environment.
+type streams struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+	getenv func(string) string
+}
+
 func main() {
-	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr))
+	os.Exit(run(os.Args[1:], streams{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv}))
 }
 
 // run dispatches one subcommand and returns the process's exit code.
-func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func run(args []string, s streams) int {
 	if len(args) == 0 {
-		fmt.Fprintln(stderr, "usage: testgate builddef [extra paths...]")
+		fmt.Fprintln(s.stderr, "usage: testgate builddef|count|expect ...")
 
 		return exitUsage
 	}
 
 	switch args[0] {
 	case "builddef":
-		return builddef(args[1:], stdin, stdout, stderr)
+		return builddef(args[1:], s)
+	case "count":
+		return count(args[1:], s)
+	case "expect":
+		return expect(args[1:], s)
 	default:
-		fmt.Fprintf(stderr, "testgate: unknown subcommand %q\n", args[0])
+		fmt.Fprintf(s.stderr, "testgate: unknown subcommand %q\n", args[0])
 
 		return exitUsage
 	}
 }
 
 // builddef scans the NUL-separated paths on stdin, plus extra, for builds of the product.
-func builddef(extra []string, stdin io.Reader, stdout, stderr io.Writer) int {
+func builddef(extra []string, s streams) int {
+	stdin, stdout, stderr := s.stdin, s.stdout, s.stderr
+
 	paths, err := nulSeparated(stdin)
 	if err != nil {
 		fmt.Fprintf(stderr, "builddef: reading the file list: %v\n", err)
