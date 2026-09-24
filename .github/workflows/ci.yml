@@ -119,12 +119,14 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Repeat the database-free suite
+      - name: Repeat every package that needs neither a database nor Docker
+        # The set is derived from the packages themselves, never listed by hand: a package whose tests
+        # read the database variable, or whose test binary links the Docker helper, is left out.
         run: |
-          go test -race -shuffle=on -count=5 \
-            ./internal/effect/... ./internal/gate/... ./internal/policy/... \
-            ./internal/shrink/... ./internal/report/... ./internal/check/... \
-            ./internal/proxy/... ./internal/version/...
+          set -euo pipefail
+          go list -test -json ./... | go run ./tools/testgate flakeset > "$RUNNER_TEMP/flake-packages"
+          mapfile -t pkgs < "$RUNNER_TEMP/flake-packages"
+          go test -race -shuffle=on -count=5 -json "${pkgs[@]}" | go run ./tools/testgate count -docker=excluded
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}

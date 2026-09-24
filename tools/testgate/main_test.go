@@ -131,3 +131,24 @@ func TestExpectNamesTheOutcome(t *testing.T) {
 		t.Fatalf("a renamed test: exit %d, stderr %q", got.code, got.stderr)
 	}
 }
+
+func TestFlakesetPrintsTheDerivedPackages(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a_test.go"), []byte("package a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	list := `{"ImportPath": "example.test/a", "Dir": "` + dir + `", "TestGoFiles": ["a_test.go"]}`
+
+	got := runWith([]string{"flakeset"}, list, nil)
+	if got.code != exitPass || got.stdout != "example.test/a\n" ||
+		!strings.Contains(got.stderr, "flake packages with-tests=1 postgres=0 docker=0 derived=1") {
+		t.Fatalf("exit %d, stdout %q, stderr %q", got.code, got.stdout, got.stderr)
+	}
+
+	if got := runWith([]string{"flakeset"}, "", nil); got.code != exitFail {
+		t.Fatalf("an empty set: exit %d, want %d", got.code, exitFail)
+	}
+}

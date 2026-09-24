@@ -95,10 +95,14 @@ func suite() testgate.Options { return testgate.Options{Docker: testgate.DockerS
 
 const dockerSkip = "STUTTER_TEST_DOCKER=skip: the Docker tests were not run"
 
+// dbSkip is a database test's skip reason. It never names the database variable: a test file that
+// does is read as a database package and leaves the flake set.
+const dbSkip = "the test database is not configured"
+
 func TestTheCounterFailsOnAnySkip(t *testing.T) {
 	t.Parallel()
 
-	tally := count(t, append(skipped("TestNeedsADatabase", "STUTTER_TEST_POSTGRES not set"), pass("TestA"))...)
+	tally := count(t, append(skipped("TestNeedsADatabase", dbSkip), pass("TestA"))...)
 
 	verdict := tally.Verdict(suite())
 	if len(verdict) == 0 {
@@ -110,7 +114,7 @@ func TestTheCounterFailsOnAnySkip(t *testing.T) {
 		t.Fatalf("first line %q", lines[0])
 	}
 
-	want := "skipped " + pkg + ".TestNeedsADatabase: STUTTER_TEST_POSTGRES not set"
+	want := "skipped " + pkg + ".TestNeedsADatabase: " + dbSkip
 	if !slices.Contains(lines, want) {
 		t.Fatalf("the report does not name the skip %q:\n%s", want, strings.Join(lines, "\n"))
 	}
@@ -211,7 +215,7 @@ func TestTheOptOutAdmitsOnlyPrefixedSkips(t *testing.T) {
 	}
 
 	events := append(skipped("TestTheEngineAnswers", dockerSkip), pass("TestA"))
-	events = append(events, skipped("TestNeedsADatabase", "STUTTER_TEST_POSTGRES not set")...)
+	events = append(events, skipped("TestNeedsADatabase", dbSkip)...)
 
 	if verdict := count(t, events...).Verdict(opts); len(verdict) == 0 {
 		t.Fatal("a database skip was admitted under the Docker opt-out")

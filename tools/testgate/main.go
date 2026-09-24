@@ -5,6 +5,7 @@
 //	git ls-files -z | testgate builddef [extra paths...]
 //	go test -json ./... | testgate count [-docker=suite|excluded]
 //	go test -json -run ... | testgate expect -test T -action pass|fail|skip [-reason P]
+//	go list -test -json ./... | testgate flakeset
 package main
 
 import (
@@ -40,7 +41,7 @@ func main() {
 // run dispatches one subcommand and returns the process's exit code.
 func run(args []string, s streams) int {
 	if len(args) == 0 {
-		fmt.Fprintln(s.stderr, "usage: testgate builddef|count|expect ...")
+		fmt.Fprintln(s.stderr, "usage: testgate builddef|count|expect|flakeset ...")
 
 		return exitUsage
 	}
@@ -52,6 +53,8 @@ func run(args []string, s streams) int {
 		return count(args[1:], s)
 	case "expect":
 		return expect(args[1:], s)
+	case "flakeset":
+		return flakeset(s)
 	default:
 		fmt.Fprintf(s.stderr, "testgate: unknown subcommand %q\n", args[0])
 
