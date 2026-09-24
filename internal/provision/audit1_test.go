@@ -39,12 +39,12 @@ func spawnersAllowed() map[string]string {
 	}
 }
 
-// pruneExempt are the files that may name prune: this audit, and the recorder that classifies prune
-// API paths.
+// pruneExempt are the files that may name prune: this audit, the recorder that classifies prune
+// API paths, and the audit-line grammar whose recorder line counts them.
 func pruneExempt() map[string]bool {
 	return map[string]bool{
 		auditFile: true, "internal/dockertest/recorder.go": true,
-		"internal/dockertest/recorder_internal_test.go": true,
+		"internal/dockertest/recorder_internal_test.go": true, "internal/testgate/audit.go": true,
 	}
 }
 
@@ -536,6 +536,9 @@ var (
 	pruneAPIPath  = regexp.MustCompile(`(^|/)prune($|[/?])`)
 	dockerCommand = regexp.MustCompile(`\bdocker\s+([a-z][a-z0-9-]*)`)
 	pruneToken    = regexp.MustCompile(`(^|[^\w-])prune\b`)
+	// composeRun is the compose plugin given an argument: run, not a file named by a download,
+	// checksum or move.
+	composeRun = regexp.MustCompile(`docker-compose"?[ \t]+[^\s|;&<>\\"'` + "`" + `)]`)
 )
 
 // pruneInGo finds prune as an argv element, an API path, or a docker command string.
@@ -571,7 +574,7 @@ func textInvocations(texts []textSource) []string {
 				}
 			}
 
-			if strings.Contains(line, "docker-compose") {
+			if composeRun.MatchString(line) {
 				violations = append(violations, "item 3: "+src.path+" runs docker-compose")
 			}
 
@@ -923,6 +926,9 @@ func TestAuditOneCatchesEachBreak(t *testing.T) {
 		{name: "compose up", detect: func() []string {
 			src := "package provision_test\n\nvar x = []string{\"compose\", \"up\"}\n"
 			return composeSites([]goSource{parseGo(t, "internal/provision/x_test.go", []byte(src))}).violations
+		}},
+		{name: "a Makefile running the compose plugin", detect: func() []string {
+			return textInvocations([]textSource{{path: "Makefile", text: "\t\"$(DEST)/docker-compose\" up -d\n"}})
 		}},
 		{name: "a verb added to the runner only", detect: func() []string {
 			rows := verbRows([]goSource{parseGo(t, runnerFile, []byte(extraRow))})
