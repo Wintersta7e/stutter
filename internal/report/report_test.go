@@ -11,7 +11,9 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/gate"
+	"github.com/Wintersta7e/stutter/internal/harness"
 	"github.com/Wintersta7e/stutter/internal/policy"
+	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/report"
 )
 
@@ -1019,5 +1021,100 @@ func TestHealthNotesNameWhatTheBusDid(t *testing.T) {
 
 	if plain := withHealth(report.New(scan, heldGates(), nil), quiet).String(); strings.Contains(plain, "NOTE") {
 		t.Errorf("a clean run that saw none of it rendered a note:\n%s", plain)
+	}
+}
+
+// TestHealthNotesOwedExhaustedAndAnExit: a clean run cut at the owed-silence limit, one whose messages
+// reached the delivery cap, and one whose service exited by itself after every message was done each
+// say so beside the verdict — one note apiece — and a run with none of it renders no note at all.
+func TestHealthNotesOwedExhaustedAndAnExit(t *testing.T) {
+	t.Parallel()
+
+	scan := report.Scan{Consumers: 1, Messages: 3}
+	base := report.Health{Messages: 3, Delivered: 3, Effects: 3}
+
+	cases := []struct {
+		health func(report.Health) report.Health
+		name   string
+		want   string
+	}{
+		{
+			name:   "owed",
+			want:   "2 of 3 messages were still owed an acknowledgement",
+			health: func(h report.Health) report.Health { h.Owed = 2; return h },
+		},
+		{
+			name: "exhausted",
+			want: "1 message reached the cap of " + strconv.Itoa(harness.DeliveryCap) + " deliveries",
+			health: func(h report.Health) report.Health {
+				h.Exhausted = 1
+
+				return h
+			},
+		},
+		{
+			name: "exited",
+			want: "the service exited on its own after message #3: exited with code 1; log: logs/target.log",
+			health: func(h report.Health) report.Health {
+				h.Exit = replay.Exit{Log: "logs/target.log", After: 3, Code: 1, Exited: true}
+
+				return h
+			},
+		},
+	}
+
+	for _, testCase := range cases {
+		rendered := withHealth(report.New(scan, heldGates(), nil), testCase.health(base)).String()
+		notes := strings.Count(rendered, "NOTE")
+
+		t.Logf("%s: %d note lines", testCase.name, notes)
+
+		if notes != 1 || !strings.Contains(rendered, testCase.want) {
+			t.Errorf("%s: %d notes, want one naming %q:\n%s", testCase.name, notes, testCase.want, rendered)
+		}
+	}
+
+	plain := withHealth(report.New(scan, heldGates(), nil), base).String()
+	t.Logf("none: %d note lines", strings.Count(plain, "NOTE"))
+
+	if strings.Contains(plain, "NOTE") {
+		t.Errorf("a clean run with nothing owed, exhausted or exited rendered a note:\n%s", plain)
+	}
+}
+
+// TestAFindingCarriesItsExitAndItsStop: a finding whose run the service exited during says how and
+// after which message, beside a verdict that stands; one whose run stopped on an egress-policy stop is
+// held at WARN, because what the service did next went unobserved.
+func TestAFindingCarriesItsExitAndItsStop(t *testing.T) {
+	t.Parallel()
+
+	stopped := corruptingStock()
+	stopped.Stopped = "a connection to 203.0.113.9:443 sent nothing"
+
+	exited := corruptingStock()
+	exited.Exit = replay.Exit{After: 8891, Code: 137, Exited: true, OOMKilled: true}
+
+	built := report.New(report.Scan{Consumers: 3, Messages: 3}, heldGates(),
+		[]report.Divergence{stopped, exited, corruptingStock()})
+
+	statuses := make(map[report.Status]int)
+	for _, finding := range built.Findings {
+		statuses[finding.Status]++
+	}
+
+	if statuses[report.StatusWarn] != 1 || statuses[report.StatusFail] != 2 {
+		t.Errorf("statuses = %v, want the stopped run WARN and the others FAIL", statuses)
+	}
+
+	rendered := built.String()
+
+	for _, want := range []string{
+		"the run stopped on a connection to 203.0.113.9:443 sent nothing: what the service did next is " +
+			"unobservable",
+		"the service exited under this fault after message #8891: exited with code 137, OOM-killed",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered report is missing %q:\n%s", want, rendered)
+		}
 	}
 }
