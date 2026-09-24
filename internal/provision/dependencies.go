@@ -143,9 +143,11 @@ type Dependencies struct {
 	levels [][]string
 	// jobs are the discovered jobs, in the order they run.
 	jobs []string
-	cfg  DependencyConfig
-	mu   sync.Mutex
-	step step
+	// lastJob is when the last job exited, on the monotonic clock; zero when no job ran.
+	lastJob time.Time
+	cfg     DependencyConfig
+	mu      sync.Mutex
+	step    step
 }
 
 // NewDependencies derives a check's started dependencies from its final classification.

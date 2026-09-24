@@ -21,9 +21,10 @@ import (
 )
 
 // treeServer is the script a fixture service runs to let a test read one of its directories: a tar of
-// it on every connection to port 7000. Tests reach the engine only through the test helper, which
-// copies nothing out, so a container hands its own files over.
-const treeServer = "while :; do tar -c -C \"$$0\" . | nc -l -p 7000; done"
+// it, made when a connection to port 7000 arrives, never before, so it is the directory as it is then.
+// Tests reach the engine only through the test helper, which copies nothing out, so a container hands
+// its own files over.
+const treeServer = "while :; do nc -l -p 7000 -e tar -c -C \"$$0\" .; done"
 
 // treePort is the port treeServer serves on.
 const treePort = 7000
