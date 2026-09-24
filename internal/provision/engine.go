@@ -47,6 +47,8 @@ type Engine struct {
 	exited map[int]chan struct{}
 	// held maps a one-name container kept stopped under Keep to its seq, until its successor.
 	held map[string]int
+	// hostPorts holds, per created container's seq, the host ports reserved for it until its removal.
+	hostPorts map[int][]uint16
 	// closing is closed when the check closes, ending every wait.
 	closing    chan struct{}
 	interfaces func() ([]localAddr, error)

@@ -67,6 +67,9 @@ type fakeEngine struct {
 	logCall    func(callLine)
 	// inspectHook, when set, edits every created container's inspect as the engine reports it.
 	inspectHook func(inspect *containerReport)
+	// refuseStart, when set, is the engine's answer to starting a container: empty starts it, anything
+	// else refuses the start with that line.
+	refuseStart func(inspect *containerReport) string
 	// registry holds the images a pull can land, by reference.
 	registry    map[string]*fakeObject
 	ledgerPath  string
@@ -593,6 +596,12 @@ func (f *fakeEngine) start(spec verbSpec, rest []string) (result, error) {
 	container := f.find(ResourceContainer, rest[len(rest)-1])
 	if container == nil || container.inspect == nil {
 		return fail(spec, "No such container")
+	}
+
+	if f.refuseStart != nil {
+		if refusal := f.refuseStart(container.inspect); refusal != "" {
+			return fail(spec, refusal)
+		}
 	}
 
 	container.inspect.Running, container.stopped = true, make(chan struct{})

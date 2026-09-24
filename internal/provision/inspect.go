@@ -245,7 +245,8 @@ func (e *Engine) Address(ctx context.Context, c *Container, n *Network) (netip.A
 	return netip.Addr{}, fmt.Errorf("%w: container %s has no address on %s", ErrEngine, c.name, n.name)
 }
 
-// Published returns where a container's port is published on the host's loopback.
+// Published returns where a container's port is published on the host's loopback. It is read after
+// Start and never before: a start refused for a taken host port moves the container to another.
 func (e *Engine) Published(ctx context.Context, c *Container, port uint16) (netip.AddrPort, error) {
 	report, err := e.inspectContainer(ctx, c)
 	if err != nil {
