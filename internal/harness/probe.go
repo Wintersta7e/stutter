@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
 )
 
 // stageProbe names the probe start in its errors.
@@ -47,12 +49,22 @@ func (s *Sandbox) probe(ctx context.Context) (Probe, error) {
 		return Probe{}, err
 	}
 
-	_, err = start.observed.await(ctx, start.service.Exited(), s.probeEnded(start))
+	ended, err := start.observed.await(ctx, start.service.Exited(), s.probeEnded(start))
 
-	// Ownership is read at the moment the start ended, before the service is removed.
+	// Ownership is read at the moment the start ended, before the service is removed. An egress-policy
+	// stop ends the probe start as an exit does, but only while the stream is absent: once it exists the
+	// start is discovery's, and there the stop stops the check.
+	stopped := ended == proxyStopped && isEgressStop(err)
+
 	var created bool
-	if err == nil {
-		created, err = s.streamExists(ctx)
+
+	if err == nil || stopped {
+		exists, surveyErr := s.streamExists(ctx)
+		if stopped && !exists {
+			err = nil
+		}
+
+		created, err = exists, errors.Join(err, surveyErr)
 	}
 
 	if err == nil && created {
@@ -113,4 +125,12 @@ func (b *bare) quietSinceRequest() (time.Duration, bool) {
 func (w *startWatch) Requested(string) {
 	now := time.Now()
 	w.requested.CompareAndSwap(nil, &now)
+}
+
+// isEgressStop reports whether a wait ended on an egress-policy stop: a connection the stub could not
+// observe, as opposed to a dependency Stutter could not reach.
+func isEgressStop(err error) bool {
+	stop, found := errors.AsType[*httpproxy.EgressStop](err)
+
+	return found && stop != nil
 }

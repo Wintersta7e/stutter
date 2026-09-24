@@ -46,6 +46,7 @@ github.com/Wintersta7e/stutter/internal/harness.bare.conclude
 github.com/Wintersta7e/stutter/internal/harness.bare.discard
 github.com/Wintersta7e/stutter/internal/harness.bare.quiet
 github.com/Wintersta7e/stutter/internal/harness.bare.quietSinceRequest
+github.com/Wintersta7e/stutter/internal/harness.isEgressStop
 github.com/Wintersta7e/stutter/internal/harness.startOnly
 # The invocation listener set and its endpoint keys: opened by the compose path once per check.
 github.com/Wintersta7e/stutter/internal/harness.EndpointKey

@@ -190,8 +190,12 @@ func (b *bare) quiet() time.Duration {
 }
 
 // discard ends the start. The service goes first, because the proxies wait for its connections; the
-// script is aborted, never committed.
+// script is aborted, never committed. The teardown point is marked before the service goes: a
+// connection it closes as it is removed hid nothing, and without the mark a TLS connection held open
+// without a request would read as a client that could not talk to the stub.
 func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
+	b.observed.markTeardown()
+
 	exit, err := b.service.Close(ctx)
 	if err != nil {
 		err = fmt.Errorf("close the service under test: %w", err)
@@ -330,9 +334,9 @@ func (d Discovery) diagnosis() string {
 }
 
 // readDiscovered reads every consumer on the corpus stream as the server holds it, on Stutter's own
-// connection, and names those with no durable name of their own. Nothing is serialised: the read-back
-// is the one legality input, and a rewrite read back would license faults against a contract the
-// service never had.
+// connection, and names the ones that can be targets with no durable name of their own. Nothing is
+// serialised: the read-back is the one legality input, and a rewrite read back would license faults
+// against a contract the service never had.
 func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (Discovery, []string, error) {
 	consumers := make([]Found, 0, len(listing.Corpus))
 
@@ -344,6 +348,13 @@ func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (D
 			return Discovery{}, nil, err
 		}
 
+		consumers = append(consumers, found)
+
+		// A consumer that can never be a target is never looked for by name, so its name costs no start.
+		if found.Excluded != "" {
+			continue
+		}
+
 		durable, err := s.cfg.Corpus.Durable(ctx, name)
 		if err != nil {
 			return Discovery{}, nil, fmt.Errorf("read consumer %q: %w", name, err)
@@ -352,8 +363,6 @@ func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (D
 		if !durable {
 			durableLess = append(durableLess, name)
 		}
-
-		consumers = append(consumers, found)
 	}
 
 	return Discovery{Consumers: consumers, Elsewhere: listing.Elsewhere}, durableLess, nil
