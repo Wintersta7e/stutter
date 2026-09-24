@@ -12,7 +12,7 @@ import (
 func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 	t.Parallel()
 
-	for _, release := range []string{"2.29.7", "5.5.1"} {
+	for _, release := range releases {
 		model := modelFrom(t, string(golden(t, release)))
 
 		cases := []struct {
@@ -67,7 +67,7 @@ func TestAnUnparseableHealthcheckTimingIsNamed(t *testing.T) {
 func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 	t.Parallel()
 
-	for _, release := range []string{"2.29.7", "5.5.1"} {
+	for _, release := range releases {
 		model := modelFrom(t, string(golden(t, release)))
 
 		cases := []struct {

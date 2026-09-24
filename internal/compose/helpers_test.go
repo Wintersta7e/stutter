@@ -71,6 +71,9 @@ const (
 	target = "api"
 	// toolsService is a profile-gated service.
 	toolsService = "tools"
+	// resolvedEnvironment is compose's resolved environment for every model modelFrom parses: the
+	// two variables the kitchen model's environment-sourced config and secret read.
+	resolvedEnvironment = "HOME=/home/x\nCONFIG_VALUE=config-value\nSECRET_VALUE=secret-value\n"
 	// absentService is a service no model has.
 	absentService = "ghost"
 	// pidKey, ipcKey and utsKey are namespace keys several tests name.
@@ -78,6 +81,9 @@ const (
 	ipcKey = "ipc"
 	utsKey = "uts"
 )
+
+// releases are the compose releases whose rendering of the kitchen model is committed.
+var releases = []string{"2.29.7", "5.5.1"}
 
 // project writes a compose file into a fresh project directory and returns its absolute path.
 func project(t *testing.T, name string) string {
@@ -107,7 +113,10 @@ func golden(t *testing.T, release string) []byte {
 func modelFrom(t *testing.T, jsonText string) *compose.Model {
 	t.Helper()
 
-	run := &fakeRun{whole: func([]string) ([]byte, int, error) { return []byte(jsonText), 0, nil }}
+	run := &fakeRun{
+		whole:       func([]string) ([]byte, int, error) { return []byte(jsonText), 0, nil },
+		environment: []byte(resolvedEnvironment),
+	}
 
 	file := project(t, "compose.yaml")
 	if strings.Contains(jsonText, `"x-stutter"`) {

@@ -21,14 +21,14 @@ func (m *Model) BindSources(services []string) []string {
 		}
 
 		for _, volume := range svc.Volumes {
-			if volume.Type == "bind" && volume.Source != "" {
-				sources = append(sources, volume.Source)
+			if volume.Type == volumeTypeBind && volume.Source != "" {
+				sources = append(sources, unescape(volume.Source))
 			}
 		}
 
 		for _, file := range m.usedFiles(svc) {
 			if file.def.File != "" {
-				sources = append(sources, file.def.File)
+				sources = append(sources, unescape(file.def.File))
 			}
 		}
 	}
@@ -214,8 +214,8 @@ func (m *Model) mountRefusals(svc *composeService, prints Prints) []*Refusal {
 			found = append(found, refusal)
 		}
 
-		if volume.Type == "bind" {
-			found = append(found, sourceRefusal(volume.Source, prints)...)
+		if volume.Type == volumeTypeBind {
+			found = append(found, sourceRefusal(unescape(volume.Source), prints)...)
 		}
 	}
 
@@ -242,7 +242,7 @@ func (m *Model) volumeRefusal(key string, volume serviceVolume) *Refusal {
 		return &Refusal{Key: key + ".volume.subpath", Class: K9}
 	case volume.Bind != nil && volume.Bind.SELinux != "":
 		return &Refusal{Key: key + ".bind.selinux", Class: K9}
-	case volume.Type == "volume" && m.externalVolume(volume.Source):
+	case volume.Type == volumeTypeVolume && m.externalVolume(volume.Source):
 		return &Refusal{Key: "volumes." + volume.Source + ".external", Class: K9}
 	default:
 		return nil
@@ -286,6 +286,7 @@ func coversCA(target string) bool {
 // serviceFileRef is one config or secret a service uses, with its top-level definition.
 type serviceFileRef struct {
 	def    *topFile
+	use    serviceFile
 	kind   string
 	source string
 	target string
@@ -316,7 +317,7 @@ func (m *Model) usedFiles(svc *composeService) []serviceFileRef {
 				target = set.prefix + use.Source
 			}
 
-			refs = append(refs, serviceFileRef{def: def, kind: set.kind, source: use.Source, target: target})
+			refs = append(refs, serviceFileRef{def: def, use: use, kind: set.kind, source: use.Source, target: target})
 		}
 	}
 
@@ -345,7 +346,7 @@ func (m *Model) fileRefusals(svc *composeService, prints Prints) []*Refusal {
 		}
 
 		if file.def.File != "" {
-			found = append(found, sourceRefusal(file.def.File, prints)...)
+			found = append(found, sourceRefusal(unescape(file.def.File), prints)...)
 		}
 
 		if file.def.Content == nil && file.def.Environment == "" {

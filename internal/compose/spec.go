@@ -34,7 +34,37 @@ func (m *Model) Spec(service string, img Image, ca map[string]string) (Spec, err
 		return Spec{}, errCAEnvironment
 	}
 
-	spec := Spec{
+	spec := identity(service, svc, img)
+	spec.target = ca != nil
+
+	if svc.Entrypoint != nil {
+		spec.Entrypoint, spec.EntrypointSet = unescapeAll(*svc.Entrypoint), true
+	}
+
+	if svc.Command != nil {
+		spec.Cmd, spec.CmdSet = unescapeAll(*svc.Command), true
+	}
+
+	applyEnvironment(&spec, svc, img, ca)
+
+	spec.Replaced = m.replaced(service, svc)
+
+	if err := m.applyMounts(&spec, svc, img); err != nil {
+		return Spec{}, err
+	}
+
+	var constant bool
+	if spec.Hostname, constant = m.hostname(service, svc); constant {
+		spec.Replaced = append(spec.Replaced, Replaced{Key: "hostname", What: "a per-check constant"})
+	}
+
+	return spec, nil
+}
+
+// identity copies what a spec takes from the model as it stands: the process's identity, its
+// privileges and its resources.
+func identity(service string, svc *composeService, img Image) Spec {
+	return Spec{
 		Service:     service,
 		Image:       img.ID,
 		Platform:    svc.Platform,
@@ -54,27 +84,7 @@ func (m *Model) Spec(service string, img Image, ca map[string]string) (Spec, err
 		CapDrop:     slices.Clone(svc.CapDrop),
 		GroupAdd:    slices.Clone(svc.GroupAdd),
 		Resources:   resources(svc),
-		target:      ca != nil,
 	}
-
-	if svc.Entrypoint != nil {
-		spec.Entrypoint, spec.EntrypointSet = unescapeAll(*svc.Entrypoint), true
-	}
-
-	if svc.Command != nil {
-		spec.Cmd, spec.CmdSet = unescapeAll(*svc.Command), true
-	}
-
-	applyEnvironment(&spec, svc, img, ca)
-
-	spec.Replaced = m.replaced(service, svc)
-
-	var constant bool
-	if spec.Hostname, constant = m.hostname(service, svc); constant {
-		spec.Replaced = append(spec.Replaced, Replaced{Key: "hostname", What: "a per-check constant"})
-	}
-
-	return spec, nil
 }
 
 func sysctls(svc *composeService) map[string]string {

@@ -97,7 +97,7 @@ type Mount struct {
 	Volume string
 	// Size is a tmpfs size in bytes; zero is unset.
 	Size int64
-	// Mode is a tmpfs mode; zero is unset.
+	// Mode is a tmpfs mode as compose wrote it, sticky bit included as the octal 01000; zero is unset.
 	Mode fs.FileMode
 	// ReadOnly mounts it read-only. Every bind is read-only.
 	ReadOnly bool
