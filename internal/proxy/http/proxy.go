@@ -1,4 +1,4 @@
-// Package http provides a cleartext HTTP/1.1 stub that records outbound requests.
+// Package http provides an HTTP/1.1 stub, in cleartext and over TLS, that records outbound requests.
 package http
 
 import (
@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	nethttp "net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -29,25 +30,27 @@ const (
 	maxRequestHeader      = 1 << 20
 	initialHeaderCapacity = 1024
 	tlsRecord             = 0x16
-	// headerBound is how long a connection has to deliver its first request header: from accept in
-	// cleartext, from handshake completion behind TLS. net/http's handshake timeout derives from it.
+	// cleartextPort and tlsPort are the ports the service dials the stub's two entries on. A stop names
+	// them, never the listener's own kernel-assigned port.
+	cleartextPort uint16 = 80
+	tlsPort       uint16 = 443
+	// headerBound is how long a connection has to deliver its first request header, from its first
+	// byte. net/http's handshake timeout derives from it.
 	headerBound = time.Second
+	// http2Preface opens every HTTP/2 connection made with prior knowledge.
+	http2Preface = "PRI * HTTP/2.0\r\n"
 )
 
 var (
 	errActiveRun       = errors.New("HTTP script already has an active run")
 	errServerLog       = errors.New("the HTTP stub could not serve a connection")
-	errEncrypted       = errors.New("client used TLS with the HTTP stub; cleartext HTTP/1.1 is required")
-	errHandshake       = errors.New("TLS handshake with the HTTP stub failed")
 	errInactiveRun     = errors.New("HTTP script run is not active")
 	errMissingHost     = errors.New("HTTP proxy requires a stable logical host")
 	errMissingScript   = errors.New("HTTP proxy requires a script")
 	errMissingSink     = errors.New("HTTP proxy requires an effect sink")
 	errOversizeRequest = errors.New("HTTP request body exceeds configured limit")
 	errUnparseable     = errors.New("client traffic is not parseable HTTP/1.1; effects cannot be observed")
-	errNoRequest       = errors.New("the client completed a TLS handshake and sent no request, and no " +
-		"earlier connection to this host did either: it likely pins certificates or speaks a protocol the " +
-		"stub does not serve")
+	errPreface         = errors.New("client sent the HTTP/2 connection preface")
 )
 
 // Sink receives the effects the stub observes and supplies the run canonical form used as a
@@ -75,7 +78,9 @@ type Route struct {
 
 // Script is the persistent fixture shared by clean and faulted replay runs.
 type Script struct {
-	frozen          map[string][]Response
+	frozen map[string][]Response
+	// tally is what the committed runs answered per host.
+	tally           map[string]*HostTally
 	active          *Run
 	routes          []Route
 	defaultResponse Response
@@ -88,8 +93,10 @@ type Run struct {
 	script   *Script
 	captured map[string][]Response
 	replayed map[string]int
-	capture  bool
-	done     bool
+	// tally is what this run answered per host, kept only if the run commits.
+	tally   map[string]*HostTally
+	capture bool
+	done    bool
 }
 
 // NewScript constructs a fixture. Its configuration is copied, so later caller mutation cannot
@@ -145,6 +152,7 @@ func (r *Run) Commit() error {
 		r.script.frozen = cloneFrozen(r.captured)
 	}
 
+	r.script.keep(r)
 	r.done = true
 	r.script.active = nil
 
@@ -172,141 +180,110 @@ func (r *Run) Abort() error {
 }
 
 // Proxy serves configured HTTP replies and records each request before its response is written.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type Proxy struct {
-	listener net.Listener
-	script   *Script
-	sink     Sink
-	server   *nethttp.Server
+	script *Script
+	sink   Sink
+	server *nethttp.Server
+	// tlsConfig is the one TLS configuration every connection shares: a copy per connection would give
+	// each its own session ticket keys, and no client could resume a session.
+	tlsConfig *tls.Config
+	// held are the connections the stub is judging or holding before net/http has them, closed with
+	// the stub so an idle one never presents as a teardown that hangs.
+	held map[net.Conn]struct{}
+	// watched are the catch-all TLS connections waiting for their first request, which the teardown
+	// point cuts short.
+	watched  map[*tunnel]struct{}
 	closeErr error
 	// failure is the first error net/http reported while serving. It stops the run rather than
 	// being recorded, so a broken connection can never be mistaken for a side effect.
 	failure error
-	// served holds the server names at least one TLS connection has sent a request for. A later
-	// connection to one of them that sends nothing is the client's pool, not a client that cannot
-	// reach the stub (see tunnel.Read).
-	served sync.Map
-
+	// served holds what the connections that sent a request were, by entry, port and server name. It
+	// is this run's only: the stub is built once per run, so a name served in one run exempts nothing in
+	// the next. A later connection with the same key that sends nothing is the client's pool, not a
+	// client that cannot reach the stub (see tunnel.closedUnused).
+	served      map[servedKey]struct{}
 	logicalHost string
-	closeOnce   sync.Once
-	failOnce    sync.Once
-	failed      sync.Mutex
+	entries     []*entry
+
+	closeOnce sync.Once
+	failOnce  sync.Once
+	failed    sync.Mutex
+	// heldMu guards held, watched, served, closing and teardown.
+	heldMu sync.Mutex
+	// closing is set once the stub has begun to close, so its own closes are never read as a client's.
+	closing bool
+	// teardown is set at the teardown point (MarkTeardown).
+	teardown bool
 }
 
-// Listen binds a cleartext HTTP/1.1 stub at addr. logicalHost replaces the ephemeral listener
-// address in observations so runs can be compared.
-func Listen(ctx context.Context, addr, logicalHost string, sink Sink, script *Script) (*Proxy, error) {
-	return bind(ctx, addr, logicalHost, sink, script, nil)
-}
-
-// ListenTLS binds an HTTPS stub serving certificate.
+// New builds a stub serving entries. logicalHost replaces the addresses a service was told to dial in
+// observations, so runs can be compared. certificate presents the TLS entry's certificate for each
+// client; it is required when that entry is set.
 //
-// Most real dependencies are reached over TLS, and a service that cannot reach its dependency
-// produces no effects at all — which reads as a handler that did nothing. The caller supplies the
-// certificate and is responsible for giving the service under test the CA that signed it.
-func ListenTLS(
-	ctx context.Context,
-	addr, logicalHost string,
+// Most real dependencies are reached over TLS, and a service that cannot reach its dependency produces
+// no effects at all — which reads as a handler that did nothing. The caller is responsible for giving
+// the service under test the CA that signed what certificate returns.
+func New(
+	entries Entries,
+	logicalHost string,
 	sink Sink,
 	script *Script,
-	certificate tls.Certificate,
+	certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error),
 ) (*Proxy, error) {
-	return bind(ctx, addr, logicalHost, sink, script, &tls.Config{
-		Certificates:       []tls.Certificate{certificate},
-		GetConfigForClient: recordServerName,
-		// HTTP/1.1 is all the stub serves. Agreeing on it in the handshake makes an h2-only client
-		// fail there, loudly, instead of connecting and hanging up unseen.
-		NextProtos: []string{"http/1.1"},
-		MinVersion: tls.VersionTLS12,
-	})
-}
-
-func bind(
-	ctx context.Context,
-	addr, logicalHost string,
-	sink Sink,
-	script *Script,
-	serverTLS *tls.Config,
-) (*Proxy, error) {
-	if sink == nil {
+	switch {
+	case sink == nil:
 		return nil, errMissingSink
-	}
-
-	if script == nil {
+	case script == nil:
 		return nil, errMissingScript
-	}
-
-	if logicalHost == "" {
+	case logicalHost == "":
 		return nil, errMissingHost
+	case entries.Cleartext == nil && entries.TLS == nil && entries.CatchAll == nil:
+		return nil, errNoEntries
+	case (entries.TLS != nil || entries.CatchAll != nil) && certificate == nil:
+		return nil, errNoCertificates
+	default:
 	}
 
-	var config net.ListenConfig
-
-	listener, err := config.Listen(ctx, "tcp", addr)
-	if err != nil {
-		return nil, fmt.Errorf("listen on %s: %w", addr, err)
+	proxy := &Proxy{
+		logicalHost: logicalHost,
+		script:      script,
+		sink:        sink,
+		held:        make(map[net.Conn]struct{}),
+		watched:     make(map[*tunnel]struct{}),
+		served:      make(map[servedKey]struct{}),
+		tlsConfig: &tls.Config{
+			GetCertificate:     certificate,
+			GetConfigForClient: recordServerName,
+			// HTTP/1.1 is all the stub serves. Agreeing on it in the handshake makes an h2-only client
+			// fail there, loudly, instead of connecting and hanging up unseen.
+			NextProtos: []string{"http/1.1"},
+			MinVersion: tls.VersionTLS12,
+		},
 	}
 
-	proxy := &Proxy{logicalHost: logicalHost, script: script, sink: sink}
-
-	// The cleartext guard runs in Accept and would reject every ClientHello. Behind TLS each
-	// connection instead applies the same first-request rules to its decrypted stream, after its
-	// handshake and on its own goroutine, and a failure there stops the run just as it does in
-	// cleartext.
-	proxy.listener = checkedListener{Listener: listener, readTimeout: headerBound}
-	if serverTLS != nil {
-		proxy.listener = tunnelListener{Listener: listener, config: serverTLS, proxy: proxy}
-	}
+	proxy.addEntries(entries)
 
 	proxy.server = &nethttp.Server{
 		Handler:           nethttp.HandlerFunc(proxy.serveRequest),
 		ErrorLog:          log.New(proxyErrorWriter{proxy: proxy}, "", 0),
 		ReadHeaderTimeout: headerBound,
+		ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+			return context.WithValue(ctx, connKey{}, conn)
+		},
 	}
 
 	return proxy, nil
 }
 
-// checkedListener rejects encrypted or malformed first requests before net/http can turn them into
-// an unobservable 400 response. Returning the error from Accept stops Serve, which makes the whole
-// run a setup error instead of a false clean result.
-type checkedListener struct {
-	net.Listener
+// connKey carries the connection a request arrived on, so a stop can name the port it was dialled on.
+type connKey struct{}
 
-	readTimeout time.Duration
-}
-
-func (l checkedListener) Accept() (net.Conn, error) {
-	connection, err := l.Listener.Accept()
-	if err != nil {
-		return nil, fmt.Errorf("accept HTTP connection: %w", err)
-	}
-
-	checked, err := checkConnection(connection, l.readTimeout, errUnparseable)
-	if err != nil {
-		_ = connection.Close()
-
-		return nil, err
-	}
-
-	return checked, nil
-}
-
-// tunnelListener hands each TLS connection to net/http before its handshake, as tls.NewListener
-// does, so no client's handshake or first request can delay another's accept.
-type tunnelListener struct {
-	net.Listener
-
-	config *tls.Config
-	proxy  *Proxy
-}
-
-func (l tunnelListener) Accept() (net.Conn, error) {
-	connection, err := l.Listener.Accept()
-	if err != nil {
-		return nil, fmt.Errorf("accept HTTPS connection: %w", err)
-	}
-
-	return &tunnel{Conn: tls.Server(connection, l.config), proxy: l.proxy}, nil
+// destination is where a connection handed to net/http was dialled: the entry's port, and the server
+// name a TLS client asked for.
+type destination interface {
+	destination() (uint16, string)
 }
 
 // tunnel is one TLS connection to the stub. net/http completes its handshake through
@@ -314,10 +291,16 @@ func (l tunnelListener) Accept() (net.Conn, error) {
 type tunnel struct {
 	*tls.Conn
 
+	// raw is the connection under TLS, held by the stub until the first request's first byte.
+	raw        net.Conn
 	checked    net.Conn
 	failure    error
 	proxy      *Proxy
 	serverName string
+	// offered are the application protocols the client's hello listed, sorted.
+	offered []string
+	port    uint16
+	class   entryClass
 }
 
 // HandshakeContext stops the run on a failed handshake, naming the server name the client asked
@@ -325,38 +308,30 @@ type tunnel struct {
 func (t *tunnel) HandshakeContext(ctx context.Context) error {
 	err := t.Conn.HandshakeContext(context.WithValue(ctx, tunnelKey{}, t))
 	if err != nil {
-		// A stop's text is compared between runs, so the connection's addresses — an ephemeral port
-		// on every run — are dropped and only the cause is kept.
-		cause := err
-		if network, isNetwork := errors.AsType[*net.OpError](err); isNetwork {
-			cause = network.Err
+		// A stop's text is compared between runs, so it says why in fixed words and never carries the
+		// connection's addresses — an ephemeral port on every run.
+		stop := &EgressStop{
+			Name:   t.serverName,
+			Detail: handshakeDetail(t.serverName, err),
+			Class:  StopHandshake,
+			Port:   t.port,
 		}
 
-		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, cause)))
+		if refusesHTTP1(t.offered) {
+			stop.Class, stop.Detail = StopALPN, alpnDetail(t.offered)
+		}
+
+		t.proxy.release(t.raw)
+		t.proxy.stopOn(stop)
 	}
 
 	return err //nolint:wrapcheck // net/http type-checks this error to answer a cleartext client.
 }
 
-// Read applies the cleartext first-request check to the decrypted stream before net/http sees any
-// of it. net/http reads first right after the handshake, so the header bound runs from there.
+// Read applies the first-request check to the decrypted stream before net/http sees any of it.
 func (t *tunnel) Read(buffer []byte) (int, error) {
 	if t.checked == nil && t.failure == nil {
-		t.checked, t.failure = checkConnection(t.Conn, headerBound, errNoRequest)
-
-		switch {
-		case t.failure == nil:
-			t.proxy.served.Store(t.serverName, struct{}{})
-		case errors.Is(t.failure, errNoRequest) && t.proxy.wasServed(t.serverName):
-			// Go's http.Transport dials for a waiting request, hands that request a connection that
-			// freed first, and pools the fresh one unused. Once this server name has been served, a
-			// connection that sends nothing is that pool, so it closes quietly. A client that pins
-			// certificates never gets a first connection through, so it still stops the run.
-			t.failure = io.EOF
-		default:
-			t.failure = t.named(t.failure)
-			t.proxy.fail(t.failure)
-		}
+		t.checked, t.failure = t.firstRequest()
 	}
 
 	if t.failure != nil {
@@ -366,12 +341,122 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-func (t *tunnel) named(err error) error {
-	if t.serverName == "" {
-		return fmt.Errorf("TLS connection without SNI: %w", err)
+// firstRequest waits for the first byte of the connection's first request and then requires an
+// HTTP/1.x request header within the header bound of that byte.
+func (t *tunnel) firstRequest() (net.Conn, error) {
+	first, err := t.firstByte()
+
+	t.proxy.release(t.raw)
+
+	if err != nil {
+		return nil, err
 	}
 
-	return fmt.Errorf("TLS connection for %q: %w", t.serverName, err)
+	checked, err := checkRequest(t.Conn, first, t.port)
+	if err != nil {
+		stop := asStop(err, t.port, t.serverName)
+		t.proxy.stopOn(stop)
+
+		return nil, stop
+	}
+
+	t.proxy.markServed(t.key())
+
+	return checked, nil
+}
+
+// firstByte waits for the first decrypted byte. On 443 it waits with no deadline: a client may keep a
+// connection it has not used yet, and one it never uses hides nothing. net/http has already bounded
+// the read from the handshake, so that bound is lifted first.
+func (t *tunnel) firstByte() ([]byte, error) {
+	if t.class == entryCatchAll {
+		return t.catchAllFirstByte()
+	}
+
+	if err := t.SetReadDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("lift the first-request deadline: %w", err)
+	}
+
+	first, err := firstByte(t.Conn)
+	if err != nil {
+		return nil, t.closedUnused()
+	}
+
+	return first, nil
+}
+
+// catchAllFirstByte waits for the first decrypted byte on a catch-all port for the silence bound from
+// the handshake, or only until the teardown point: a connection there that finished its handshake and
+// never spoke may be a server-first client waiting for a greeting nothing sends. One beside a served
+// connection with the same key is a Go client's pool, and is held.
+func (t *tunnel) catchAllFirstByte() ([]byte, error) {
+	t.proxy.watch(t)
+	defer t.proxy.unwatch(t)
+
+	bound := time.Now().Add(catchAllSilence)
+	held := false
+
+	for {
+		if err := t.proxy.boundRead(t, bound, held); err != nil {
+			return nil, fmt.Errorf("bound the first-request read: %w", err)
+		}
+
+		first, err := firstByte(t.Conn)
+
+		switch {
+		case err == nil:
+			return first, nil
+		case !isTimeout(err):
+			return nil, t.closedUnused()
+		case t.proxy.wasServed(t.key()):
+			held = true
+		default:
+			return nil, t.silent()
+		}
+	}
+}
+
+// silent stops the run on a catch-all TLS connection that sent no request.
+func (t *tunnel) silent() error {
+	detail := "sent no request within " + catchAllSilence.String() + " of its TLS handshake"
+	if t.proxy.tornDown() {
+		detail = detailUnusedAtTeardown
+	}
+
+	stop := &EgressStop{Name: t.serverName, Detail: detail, Class: StopSilent, Port: t.port}
+	t.proxy.stopOn(stop)
+
+	return stop
+}
+
+// closedUnused judges a connection that completed its handshake and closed without a request. Beside a
+// served connection with the same key it is Go's http.Transport, which dials for a waiting request,
+// hands that request a connection that freed first, and pools the fresh one unused; a client that pins
+// certificates never gets a first connection through, so it still stops the run. After the teardown
+// point it is the service going away on 443, and on a catch-all port a connection that stayed silent
+// to the end. Otherwise it is a client that cannot talk to the stub.
+func (t *tunnel) closedUnused() error {
+	switch {
+	case t.proxy.wasServed(t.key()):
+		return io.EOF
+	case t.class == entryCatchAll && t.proxy.tornDown():
+		return t.silent()
+	case t.proxy.tornDown():
+		return io.EOF
+	default:
+	}
+
+	stop := &EgressStop{Name: t.serverName, Class: StopNoRequest, Port: t.port}
+	t.proxy.stopOn(stop)
+
+	return stop
+}
+
+func (t *tunnel) destination() (uint16, string) { return t.port, t.serverName }
+
+// key is what the tunnel is for the served set.
+func (t *tunnel) key() servedKey {
+	return servedKey{name: t.serverName, port: t.port, class: t.class}
 }
 
 // tunnelKey carries a tunnel through its own handshake, so the one TLS config every connection
@@ -379,11 +464,13 @@ func (t *tunnel) named(err error) error {
 // own session ticket keys, and no client could resume a session.
 type tunnelKey struct{}
 
-// recordServerName hands each tunnel the server name its client asked for. It runs on the
-// ClientHello, before ALPN can fail the handshake, which is the only point every stop can name it.
+// recordServerName hands each tunnel the server name its client asked for, and the protocols it
+// offered. It runs on the ClientHello, before ALPN can fail the handshake, which is the only point
+// every stop can name it.
 func recordServerName(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	if current, ok := hello.Context().Value(tunnelKey{}).(*tunnel); ok {
 		current.serverName = hello.ServerName
+		current.offered = slices.Sorted(slices.Values(hello.SupportedProtos))
 	}
 
 	return nil, nil //nolint:nilnil // A nil config keeps the listener's own, as crypto/tls documents.
@@ -393,45 +480,36 @@ type replayConn struct {
 	net.Conn
 
 	reader io.Reader
+	port   uint16
 }
 
 func (c *replayConn) Read(buffer []byte) (int, error) {
 	return c.reader.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-// checkConnection admits a connection only once its first request header parses as HTTP/1.x.
-// noRequest is the error for one that closes, or stays silent past timeout, before its first byte.
-func checkConnection(connection net.Conn, timeout time.Duration, noRequest error) (net.Conn, error) {
-	if err := connection.SetReadDeadline(time.Now().Add(timeout)); err != nil {
-		return nil, fmt.Errorf("bound HTTP header read: %w", err)
+func (c *replayConn) destination() (uint16, string) { return c.port, "" }
+
+// asStop turns checkRequest's verdict on a connection to the entry at port into the stop it is.
+// name is the server name a TLS client asked for, empty in cleartext.
+func asStop(err error, port uint16, name string) error {
+	stop := &EgressStop{Name: name, Port: port}
+
+	if connect, isConnect := errors.AsType[*connectError](err); isConnect {
+		stop.Class, stop.Name = StopConnect, connect.target
+
+		return stop
 	}
 
-	reader := bufio.NewReader(connection)
-
-	first, err := reader.Peek(1)
-	if err != nil {
-		return nil, noRequest
+	switch {
+	case errors.Is(err, errPreface):
+		stop.Class, stop.Detail = StopNotHTTP, detailPreface
+	case errors.Is(err, errUnparseable):
+		stop.Class = StopNotHTTP
+	default:
+		return err
 	}
 
-	if first[0] == tlsRecord {
-		return nil, errEncrypted
-	}
-
-	header, err := readRequestHeader(reader)
-	if err != nil {
-		return nil, errUnparseable
-	}
-
-	request, err := nethttp.ReadRequest(bufio.NewReader(bytes.NewReader(header)))
-	if err != nil || request.ProtoMajor != 1 {
-		return nil, errUnparseable
-	}
-
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
-		return nil, fmt.Errorf("clear HTTP header deadline: %w", err)
-	}
-
-	return &replayConn{Conn: connection, reader: io.MultiReader(bytes.NewReader(header), reader)}, nil
+	return stop
 }
 
 func readRequestHeader(reader *bufio.Reader) ([]byte, error) {
@@ -452,10 +530,11 @@ func readRequestHeader(reader *bufio.Reader) ([]byte, error) {
 	return nil, errUnparseable
 }
 
-// Addr is the address the proxy is listening on.
-func (p *Proxy) Addr() string { return p.listener.Addr().String() }
+// Addr is the cleartext entry's address, else the TLS entry's, else the catch-all's.
+func (p *Proxy) Addr() string { return p.entries[0].Addr().String() }
 
-// Serve accepts connections until Close is called or ctx is cancelled.
+// Serve accepts connections on every entry until Close is called or ctx is cancelled, and returns the
+// first failure.
 func (p *Proxy) Serve(ctx context.Context) error {
 	stopped := make(chan struct{})
 
@@ -467,7 +546,23 @@ func (p *Proxy) Serve(ctx context.Context) error {
 		}
 	}()
 
-	err := p.server.Serve(p.listener)
+	results := make(chan error, len(p.entries))
+
+	for _, current := range p.entries {
+		go current.listen()
+		go func() { results <- p.server.Serve(current) }()
+	}
+
+	var err error
+
+	for range p.entries {
+		served := <-results
+		if !errors.Is(served, nethttp.ErrServerClosed) && !errors.Is(served, net.ErrClosed) && err == nil {
+			// One entry failing ends the stub: the others serve the same run.
+			err = served
+			_ = p.Close()
+		}
+	}
 
 	close(stopped)
 
@@ -477,7 +572,7 @@ func (p *Proxy) Serve(ctx context.Context) error {
 		return failure
 	}
 
-	if errors.Is(err, nethttp.ErrServerClosed) || errors.Is(err, net.ErrClosed) || ctx.Err() != nil {
+	if err == nil || ctx.Err() != nil {
 		//nolint:nilerr // listener closure and context cancellation deliberately stop Serve.
 		return nil
 	}
@@ -485,10 +580,13 @@ func (p *Proxy) Serve(ctx context.Context) error {
 	return fmt.Errorf("serve HTTP proxy: %w", err)
 }
 
-// Close immediately stops accepting requests and closes active HTTP connections.
+// Close immediately stops accepting requests and closes active HTTP connections and held ones.
 func (p *Proxy) Close() error {
 	p.closeOnce.Do(func() {
+		p.closeHeld()
 		p.closeErr = p.server.Close()
+		p.closeEntries()
+
 		if errors.Is(p.closeErr, nethttp.ErrServerClosed) || errors.Is(p.closeErr, net.ErrClosed) {
 			p.closeErr = nil
 		}
@@ -497,18 +595,47 @@ func (p *Proxy) Close() error {
 	return p.closeErr
 }
 
-// CloseContext stops accepting requests and waits for active handlers to finish. The harness uses
-// it only after the service has closed its HTTP connections, matching the forwarding proxies'
-// blocking teardown contract.
+// CloseContext stops accepting requests, closes held connections and waits for active handlers to
+// finish. The harness uses it only after the service has closed its HTTP connections, matching the
+// forwarding proxies' blocking teardown contract.
+//
+// A held connection is closed first: net/http counts a connection that has sent nothing as idle only
+// after 5 s, so waiting for it would present an idle client as a teardown that hangs.
 func (p *Proxy) CloseContext(ctx context.Context) error {
 	p.closeOnce.Do(func() {
+		p.closeHeld()
 		p.closeErr = p.server.Shutdown(ctx)
+		p.closeEntries()
+
 		if errors.Is(p.closeErr, nethttp.ErrServerClosed) || errors.Is(p.closeErr, net.ErrClosed) {
 			p.closeErr = nil
 		}
 	})
 
 	return p.closeErr
+}
+
+// addEntries wraps each supplied listener as an entry, in the order Addr prefers them.
+func (p *Proxy) addEntries(entries Entries) {
+	if entries.Cleartext != nil {
+		p.entries = append(p.entries, newEntry(entries.Cleartext, p, entryCleartext, cleartextPort))
+	}
+
+	if entries.TLS != nil {
+		p.entries = append(p.entries, newEntry(entries.TLS, p, entryTLS, tlsPort))
+	}
+
+	if entries.CatchAll != nil {
+		// Each connection carries its own port.
+		p.entries = append(p.entries, newEntry(entries.CatchAll, p, entryCatchAll, 0))
+	}
+}
+
+// closeEntries closes every entry, whether or not Serve ever tracked it.
+func (p *Proxy) closeEntries() {
+	for _, current := range p.entries {
+		_ = current.Close()
+	}
 }
 
 // fail records the first serving failure and stops the stub, so Serve reports it.
@@ -522,13 +649,6 @@ func (p *Proxy) fail(err error) {
 	})
 }
 
-// wasServed reports whether a TLS connection has already sent a request for serverName.
-func (p *Proxy) wasServed(serverName string) bool {
-	_, served := p.served.Load(serverName)
-
-	return served
-}
-
 func (p *Proxy) serveFailure() error {
 	p.failed.Lock()
 	defer p.failed.Unlock()
@@ -537,10 +657,17 @@ func (p *Proxy) serveFailure() error {
 }
 
 func (p *Proxy) serveRequest(writer nethttp.ResponseWriter, request *nethttp.Request) {
+	// Checked before anything is recorded: the tunnel hides the request inside it.
+	if request.Method == nethttp.MethodConnect {
+		p.refuseConnect(writer, request)
+
+		return
+	}
+
 	body, readErr := readBody(request.Body)
-	raw := renderRequest(request, p.logicalHost, p.Addr(), body, readErr)
+	raw := renderRequest(request, p.logicalHost, body, readErr)
 	key := p.sink.Canonicalise(raw)
-	response, observation := p.script.reply(key, request, p.logicalHost, p.Addr())
+	response, observation := p.script.reply(key, request, p.logicalHost)
 	observation.Kind = effect.KindHTTP
 	observation.Raw = raw
 	observation.Printable = raw
@@ -556,12 +683,30 @@ func (p *Proxy) serveRequest(writer nethttp.ResponseWriter, request *nethttp.Req
 	writeResponse(writer, response)
 }
 
-func (s *Script) reply(
-	key string,
-	request *nethttp.Request,
-	logicalHost string,
-	listenerAddr string,
-) (Response, effect.Observation) {
+// refuseConnect stops the run on a CONNECT a connection sent after its first request, and hangs up
+// on it rather than answering: an answer would tell the client its tunnel is open.
+func (p *Proxy) refuseConnect(writer nethttp.ResponseWriter, request *nethttp.Request) {
+	var port uint16
+
+	if conn, isKnown := request.Context().Value(connKey{}).(destination); isKnown {
+		port, _ = conn.destination()
+	}
+
+	p.fail(&EgressStop{Class: StopConnect, Name: request.Host, Port: port})
+
+	if hijacker, canHijack := writer.(nethttp.Hijacker); canHijack {
+		if conn, _, err := hijacker.Hijack(); err == nil {
+			_ = conn.Close()
+
+			return
+		}
+	}
+
+	writer.Header().Set("Connection", "close")
+	writer.WriteHeader(nethttp.StatusBadGateway)
+}
+
+func (s *Script) reply(key string, request *nethttp.Request, logicalHost string) (Response, effect.Observation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -569,9 +714,18 @@ func (s *Script) reply(
 		return s.defaultResponse, effect.Observation{Stubbed: true, OffScript: true}
 	}
 
+	host, secure := stableHost(request.Host, logicalHost), request.TLS != nil
+
 	if s.active.capture {
-		response := s.routeResponse(request, logicalHost, listenerAddr)
+		response, routed := s.routeResponse(request, host)
 		s.active.captured[key] = append(s.active.captured[key], cloneResponse(response))
+
+		call := HostTally{Host: host, Calls: 1, TLS: secure}
+		if routed {
+			call.Routed = 1
+		}
+
+		s.active.count(call)
 
 		return response, effect.Observation{}
 	}
@@ -580,6 +734,8 @@ func (s *Script) reply(
 	queue := s.frozen[key]
 
 	if occurrence >= len(queue) {
+		s.active.count(HostTally{Host: host, OffScript: 1, TLS: secure})
+
 		return s.defaultResponse, effect.Observation{Stubbed: true, OffScript: true}
 	}
 
@@ -588,8 +744,8 @@ func (s *Script) reply(
 	return cloneResponse(queue[occurrence]), effect.Observation{Stubbed: true}
 }
 
-func (s *Script) routeResponse(request *nethttp.Request, logicalHost, listenerAddr string) Response {
-	host := stableHost(request.Host, logicalHost, listenerAddr)
+// routeResponse is the response for a request to host, and whether a declared route matched it.
+func (s *Script) routeResponse(request *nethttp.Request, host string) (Response, bool) {
 	for _, route := range s.routes {
 		if route.Path != request.URL.Path {
 			continue
@@ -603,10 +759,10 @@ func (s *Script) routeResponse(request *nethttp.Request, logicalHost, listenerAd
 			continue
 		}
 
-		return cloneResponse(route.Response)
+		return cloneResponse(route.Response), true
 	}
 
-	return cloneResponse(s.defaultResponse)
+	return cloneResponse(s.defaultResponse), false
 }
 
 func readBody(body io.ReadCloser) ([]byte, error) {
@@ -628,13 +784,8 @@ func readBody(body io.ReadCloser) ([]byte, error) {
 //
 // It stays on ONE line, as the Postgres and NATS renderings do. The report indents each effect
 // beneath its finding, so a newline inside an effect breaks the layout of every line after it.
-func renderRequest(
-	request *nethttp.Request,
-	logicalHost, listenerAddr string,
-	body []byte,
-	readErr error,
-) string {
-	target := stableHost(request.Host, logicalHost, listenerAddr) + escapedPath(request.URL)
+func renderRequest(request *nethttp.Request, logicalHost string, body []byte, readErr error) string {
+	target := stableHost(request.Host, logicalHost) + escapedPath(request.URL)
 	if query := sortedQuery(request.URL.Query()); query != "" {
 		target += "?" + query
 	}
@@ -656,8 +807,19 @@ func renderRequest(
 	return strings.Join(fields, " ")
 }
 
-func stableHost(host, logicalHost, listenerAddr string) string {
-	if host == "" || host == listenerAddr {
+// stableHost is the host an effect names: the request's Host, lower-cased, its port kept. A Host that
+// is empty, an IP literal or localhost is where the service was told the stub is — a bind and
+// advertise choice, with a kernel-assigned port — so it renders as the logical host instead, and no
+// run's addresses reach an effect.
+func stableHost(host, logicalHost string) string {
+	name := host
+	if split, _, err := net.SplitHostPort(host); err == nil {
+		name = split
+	}
+
+	name = strings.Trim(name, "[]")
+
+	if _, err := netip.ParseAddr(name); name == "" || err == nil || strings.EqualFold(name, "localhost") {
 		return strings.ToLower(logicalHost)
 	}
 

@@ -150,6 +150,7 @@ func (s *Sandbox) runObserved(
 	}
 
 	result.Exit = exit
+	result.Stopped = observed.halted
 
 	return result, nil
 }
@@ -169,6 +170,11 @@ func (s *Sandbox) watch(
 		ended, runErr = s.drain(ctx, observed, service.Exited(), run)
 	}
 
+	// Recorded before the window closes, so the stop lands with the message whose handling raised it.
+	if ended == proxyStopped {
+		runErr = observed.halt(runErr, recorder)
+	}
+
 	if runErr == nil {
 		runErr = s.stillSerialised(ctx, run, ended)
 	}
@@ -176,7 +182,10 @@ func (s *Sandbox) watch(
 	run.finish()
 
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
-	// holding an idle connection open would make teardown hang rather than fail.
+	// holding an idle connection open would make teardown hang rather than fail. The teardown point is
+	// marked first: a connection the service closes as it goes away hid nothing.
+	observed.markTeardown()
+
 	exit, closeErr := service.Close(ctx)
 	if closeErr != nil {
 		closeErr = fmt.Errorf("close the service under test: %w", closeErr)

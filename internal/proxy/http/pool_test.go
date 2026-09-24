@@ -45,6 +45,13 @@ func TestAnUnusedPooledConnectionIsNotAStop(t *testing.T) {
 
 	_ = unused.Close()
 
+	// A connection that closes having sent nothing is judged at once, so a stop it caused is here by now.
+	select {
+	case serveErr := <-done:
+		t.Fatalf("Serve() stopped when a pooled connection closed after a served one: %v", serveErr)
+	case <-time.After(quietFor):
+	}
+
 	if abortErr := run.Abort(); abortErr != nil {
 		t.Fatal(abortErr)
 	}
@@ -108,11 +115,17 @@ func TestATLSStopNamesNoPeerAddress(t *testing.T) {
 	script := proxyhttp.NewScript(proxyhttp.Response{}, nil)
 	proxy, done, _ := startTLSProxy(t, &sink{}, script)
 
-	silent, err := (&net.Dialer{Timeout: time.Second}).DialContext(t.Context(), "tcp", proxy.Addr())
+	// A handshake that opens and then stalls, so the stop comes from inside crypto/tls, whose errors
+	// carry the connection's addresses.
+	stalled, err := (&net.Dialer{Timeout: time.Second}).DialContext(t.Context(), "tcp", proxy.Addr())
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = silent.Close() }()
+	defer func() { _ = stalled.Close() }()
+
+	if _, err := stalled.Write([]byte{0x16}); err != nil {
+		t.Fatal(err)
+	}
 
 	select {
 	case serveErr := <-done:

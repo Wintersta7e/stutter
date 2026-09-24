@@ -79,6 +79,8 @@ type quirks struct {
 	seen *startups
 	// onStop is called when the service stops consuming under stopAfter.
 	onStop func()
+	// onHandled is called once a delivery's work is done, before the delivery is settled.
+	onHandled func()
 	// timeline is where the service notes each delivery, its last acknowledgement and when it was
 	// closed. Nil notes nothing.
 	timeline *timeline
@@ -638,6 +640,10 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 			}
 		}
 	default:
+	}
+
+	if p.quirks.onHandled != nil {
+		p.quirks.onHandled()
 	}
 
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy

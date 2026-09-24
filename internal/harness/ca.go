@@ -11,42 +11,66 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
+	"slices"
+	"strings"
+	"sync"
 	"time"
 )
 
-// certificateLifetime outlives any plausible run without being long enough to be worth reusing.
-const certificateLifetime = 24 * time.Hour
+const (
+	// validity is how long the CA and every leaf stay valid from the moment the CA is minted: longer than
+	// any check, so no run ever meets an expired certificate.
+	validity = 30 * 24 * time.Hour
+	// backdate starts every certificate's validity before the CA was minted, so a client whose clock runs
+	// behind the host's still accepts it.
+	backdate = time.Hour
+	// serialBits sizes the random certificate serial. x509 wants a positive integer that will not
+	// collide; 128 bits is what public CAs use for the same reason.
+	serialBits = 128
+	// noServerName keys the leaf for a client that sent no server name, per local address.
+	noServerName = "ip:"
+)
 
-// serialBits sizes the random certificate serial. x509 wants a positive integer that will not
-// collide; 128 bits is what public CAs use for the same reason.
-const serialBits = 128
-
-// authority is a throwaway certificate authority for one sandbox.
+// authority is the certificate authority the HTTP stub's TLS entry presents: one per check on the
+// listener set, one per Sandbox otherwise.
 //
-// The HTTP stub has to be reachable over TLS because most real dependencies are, and a service that
-// cannot reach its dependency produces no effects at all — which reads as a handler that did
-// nothing, the most dangerous wrong answer this tool can give. The CA lives and dies with the run
-// and is handed to the service under test to trust; it is never written anywhere a real trust store
-// could pick it up.
+// The stub has to be reachable over TLS because most real dependencies are, and a service that cannot
+// reach its dependency produces no effects at all — which reads as a handler that did nothing, the most
+// dangerous wrong answer this tool can give. The CA lives and dies with the check (listener set) or the
+// Sandbox (Go API); its key is held in memory only, never written anywhere a real trust store could
+// pick it up.
+//
+// Every server name a client asks for gets a leaf of its own, minted on first use and kept for the
+// CA's life, so every run presents the same leaf for a name.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type authority struct {
-	// leaf is what the stub serves.
-	leaf tls.Certificate
+	caCert *x509.Certificate
+	caKey  *ecdsa.PrivateKey
+	// leaves are the leaves minted so far, by lower-cased server name, or by local address for a client
+	// that sent none.
+	leaves map[string]*tls.Certificate
+	// minted is when the CA was made; every certificate's window is measured from it.
+	minted time.Time
+	// logical is the stub's logical host; advertise is the host the service is told to dial.
+	logical   string
+	advertise string
 	// pem is the CA certificate, which the service under test must trust to reach the stub.
 	pem []byte
+	mu  sync.Mutex
 }
 
-// newAuthority mints a CA and one leaf certificate valid for host.
-//
-// The leaf also covers 127.0.0.1, because the stub is reached at a loopback address while it
-// answers under a stable logical name — without the address in the SAN list every connection fails
-// verification and no effect is ever observed.
-func newAuthority(host string) (*authority, error) {
+// newAuthority mints a CA. Leaves are minted as clients ask for them.
+func newAuthority(logicalHost, advertiseHost string) (*authority, error) {
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return nil, fmt.Errorf("generate the sandbox CA key: %w", err)
+		return nil, fmt.Errorf("generate the stub CA key: %w", err)
 	}
 
-	caTemplate, err := certificateTemplate("Stutter sandbox CA")
+	minted := time.Now()
+
+	caTemplate, err := certificateTemplate("Stutter stub CA", minted)
 	if err != nil {
 		return nil, err
 	}
@@ -57,50 +81,131 @@ func newAuthority(host string) (*authority, error) {
 
 	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, &caKey.PublicKey, caKey)
 	if err != nil {
-		return nil, fmt.Errorf("create the sandbox CA certificate: %w", err)
+		return nil, fmt.Errorf("create the stub CA certificate: %w", err)
 	}
 
-	caCertificate, err := x509.ParseCertificate(caDER)
+	caCert, err := x509.ParseCertificate(caDER)
 	if err != nil {
-		return nil, fmt.Errorf("parse the sandbox CA certificate: %w", err)
+		return nil, fmt.Errorf("parse the stub CA certificate: %w", err)
 	}
 
-	leaf, err := issueLeaf(host, caCertificate, caKey)
+	return &authority{
+		caCert:    caCert,
+		caKey:     caKey,
+		leaves:    make(map[string]*tls.Certificate),
+		minted:    minted,
+		logical:   logicalHost,
+		advertise: advertiseHost,
+		pem:       pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
+	}, nil
+}
+
+// certificate is the leaf for a client's hello: its server name's, or, for a client that sent none,
+// one covering every address the stub is reached at on the connection's local address.
+func (a *authority) certificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	name := strings.ToLower(hello.ServerName)
+
+	var local netip.Addr
+
+	key := name
+	if name == "" {
+		local = localAddr(hello.Conn)
+		key = noServerName + local.String()
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if leaf, minted := a.leaves[key]; minted {
+		return leaf, nil
+	}
+
+	template, err := certificateTemplate(name, a.minted)
 	if err != nil {
 		return nil, err
 	}
 
-	return &authority{
-		leaf: leaf,
-		pem:  pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER}),
-	}, nil
+	if name == "" {
+		a.coverUnnamed(template, local)
+	} else {
+		cover(template, name)
+	}
+
+	leaf, err := a.issue(template)
+	if err != nil {
+		return nil, err
+	}
+
+	a.leaves[key] = leaf
+
+	return leaf, nil
 }
 
-func issueLeaf(host string, parent *x509.Certificate, parentKey *ecdsa.PrivateKey) (tls.Certificate, error) {
+// coverUnnamed makes a leaf for a client that sent no server name: it verifies one of the addresses it
+// was told to dial, or the logical host, so every such address is on it.
+func (a *authority) coverUnnamed(template *x509.Certificate, local netip.Addr) {
+	template.Subject.CommonName = a.logical
+	template.DNSNames = []string{a.logical, "localhost"}
+	template.IPAddresses = []net.IP{net.ParseIP(loopback), net.IPv6loopback}
+
+	if local.IsValid() {
+		cover(template, local.String())
+	}
+
+	if a.advertise != "" {
+		cover(template, a.advertise)
+	}
+}
+
+// cover adds a name to a leaf, once: as an IP address when it is one, else as a DNS name.
+func cover(template *x509.Certificate, name string) {
+	address, err := netip.ParseAddr(name)
+	if err != nil {
+		if !slices.Contains(template.DNSNames, name) {
+			template.DNSNames = append(template.DNSNames, name)
+		}
+
+		return
+	}
+
+	if !slices.ContainsFunc(template.IPAddresses, func(known net.IP) bool { return known.Equal(address.AsSlice()) }) {
+		template.IPAddresses = append(template.IPAddresses, address.AsSlice())
+	}
+}
+
+// issue signs a leaf with the CA.
+func (a *authority) issue(template *x509.Certificate) (*tls.Certificate, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("generate the stub key: %w", err)
+		return nil, fmt.Errorf("generate a stub leaf key: %w", err)
 	}
 
-	template, err := certificateTemplate(host)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	template.DNSNames = []string{host, "localhost"}
-	template.IPAddresses = []net.IP{net.ParseIP("127.0.0.1"), net.IPv6loopback}
 	template.KeyUsage = x509.KeyUsageDigitalSignature
 	template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
 
-	der, err := x509.CreateCertificate(rand.Reader, template, parent, &key.PublicKey, parentKey)
+	der, err := x509.CreateCertificate(rand.Reader, template, a.caCert, &key.PublicKey, a.caKey)
 	if err != nil {
-		return tls.Certificate{}, fmt.Errorf("create the stub certificate: %w", err)
+		return nil, fmt.Errorf("create a stub leaf: %w", err)
 	}
 
-	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
+	return &tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }
 
-func certificateTemplate(name string) (*x509.Certificate, error) {
+// localAddr is the address a connection arrived on, the zero address when it has none.
+func localAddr(conn net.Conn) netip.Addr {
+	if conn == nil {
+		return netip.Addr{}
+	}
+
+	address, err := netip.ParseAddrPort(conn.LocalAddr().String())
+	if err != nil {
+		return netip.Addr{}
+	}
+
+	return address.Addr().Unmap()
+}
+
+func certificateTemplate(name string, minted time.Time) (*x509.Certificate, error) {
 	limit := new(big.Int).Lsh(big.NewInt(1), serialBits)
 
 	serial, err := rand.Int(rand.Reader, limit)
@@ -108,12 +213,10 @@ func certificateTemplate(name string) (*x509.Certificate, error) {
 		return nil, fmt.Errorf("generate a certificate serial: %w", err)
 	}
 
-	now := time.Now()
-
 	return &x509.Certificate{
 		SerialNumber: serial,
 		Subject:      pkix.Name{CommonName: name},
-		NotBefore:    now.Add(-time.Minute),
-		NotAfter:     now.Add(certificateLifetime),
+		NotBefore:    minted.Add(-backdate),
+		NotAfter:     minted.Add(validity),
 	}, nil
 }

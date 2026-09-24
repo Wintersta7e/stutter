@@ -73,3 +73,17 @@ github.com/Wintersta7e/stutter/internal/relay.qualifyFor
 github.com/Wintersta7e/stutter/internal/relay.ImageChanges
 github.com/Wintersta7e/stutter/internal/relay.Layer
 github.com/Wintersta7e/stutter/internal/relay.writeLayer
+# Decoding a stub routes file: called by `stutter check --compose … --routes <file>`.
+github.com/Wintersta7e/stutter/internal/proxy/http.DecodeRoutes
+github.com/Wintersta7e/stutter/internal/proxy/http.decodeBody
+github.com/Wintersta7e/stutter/internal/proxy/http.decodeHeaders
+github.com/Wintersta7e/stutter/internal/proxy/http.decodeResponse
+github.com/Wintersta7e/stutter/internal/proxy/http.decodeRoute
+github.com/Wintersta7e/stutter/internal/proxy/http.decodeRouteList
+github.com/Wintersta7e/stutter/internal/proxy/http.knownKeys
+github.com/Wintersta7e/stutter/internal/proxy/http.object
+github.com/Wintersta7e/stutter/internal/proxy/http.responseKeys
+github.com/Wintersta7e/stutter/internal/proxy/http.routesError
+github.com/Wintersta7e/stutter/internal/proxy/http.text
+# Summing the per-host stub tally over consumer checks: called by `stutter check --compose` for its header.
+github.com/Wintersta7e/stutter/internal/proxy/http.SumTallies

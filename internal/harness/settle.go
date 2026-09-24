@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/policy"
+	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
@@ -113,6 +115,22 @@ func (e *egress) stopped(err error) error {
 	}
 
 	return fmt.Errorf("%w: %w", errProxyStopped, err)
+}
+
+// halt takes an egress-policy stop out of the error a wait ended on. The run ends on it rather than
+// failing: the stop is recorded as the run's last effect, in its own words so a shrink reproduces it,
+// and kept as the text the run reports. Any other error is returned as it came, and still fails the run.
+func (e *egress) halt(err error, recorder *effect.Recorder) error {
+	stop, isStop := errors.AsType[*httpproxy.EgressStop](err)
+	if !isStop {
+		return err
+	}
+
+	text := stop.Error()
+	recorder.Record(effect.Observation{Kind: effect.KindOpaque, Raw: text, Printable: text})
+	e.halted = text
+
+	return nil
 }
 
 // answer is the latest word the server has had on one message's latest delivery.

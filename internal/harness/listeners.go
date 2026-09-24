@@ -117,7 +117,7 @@ func OpenListeners(ctx context.Context, cfg ListenerConfig) (*ListenerSet, error
 		host = defaultHTTPHost
 	}
 
-	minted, err := newAuthority(host)
+	minted, err := newAuthority(host, "")
 	if err != nil {
 		return nil, err
 	}
