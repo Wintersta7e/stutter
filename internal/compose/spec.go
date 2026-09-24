@@ -61,28 +61,28 @@ func (m *Model) Spec(service string, img Image, ca map[string]string) (Spec, err
 	return spec, nil
 }
 
-// identity copies what a spec takes from the model as it stands: the process's identity, its
-// privileges and its resources.
+// identity copies what a spec takes from the model: the process's identity, its privileges and its
+// resources, every string unescaped once as compose itself does before creating a container.
 func identity(service string, svc *composeService, img Image) Spec {
 	return Spec{
 		Service:     service,
 		Image:       img.ID,
-		Platform:    svc.Platform,
-		User:        svc.User,
+		Platform:    unescape(svc.Platform),
+		User:        unescape(svc.User),
 		WorkingDir:  unescape(svc.WorkingDir),
-		Domainname:  svc.Domainname,
-		MacAddress:  svc.MacAddress,
-		IPC:         svc.IPC,
-		Cgroup:      svc.Cgroup,
+		Domainname:  unescape(svc.Domainname),
+		MacAddress:  unescape(svc.MacAddress),
+		IPC:         unescape(svc.IPC),
+		Cgroup:      unescape(svc.Cgroup),
 		Init:        svc.Init,
 		ReadOnly:    svc.ReadOnly,
 		StdinOpen:   svc.StdinOpen,
 		TTY:         svc.TTY,
 		Sysctls:     sysctls(svc),
-		SecurityOpt: slices.Clone(svc.SecurityOpt),
-		CapAdd:      slices.Clone(svc.CapAdd),
-		CapDrop:     slices.Clone(svc.CapDrop),
-		GroupAdd:    slices.Clone(svc.GroupAdd),
+		SecurityOpt: unescapeAll(svc.SecurityOpt),
+		CapAdd:      unescapeAll(svc.CapAdd),
+		CapDrop:     unescapeAll(svc.CapDrop),
+		GroupAdd:    unescapeAll(svc.GroupAdd),
 		Resources:   resources(svc),
 	}
 }
@@ -94,7 +94,7 @@ func sysctls(svc *composeService) map[string]string {
 
 	out := make(map[string]string, len(svc.Sysctls))
 	for key, value := range svc.Sysctls {
-		out[key] = string(value)
+		out[key] = unescape(string(value))
 	}
 
 	return out
@@ -179,9 +179,9 @@ func (m *Model) replaced(service string, svc *composeService) []Replaced {
 func resources(svc *composeService) Resources {
 	out := Resources{
 		Ulimits:        nil,
-		StorageOpt:     maps.Clone(svc.StorageOpt),
-		Cpuset:         svc.Cpuset,
-		CgroupParent:   svc.CgroupParent,
+		StorageOpt:     unescapeValues(svc.StorageOpt),
+		Cpuset:         unescape(svc.Cpuset),
+		CgroupParent:   unescape(svc.CgroupParent),
 		CPUs:           float64(svc.CPUs),
 		CPUCount:       int64(svc.CPUCount),
 		CPUPercent:     int64(svc.CPUPercent),
@@ -230,7 +230,7 @@ func blkio(config *serviceBlkio) *Blkio {
 	rates := func(entries []blkioRate) []BlkioRate {
 		out := make([]BlkioRate, 0, len(entries))
 		for _, entry := range entries {
-			out = append(out, BlkioRate{Path: entry.Path, Rate: int64(entry.Rate)})
+			out = append(out, BlkioRate{Path: unescape(entry.Path), Rate: int64(entry.Rate)})
 		}
 
 		return out
@@ -246,7 +246,23 @@ func blkio(config *serviceBlkio) *Blkio {
 
 	for _, entry := range config.WeightDevice {
 		//nolint:gosec // compose bounds a weight to 10-1000.
-		out.WeightDevice = append(out.WeightDevice, BlkioWeight{Path: entry.Path, Weight: uint16(entry.Weight)})
+		out.WeightDevice = append(out.WeightDevice, BlkioWeight{
+			Path: unescape(entry.Path), Weight: uint16(entry.Weight),
+		})
+	}
+
+	return out
+}
+
+// unescapeValues unescapes every value of a map; nil stays nil.
+func unescapeValues(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = unescape(value)
 	}
 
 	return out

@@ -27,7 +27,12 @@ func unescape(text string) string {
 	return strings.ReplaceAll(text, "$$", "$")
 }
 
+// unescapeAll unescapes every value; nil stays nil, so an unset list stays unset.
 func unescapeAll(values []string) []string {
+	if values == nil {
+		return nil
+	}
+
 	out := make([]string, len(values))
 	for index, value := range values {
 		out[index] = unescape(value)

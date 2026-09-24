@@ -9,8 +9,8 @@ import (
 // Healthcheck is a service's `healthcheck` as compose normalised it. A zero timing or Retries is
 // unset: the image's or the engine's default applies.
 type Healthcheck struct {
-	// Test is the test as compose wrote it: `["CMD", argv…]`, `["CMD-SHELL", command]` or
-	// `["NONE"]`.
+	// Test is the test as compose wrote it, unescaped as every value a container sees:
+	// `["CMD", argv…]`, `["CMD-SHELL", command]` or `["NONE"]`.
 	Test []string
 	// Interval is `healthcheck.interval`.
 	Interval time.Duration
@@ -39,7 +39,7 @@ func (m *Model) Healthcheck(service string) (Healthcheck, bool, error) {
 	}
 
 	out := Healthcheck{
-		Test:     slices.Clone(check.Test),
+		Test:     unescapeAll(check.Test),
 		Retries:  int(check.Retries),
 		Disabled: check.Disable || slices.Equal(check.Test, []string{"NONE"}),
 	}
@@ -92,7 +92,7 @@ func (m *Model) Stop(service string) (Stop, error) {
 		return Stop{}, err
 	}
 
-	out := Stop{Signal: svc.StopSignal, SignalSet: svc.StopSignal != ""}
+	out := Stop{Signal: unescape(svc.StopSignal), SignalSet: svc.StopSignal != ""}
 
 	if svc.StopGracePeriod != "" {
 		grace, err := time.ParseDuration(svc.StopGracePeriod)
