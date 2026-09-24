@@ -39,7 +39,8 @@ type openDeps struct {
 // directory. Everything the check creates on the engine is created, verified and removed through it.
 type Engine struct {
 	run        engineCaller
-	led        *ledger
+	book       *book
+	interfaces func() ([]localAddr, error)
 	log        *invLog
 	host       hostFS
 	identity   Identity
@@ -92,16 +93,18 @@ func openWith(ctx context.Context, opts Options, deps openDeps) (*Engine, error)
 
 	e := &Engine{
 		run: run, host: deps.host, identity: identity, id: id, keep: opts.Keep,
-		private: filepath.Join(temp, "stutter-"+id),
+		private: filepath.Join(temp, "stutter-"+id), interfaces: localAddrs,
 	}
 
-	e.led, err = createLedger(state, deps.host, header{
+	led, err := createLedger(state, deps.host, header{
 		Check: id, EngineID: identity.EngineID, Endpoint: identity.Endpoint, Context: identity.Context,
 		PrivateDir: e.private, Project: project(id),
 	})
 	if err != nil {
 		return nil, err
 	}
+
+	e.book = newBook(led, id)
 
 	if err := e.prepare(); err != nil {
 		return nil, errors.Join(err, e.discard())
@@ -156,14 +159,14 @@ func (e *Engine) ComposeConfig(
 
 // prepare runs the lock self-test and makes the private directory and its invocation log.
 func (e *Engine) prepare() error {
-	enforced, err := e.led.selfTest()
+	enforced, err := e.book.led.selfTest()
 	if err != nil {
 		return err
 	}
 
 	e.locks = enforced
 
-	seq, err := makePrivate(e.private, e.led, e.host)
+	seq, err := makePrivate(e.private, e.book, e.host)
 	if err != nil {
 		return err
 	}
@@ -193,10 +196,10 @@ func (e *Engine) discard() error {
 		errs = append(errs, removeMade(e.private))
 	}
 
-	return errors.Join(append(errs, e.led.remove())...)
+	return errors.Join(append(errs, e.book.led.remove())...)
 }
 
 // release closes the invocation log and releases the ledger's lock, leaving both on disk.
 func (e *Engine) release() error {
-	return errors.Join(e.log.close(), e.led.close())
+	return errors.Join(e.log.close(), e.book.led.close())
 }

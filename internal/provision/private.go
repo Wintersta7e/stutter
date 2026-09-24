@@ -36,10 +36,10 @@ func hostNames() map[HostName]string {
 // makePrivate creates the check-private directory at path, ledgered as a host path: never reused
 // (Mkdir, not MkdirAll), and verified a local directory this user alone owns, mode 0700. A
 // directory it made and then refused is removed again. It returns the entry's seq.
-func makePrivate(path string, led *ledger, host hostFS) (int, error) {
-	seq := led.next()
+func makePrivate(path string, b *book, host hostFS) (int, error) {
+	seq := b.led.next()
 
-	if err := led.append(entry{Seq: seq, Op: opIntent, Type: ResourceHostPath, Name: path}); err != nil {
+	if err := b.note(entry{Seq: seq, Op: opIntent, Type: ResourceHostPath, Name: path}); err != nil {
 		return seq, fmt.Errorf("%w: %w", ErrStateDir, err)
 	}
 
@@ -47,7 +47,7 @@ func makePrivate(path string, led *ledger, host hostFS) (int, error) {
 		return seq, fmt.Errorf("%w: %s: %w", ErrPrivateDir, path, err)
 	}
 
-	if err := led.append(entry{Seq: seq, Op: opCreated, Type: ResourceHostPath, Name: path}); err != nil {
+	if err := b.note(entry{Seq: seq, Op: opCreated, Type: ResourceHostPath, Name: path}); err != nil {
 		return seq, errors.Join(fmt.Errorf("%w: %w", ErrStateDir, err), removeMade(path))
 	}
 
@@ -55,7 +55,7 @@ func makePrivate(path string, led *ledger, host hostFS) (int, error) {
 		return seq, errors.Join(fmt.Errorf("%w: %s: %w", ErrPrivateDir, path, err), removeMade(path))
 	}
 
-	if err := led.append(entry{Seq: seq, Op: opVerified, Type: ResourceHostPath, Name: path}); err != nil {
+	if err := b.note(entry{Seq: seq, Op: opVerified, Type: ResourceHostPath, Name: path}); err != nil {
 		return seq, errors.Join(fmt.Errorf("%w: %w", ErrStateDir, err), removeMade(path))
 	}
 

@@ -27,6 +27,17 @@ const (
 	verbInfo
 	verbWSLInfo
 	verbComposeConfig
+	verbInspect
+	verbImageInspect
+	verbNetworkInspect
+	verbVolumeInspect
+	verbNetworkList
+	verbNetworkCreate
+	verbVolumeCreate
+	verbRemove
+	verbNetworkRemove
+	verbVolumeRemove
+	verbImageRemove
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -114,7 +125,7 @@ type verbSpec struct {
 
 // verbs returns the verb table: every call the runner can make.
 //
-//nolint:goconst // the table spells every fixed token out, so it reads — and is audited — as the table it is.
+//nolint:goconst,revive // one literal, every fixed token spelled out: it reads, and is audited, as the table.
 func verbs() [verbCount]verbSpec {
 	return [verbCount]verbSpec{
 		verbContext: {
@@ -137,6 +148,50 @@ func verbs() [verbCount]verbSpec {
 			name: "composeConfig", program: programCompose, prefix: []string{"compose"},
 			suffix: []string{"config", "--format", "json"}, alt: []string{"config", "--environment"},
 			mode: modeUser, deadline: deadlineShort, stderr: stderrCount,
+		},
+		verbInspect: {
+			name: "inspect", program: programDocker, prefix: []string{"inspect", "--type", "container", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbImageInspect: {
+			name: "imageInspect", program: programDocker, prefix: []string{"image", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkInspect: {
+			name: "networkInspect", program: programDocker, prefix: []string{"network", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbVolumeInspect: {
+			name: "volumeInspect", program: programDocker, prefix: []string{"volume", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkList: {
+			name: "networkList", program: programDocker, prefix: []string{"network", "ls", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkCreate: {
+			name: "networkCreate", program: programDocker, prefix: []string{"network", "create"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbVolumeCreate: {
+			name: "volumeCreate", program: programDocker, prefix: []string{"volume", "create"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbRemove: {
+			name: "remove", program: programDocker, prefix: []string{"rm", "-f", "-v"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbNetworkRemove: {
+			name: "networkRemove", program: programDocker, prefix: []string{"network", "rm"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbVolumeRemove: {
+			name: "volumeRemove", program: programDocker, prefix: []string{"volume", "rm"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbImageRemove: {
+			name: "imageRemove", program: programDocker, prefix: []string{"rmi", "--no-prune"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
 		},
 	}
 }

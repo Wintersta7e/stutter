@@ -44,7 +44,7 @@ func TestAPrivateDirectoryWithTheWrongModeIsRefused(t *testing.T) {
 
 		path := filepath.Join(t.TempDir(), "stutter-"+testCheckID)
 
-		_, err := makePrivate(path, newTestLedger(t, defaultHostFS()), host)
+		_, err := makePrivate(path, newBook(newTestLedger(t, defaultHostFS()), testCheckID), host)
 		if !errors.Is(err, ErrPrivateDir) || !strings.Contains(err.Error(), "0777") {
 			t.Errorf("makePrivate = %v, want ErrPrivateDir naming the mode", err)
 		}
@@ -67,7 +67,7 @@ func TestAPrivateDirectoryWithTheWrongModeIsRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := makePrivate(path, newTestLedger(t, defaultHostFS()), defaultHostFS())
+		_, err := makePrivate(path, newBook(newTestLedger(t, defaultHostFS()), testCheckID), defaultHostFS())
 		if !errors.Is(err, ErrPrivateDir) {
 			t.Errorf("makePrivate over an existing directory = %v, want ErrPrivateDir", err)
 		}
@@ -87,7 +87,7 @@ func TestAPrivateDirectoryWithTheWrongModeIsRefused(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		_, err := makePrivate(path, newTestLedger(t, defaultHostFS()), defaultHostFS())
+		_, err := makePrivate(path, newBook(newTestLedger(t, defaultHostFS()), testCheckID), defaultHostFS())
 		if !errors.Is(err, ErrPrivateDir) {
 			t.Errorf("makePrivate over a symlink = %v, want ErrPrivateDir", err)
 		}

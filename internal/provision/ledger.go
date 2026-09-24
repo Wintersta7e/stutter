@@ -392,6 +392,115 @@ func (l *ledger) next() int {
 	return l.seq
 }
 
+// record is what a ledger says about one resource: every line with its seq, folded.
+type record struct {
+	typ     ResourceType
+	kind    rules.Kind
+	name    string
+	id      string
+	service string
+	state   op
+	seq     int
+	parent  int
+}
+
+// book is a ledger open for appending, the check whose labels its resources must carry, and its
+// entries folded per resource.
+type book struct {
+	led      *ledger
+	records  map[int]*record
+	check    string
+	order    []int
+	mu       sync.Mutex
+	kept     bool
+	retained bool
+}
+
+func newBook(led *ledger, check string) *book {
+	return &book{led: led, check: check, records: map[int]*record{}}
+}
+
+// note appends one entry, synced, and folds it.
+func (b *book) note(e entry) error {
+	if err := b.led.append(e); err != nil {
+		return err
+	}
+
+	b.fold(e)
+
+	return nil
+}
+
+// fold applies one entry to the records.
+func (b *book) fold(e entry) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if e.Op.checkWide() {
+		b.kept = b.kept || e.Op == opKept
+		b.retained = b.retained || e.Op == opRetained
+
+		return
+	}
+
+	rec, ok := b.records[e.Seq]
+	if !ok {
+		rec = &record{seq: e.Seq, typ: e.Type, kind: e.Kind, name: e.Name, service: e.Service, parent: e.Parent}
+		b.records[e.Seq] = rec
+		b.order = append(b.order, e.Seq)
+	}
+
+	if e.ID != "" {
+		rec.id = e.ID
+	}
+
+	rec.state = e.Op
+}
+
+// record returns a copy of the record of seq.
+func (b *book) record(seq int) (record, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	rec, ok := b.records[seq]
+	if !ok {
+		return record{}, false
+	}
+
+	return *rec, true
+}
+
+// children returns copies of the records of the anonymous volumes ledgered against the container
+// recorded at parent.
+func (b *book) children(parent int) []record {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	var out []record
+
+	for _, seq := range b.order {
+		if rec := b.records[seq]; rec.parent == parent && rec.typ == ResourceVolume {
+			out = append(out, *rec)
+		}
+	}
+
+	return out
+}
+
+// knows reports whether any record holds id.
+func (b *book) knows(id string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	for _, rec := range b.records {
+		if rec.id == id {
+			return true
+		}
+	}
+
+	return false
+}
+
 // loaded is a ledger as read back.
 type loaded struct {
 	entries []entry

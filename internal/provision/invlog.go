@@ -17,9 +17,10 @@ const (
 	invocationLog   = "invocation.log"
 	logsDir         = "logs"
 	dockerConfigDir = "docker-config"
-	// hostDir and hostFile are what a host-path line records.
-	hostDir  = "dir"
-	hostFile = "file"
+	// hostDir and hostFile are what a host-path line records; hostPathCreate is its one op.
+	hostDir        = "dir"
+	hostFile       = "file"
+	hostPathCreate = "create"
 )
 
 // errOutsidePrivate means a host path named for the log is not under the check-private directory.
@@ -151,5 +152,5 @@ func (e *Engine) LogHostPath(path string) error {
 }
 
 func (e *Engine) recordHostPath(kind, path string) error {
-	return e.log.write(hostPathLine{Kind: "hostpath", Op: "create", Type: kind, Path: path})
+	return e.log.write(hostPathLine{Kind: "hostpath", Op: hostPathCreate, Type: kind, Path: path})
 }

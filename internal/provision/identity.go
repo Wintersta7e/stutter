@@ -228,9 +228,13 @@ func readTemplate(ctx context.Context, c caller, v verb, template string, into a
 		return err
 	}
 
-	if err := json.Unmarshal(bytes.TrimSpace(res.out), into); err != nil {
-		return fmt.Errorf("%w: the %s call printed something other than its template: %w",
-			ErrEngine, verbs()[v].name, err)
+	return decodeJSON(res.out, into)
+}
+
+// decodeJSON decodes the one JSON object a template call printed.
+func decodeJSON(out []byte, into any) error {
+	if err := json.Unmarshal(bytes.TrimSpace(out), into); err != nil {
+		return fmt.Errorf("%w: a template call printed something other than its template: %w", ErrEngine, err)
 	}
 
 	return nil

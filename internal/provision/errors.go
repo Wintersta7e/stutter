@@ -16,4 +16,13 @@ var (
 	// ErrPrivateDir means the check's private directory cannot be trusted: it already existed, or is
 	// not a local directory this user alone owns with mode 0700.
 	ErrPrivateDir = errors.New("check-private directory unusable")
+	// ErrNotOurs means a resource does not carry this check's labels: it is not provably the
+	// check's, so it is never used and never removed.
+	ErrNotOurs = errors.New("resource does not carry this check's labels")
+	// ErrSubnetTaken means the engine refused a network create because another network holds an
+	// intersecting subnet; another subnet may succeed.
+	ErrSubnetTaken = errors.New("subnet taken on the engine")
+	// ErrSubnetOverlap means a requested subnet is not a masked IPv4 prefix, or intersects a prefix
+	// of a local interface; it is refused before any call.
+	ErrSubnetOverlap = errors.New("subnet refused")
 )
