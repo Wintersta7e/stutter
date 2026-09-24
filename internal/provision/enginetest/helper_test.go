@@ -9,10 +9,28 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/Wintersta7e/stutter/internal/provision"
 )
+
+// writeShim writes an executable `docker` script into dir. It holds the fork lock while the file is
+// open for writing: a child another parallel test forks meanwhile would inherit the descriptor until
+// it execs, and executing the shim then fails with "text file busy".
+func writeShim(t *testing.T, dir, script string) {
+	t.Helper()
+
+	syscall.ForkLock.Lock()
+	//nolint:gosec // a test shim must be executable to stand in for the docker CLI.
+	err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755)
+	syscall.ForkLock.Unlock()
+
+	if err != nil {
+		t.Fatalf("write shim: %v", err)
+	}
+}
 
 // helperMode turns this test binary into a helper process when set in its environment. A helper is
 // the process a test kills or signals, standing in for a stutter invocation.

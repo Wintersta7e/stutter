@@ -59,10 +59,7 @@ func TestNoDockerChildOutlivesStutter(t *testing.T) {
 	shim := "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$STUTTER_SHIM_PID.tmp\"\n" +
 		"mv \"$STUTTER_SHIM_PID.tmp\" \"$STUTTER_SHIM_PID\"\nexec sleep 300\n"
 
-	//nolint:gosec // a test shim must be executable to stand in for the docker CLI.
-	if err := os.WriteFile(filepath.Join(shimDir, "docker"), []byte(shim), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeShim(t, shimDir, shim)
 
 	helper, _ := startHelper(t, "child", []string{
 		"PATH=" + shimDir + ":/usr/bin:/bin",

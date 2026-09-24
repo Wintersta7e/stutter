@@ -13,4 +13,7 @@ var (
 	// ErrStateDir means the directory that holds the check ledgers cannot be trusted: not local,
 	// not owned or not private, or the ledger cannot be written or locked there.
 	ErrStateDir = errors.New("state directory unusable")
+	// ErrPrivateDir means the check's private directory cannot be trusted: it already existed, or is
+	// not a local directory this user alone owns with mode 0700.
+	ErrPrivateDir = errors.New("check-private directory unusable")
 )

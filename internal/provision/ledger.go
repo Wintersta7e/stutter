@@ -236,6 +236,7 @@ type ledger struct {
 	host hostFS
 	path string
 	mu   sync.Mutex
+	seq  int
 }
 
 // createLedger writes the check's ledger into dir: as a temporary file, locked, its header synced,
@@ -374,6 +375,21 @@ func (l *ledger) close() error {
 	}
 
 	return nil
+}
+
+// remove deletes the ledger, then releases its lock.
+func (l *ledger) remove() error {
+	return errors.Join(os.Remove(l.path), l.close())
+}
+
+// next allocates the sequence number of the next resource the check records.
+func (l *ledger) next() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.seq++
+
+	return l.seq
 }
 
 // loaded is a ledger as read back.

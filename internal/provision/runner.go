@@ -26,6 +26,7 @@ const (
 	verbVersion
 	verbInfo
 	verbWSLInfo
+	verbComposeConfig
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -86,6 +87,8 @@ const (
 	stderrCap = 64 << 10
 	// waitDelay bounds how long a killed call may hold its output pipes open.
 	waitDelay = 2 * time.Second
+	// pendingCap bounds the call lines kept for a log not yet attached.
+	pendingCap = 16
 	// shellPath runs groupKiller.
 	shellPath = "/bin/sh"
 	// groupKiller runs its arguments as a background child with stdin passed through, and on
@@ -94,10 +97,13 @@ const (
 	groupKiller = `exec 3<&0; trap "kill -s KILL 0" TERM; "$@" <&3 3<&- & wait $!; exit $?`
 )
 
-// verbSpec is one row of the verb table.
+// verbSpec is one row of the verb table. A call's argv is prefix, its typed arguments, suffix —
+// or alt instead, for a row with two fixed forms — then its typed tail.
 type verbSpec struct {
 	name     string
 	prefix   []string
+	suffix   []string
+	alt      []string
 	program  program
 	mode     mode
 	deadline deadline
@@ -127,6 +133,11 @@ func verbs() [verbCount]verbSpec {
 			name: "wslinfo", program: programWSLInfo, prefix: []string{"--networking-mode"},
 			mode: modeUser, deadline: deadlineShort, stderr: stderrFirstLine,
 		},
+		verbComposeConfig: {
+			name: "composeConfig", program: programCompose, prefix: []string{"compose"},
+			suffix: []string{"config", "--format", "json"}, alt: []string{"config", "--environment"},
+			mode: modeUser, deadline: deadlineShort, stderr: stderrCount,
+		},
 	}
 }
 
@@ -146,14 +157,41 @@ type arg struct {
 	model bool
 }
 
-// request is one call: a verb and its typed arguments.
+// request is one call: a verb, its typed arguments and tail, and which fixed form it takes.
 type request struct {
 	stdin    io.Reader
 	stdout   io.Writer
 	dir      string
 	args     []arg
+	tail     []arg
 	extraEnv []string
 	verb     verb
+	alt      bool
+}
+
+// tokens returns a call's whole argv after the program, as typed arguments: the row's fixed tokens
+// are never model tokens.
+func (s verbSpec) tokens(req request) ([]arg, error) {
+	suffix := s.suffix
+	if req.alt {
+		if s.alt == nil {
+			return nil, fmt.Errorf("%w: the %s row has no second form", ErrEngine, s.name)
+		}
+
+		suffix = s.alt
+	}
+
+	out := make([]arg, 0, len(s.prefix)+len(req.args)+len(suffix)+len(req.tail))
+	for _, token := range s.prefix {
+		out = append(out, arg{val: token})
+	}
+
+	out = append(out, req.args...)
+	for _, token := range suffix {
+		out = append(out, arg{val: token})
+	}
+
+	return append(out, req.tail...), nil
 }
 
 // result is what a call returned. elapsed is measured on the monotonic clock.
@@ -219,6 +257,7 @@ func (*CallError) Unwrap() error {
 type execRunner struct {
 	logCall   func(callLine)
 	limits    map[deadline]time.Duration
+	pending   []callLine
 	docker    string
 	wslinfo   string
 	pin       string
@@ -300,7 +339,12 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 			ErrEngine, spec.name)
 	}
 
-	path, argv, err := r.command(spec, req)
+	typed, err := spec.tokens(req)
+	if err != nil {
+		return result{}, err
+	}
+
+	path, argv, err := r.command(spec, typed)
 	if err != nil {
 		return result{}, err
 	}
@@ -316,19 +360,25 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 	defer cancel()
 
 	res, sink, err := spawn(callCtx, path, argv, env, spec, req)
-	r.record(spec, req, res, sink)
+	r.record(spec, typed, res, sink)
 
+	return res, outcome(ctx, callCtx, spec, limit, res, err)
+}
+
+// outcome names how a call ended: its own deadline, its caller's cancellation, a failure to run,
+// or a non-zero exit.
+func outcome(ctx, callCtx context.Context, spec verbSpec, limit time.Duration, res result, err error) error {
 	switch {
 	case err == nil && res.exit == 0:
-		return res, nil
+		return nil
 	case errors.Is(context.Cause(callCtx), errPastDeadline):
-		return res, fmt.Errorf("%w: %s call exceeded its %s deadline", ErrDeadline, spec.name, limit)
+		return fmt.Errorf("%w: %s call exceeded its %s deadline", ErrDeadline, spec.name, limit)
 	case !spec.hold && ctx.Err() != nil:
-		return res, fmt.Errorf("%s call cancelled: %w", spec.name, context.Cause(ctx))
+		return fmt.Errorf("%s call cancelled: %w", spec.name, context.Cause(ctx))
 	case err != nil:
-		return res, err
+		return err
 	default:
-		return res, &CallError{Verb: spec.name, Code: res.exit, Stderr: res.stderrFirst}
+		return &CallError{Verb: spec.name, Code: res.exit, Stderr: res.stderrFirst}
 	}
 }
 
@@ -336,9 +386,9 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 var errPastDeadline = errors.New("past the call's deadline")
 
 // command returns the program to spawn and its argv.
-func (r *execRunner) command(spec verbSpec, req request) (string, []string, error) {
-	tokens := append([]string(nil), spec.prefix...)
-	for _, a := range req.args {
+func (r *execRunner) command(spec verbSpec, typed []arg) (string, []string, error) {
+	tokens := make([]string, 0, len(typed))
+	for _, a := range typed {
 		tokens = append(tokens, a.val)
 	}
 
@@ -459,12 +509,9 @@ func spawn(
 	return res, sink, nil
 }
 
-// record hands the call's line to the invocation log, when one is attached.
-func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderrSink) {
-	if r.logCall == nil {
-		return
-	}
-
+// record hands the call's line to the invocation log. Before a log is attached, the first few lines
+// wait for it: the precondition reads happen before the check has a directory to log into.
+func (r *execRunner) record(spec verbSpec, typed []arg, res result, sink *stderrSink) {
 	line := callLine{
 		Kind: "call", Verb: spec.name, Program: r.docker, Mode: "user",
 		Exit: res.exit, MS: res.elapsed.Milliseconds(),
@@ -478,9 +525,7 @@ func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderr
 		line.Mode = "constructed"
 	}
 
-	line.Argv = append(line.Argv, spec.prefix...)
-
-	for _, a := range req.args {
+	for _, a := range typed {
 		if a.model {
 			line.Argv = append(line.Argv, "<model>")
 		} else {
@@ -496,7 +541,23 @@ func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderr
 		line.StderrLines = &lines
 	}
 
-	r.logCall(line)
+	if r.logCall != nil {
+		r.logCall(line)
+	} else if len(r.pending) < pendingCap {
+		r.pending = append(r.pending, line)
+	}
+}
+
+// attach hands the runner the check's private client configuration and invocation log, flushes the
+// lines that waited for the log, and lets the runner mutate the engine from now on.
+func (r *execRunner) attach(configDir string, logCall func(callLine)) {
+	r.configDir, r.logCall, r.mutable = configDir, logCall, true
+
+	for _, line := range r.pending {
+		logCall(line)
+	}
+
+	r.pending = nil
 }
 
 // stderrSink counts a call's stderr lines and, for a first-line row, keeps up to stderrCap bytes.
