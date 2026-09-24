@@ -164,7 +164,7 @@ type Config struct {
 type Sandbox struct {
 	httpScript *httpproxy.Script
 	// certificates is nil unless the stub serves TLS. It is minted once per sandbox, so every run in
-	// a comparison presents the same certificate.
+	// a comparison presents the same leaf for a name.
 	certificates *authority
 	// checkpoint is the sandbox's own starting point, taken at the first observed run when the
 	// configuration supplies no Baseline.
@@ -211,7 +211,7 @@ func New(cfg Config) (*Sandbox, error) {
 	var certificates *authority
 
 	if cfg.HTTPTLS {
-		minted, mintErr := newAuthority(cfg.HTTPHost)
+		minted, mintErr := newAuthority(cfg.HTTPHost, cfg.AdvertiseHost)
 		if mintErr != nil {
 			return nil, mintErr
 		}
@@ -606,7 +606,7 @@ func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpp
 		s.cfg.HTTPHost,
 		sink,
 		s.httpScript,
-		s.certificates.leaf,
+		s.certificates.certificate,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("bind the TLS stub: %w", err)

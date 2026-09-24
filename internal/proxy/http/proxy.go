@@ -203,20 +203,20 @@ func Listen(ctx context.Context, addr, logicalHost string, sink Sink, script *Sc
 	return bind(ctx, addr, logicalHost, sink, script, nil)
 }
 
-// ListenTLS binds an HTTPS stub serving certificate.
+// ListenTLS binds an HTTPS stub whose certificate for each client comes from certificate.
 //
 // Most real dependencies are reached over TLS, and a service that cannot reach its dependency
 // produces no effects at all — which reads as a handler that did nothing. The caller supplies the
-// certificate and is responsible for giving the service under test the CA that signed it.
+// certificates and is responsible for giving the service under test the CA that signed them.
 func ListenTLS(
 	ctx context.Context,
 	addr, logicalHost string,
 	sink Sink,
 	script *Script,
-	certificate tls.Certificate,
+	certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error),
 ) (*Proxy, error) {
 	return bind(ctx, addr, logicalHost, sink, script, &tls.Config{
-		Certificates:       []tls.Certificate{certificate},
+		GetCertificate:     certificate,
 		GetConfigForClient: recordServerName,
 		// HTTP/1.1 is all the stub serves. Agreeing on it in the handshake makes an h2-only client
 		// fail there, loudly, instead of connecting and hanging up unseen.

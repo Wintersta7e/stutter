@@ -337,7 +337,9 @@ func startTLSProxy(
 
 	certificate, trust := selfSigned(t)
 
-	proxy, err := proxyhttp.ListenTLS(t.Context(), "127.0.0.1:0", "logical.test", current, script, certificate)
+	present := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &certificate, nil }
+
+	proxy, err := proxyhttp.ListenTLS(t.Context(), "127.0.0.1:0", "logical.test", current, script, present)
 	if err != nil {
 		t.Fatal(err)
 	}
