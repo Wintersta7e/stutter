@@ -5,11 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -50,13 +52,19 @@ type pulling struct {
 	consumer   jetstream.Consumer
 	dependency net.Conn
 	replies    *bufio.Reader
-	done       chan struct{}
-	stopped    chan struct{}
-	quirks     quirks
+	// seeded is the job-seeded bucket the handler writes to, under the seededKey quirk.
+	seeded  jetstream.KeyValue
+	done    chan struct{}
+	stopped chan struct{}
+	quirks  quirks
 }
 
 // quirks are the ways a pulling service departs from the plain one, each for the test that needs it.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type quirks struct {
+	// seen is where a starting service notes what it found. Shared by every run of a sandbox.
+	seen *startups
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
 	// Zero never does.
 	nakFor time.Duration
@@ -74,6 +82,59 @@ type quirks struct {
 	// tlsFirst makes the service also open a raw connection to the bus and start a TLS handshake on
 	// it, as a client configured for TLS does.
 	tlsFirst bool
+	// bucket makes the service look its own key/value bucket up at startup, noting whether it found
+	// one, and then create it and write to it.
+	bucket bool
+	// seededKey makes the service read a job-seeded key at startup, noting its revision, and makes
+	// the handler write that key.
+	seededKey bool
+}
+
+// Buckets a quirky service keeps state in.
+const (
+	// serviceBucket is the bucket the service creates for itself at startup.
+	serviceBucket = "svc-state"
+	// seededBucket and seededKey are what a job writes before the service ever starts.
+	seededBucket = "seeded"
+	seededKey    = "k"
+)
+
+// startups records what a service found each time it started, across the runs of one sandbox.
+type startups struct {
+	found     []bool
+	revisions []uint64
+	mu        sync.Mutex
+}
+
+// bucketFound notes whether a starting service found its own bucket already there.
+func (s *startups) bucketFound(found bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.found = append(s.found, found)
+}
+
+// revision notes the revision a starting service read the seeded key at.
+func (s *startups) revision(revision uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.revisions = append(s.revisions, revision)
+}
+
+// buckets and seededRevisions report what every start found, in order.
+func (s *startups) buckets() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.found)
+}
+
+func (s *startups) seededRevisions() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.revisions)
 }
 
 // echoSubject is where an echoing service notes each order: inside the corpus subjects, so its own
@@ -159,6 +220,10 @@ func startPulling(
 		return nil, fmt.Errorf("open jetstream: %w", err)
 	}
 
+	if startupErr := service.startup(ctx, stream); startupErr != nil {
+		return nil, startupErr
+	}
+
 	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
 		Name:          observedConsumer,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -176,7 +241,7 @@ func startPulling(
 		}
 	}
 
-	go service.pump()
+	go service.pump(ctx)
 
 	return service, nil
 }
@@ -220,9 +285,48 @@ func (p *pulling) Close(context.Context) {
 	_ = p.dependency.Close()
 }
 
+// startup is the service's own work before it consumes: its bucket looked up and made, the seeded
+// key read.
+func (p *pulling) startup(ctx context.Context, stream jetstream.JetStream) error {
+	if p.quirks.bucket {
+		_, err := stream.KeyValue(ctx, serviceBucket)
+		if err != nil && !errors.Is(err, jetstream.ErrBucketNotFound) {
+			return fmt.Errorf("look the service bucket up: %w", err)
+		}
+
+		p.quirks.seen.bucketFound(err == nil)
+
+		own, err := stream.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: serviceBucket})
+		if err != nil {
+			return fmt.Errorf("create the service bucket: %w", err)
+		}
+
+		if _, err := own.Put(ctx, "state", []byte("started")); err != nil {
+			return fmt.Errorf("write the service bucket: %w", err)
+		}
+	}
+
+	if p.quirks.seededKey {
+		seeded, err := stream.KeyValue(ctx, seededBucket)
+		if err != nil {
+			return fmt.Errorf("open the seeded bucket: %w", err)
+		}
+
+		entry, err := seeded.Get(ctx, seededKey)
+		if err != nil {
+			return fmt.Errorf("read the seeded key: %w", err)
+		}
+
+		p.quirks.seen.revision(entry.Revision())
+		p.seeded = seeded
+	}
+
+	return nil
+}
+
 // pump pulls one message at a time for as long as the run lasts, which is what a real pull consumer
 // does and what makes a redelivery arrive on its own rather than being handed over.
-func (p *pulling) pump() {
+func (p *pulling) pump(ctx context.Context) {
 	defer close(p.stopped)
 
 	for {
@@ -238,14 +342,14 @@ func (p *pulling) pump() {
 		}
 
 		for msg := range batch.Messages() {
-			p.handle(msg)
+			p.handle(ctx, msg)
 		}
 	}
 }
 
 // handle reserves stock once per delivery, which is the planted bug: the bus is permitted to deliver
 // the same message twice, and this service reserves twice when it does.
-func (p *pulling) handle(msg jetstream.Msg) {
+func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 	if p.quirks.nakFor > 0 && firstDelivery(msg) {
 		//nolint:errcheck // as below: a settle that fails is the run ending underneath the service.
 		_ = msg.NakWithDelay(p.quirks.nakFor)
@@ -265,6 +369,12 @@ func (p *pulling) handle(msg jetstream.Msg) {
 	case !p.quirks.idempotent || firstDelivery(msg):
 		if err := p.reserve(msg.Data()); err != nil {
 			settle = msg.Nak
+		}
+
+		if p.seeded != nil {
+			if _, err := p.seeded.Put(ctx, seededKey, msg.Data()); err != nil {
+				settle = msg.Nak
+			}
 		}
 
 		if p.quirks.echo {

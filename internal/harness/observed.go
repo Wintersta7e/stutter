@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,6 +59,8 @@ const (
 	// drainPoll is how often an observed run checks whether the bus has gone quiet. Well below any
 	// redelivery deadline a consumer would be configured with, so it costs the run no accuracy.
 	drainPoll = 25 * time.Millisecond
+	// ownCheckpoint names the sandbox's own bus checkpoint, beside the store.
+	ownCheckpoint = "observed"
 )
 
 // Consumer is a service that pulls from the bus for itself.
@@ -75,10 +78,10 @@ type Start func(ctx context.Context, at Addresses) (Consumer, error)
 
 // runObserved replays the corpus into a service Stutter does not dispatch to.
 //
-// The shape is the driven run's, with three substitutions: the stream is rebuilt to scope the run
-// because the service cannot be told to skip a message, the fault is injected by swallowing
-// acknowledgements on the wire, and the run ends when the bus goes quiet rather than when the driver
-// stops delivering.
+// The shape is the driven run's, with three substitutions: the bus is restored to its starting point
+// and only the run's messages are published, because the service cannot be told to skip a message;
+// the fault is injected by swallowing acknowledgements on the wire; and the run ends when the bus goes
+// quiet rather than when the driver stops delivering.
 func (s *Sandbox) runObserved(
 	ctx context.Context,
 	name string,
@@ -135,29 +138,82 @@ func (s *Sandbox) runObserved(
 	return run.result(verdict.Clause)
 }
 
-// prepare returns the part of the corpus this run replays, and clears the stream to receive it.
+// prepare returns the part of the corpus this run replays, and restores the whole bus to its starting
+// point to receive it.
 //
-// Cleared rather than staged outright: the service starts against a stream holding nothing, and the
-// corpus arrives only once it has finished starting. Clearing is also the bus-side reset, since it
-// takes the previous run's consumers with the stream.
+// The restore is the bus-side reset: whatever the previous run's service created — buckets, streams,
+// consumers, pauses — is gone, and a key a job seeded reads at the job's revision again. Nothing is
+// published yet: the service starts against the starting point, and the corpus arrives only once it
+// has finished starting.
 //
-// The corpus is snapshotted once, before the first run reduces it. Sandbox runs are serial — a check
-// compares one run against the next — so the snapshot needs no guard of its own.
+// The corpus is taken once, before the first run: from Recorded, or else read out of the stream. Sandbox
+// runs are serial — a check compares one run against the next — so neither needs a guard of its own.
 func (s *Sandbox) prepare(ctx context.Context, retain []uint64) ([]corpus.Message, error) {
 	if s.recorded == nil {
-		snapshot, err := s.cfg.Corpus.Snapshot(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("read the corpus: %w", err)
+		if err := s.load(ctx); err != nil {
+			return nil, err
 		}
-
-		s.recorded = snapshot
 	}
 
-	if err := s.cfg.Corpus.Clear(ctx); err != nil {
-		return nil, fmt.Errorf("clear the corpus: %w", err)
+	baseline, err := s.startingPoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.cfg.Corpus.Restore(ctx, baseline); err != nil {
+		return nil, fmt.Errorf("restore the bus: %w", err)
 	}
 
 	return scope(s.recorded, retain), nil
+}
+
+// load takes the corpus the runs replay: Recorded when it is set, else the stream's contents.
+func (s *Sandbox) load(ctx context.Context) error {
+	if s.cfg.Recorded != nil {
+		s.recorded = s.cfg.Recorded
+
+		return nil
+	}
+
+	snapshot, err := s.cfg.Corpus.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("read the corpus: %w", err)
+	}
+
+	// Never nil once taken, so an empty stream is not read again after a run has written to it.
+	s.recorded = append([]corpus.Message{}, snapshot...)
+
+	return nil
+}
+
+// startingPoint is the checkpoint every observed run restores: Baseline, or the sandbox's own.
+//
+// The sandbox's own is taken once, at the first observed run: the corpus stream cleared — its
+// messages are already in hand — and the whole bus copied beside the store, never inside the store a
+// restore replaces.
+func (s *Sandbox) startingPoint(ctx context.Context) (corpus.Checkpoint, error) {
+	if s.cfg.Baseline != nil {
+		return *s.cfg.Baseline, nil
+	}
+
+	if s.checkpoint != nil {
+		return *s.checkpoint, nil
+	}
+
+	if err := s.cfg.Corpus.Clear(ctx); err != nil {
+		return corpus.Checkpoint{}, fmt.Errorf("clear the corpus: %w", err)
+	}
+
+	dir := filepath.Join(filepath.Dir(s.cfg.Corpus.StoreDir()), ownCheckpoint)
+
+	taken, err := s.cfg.Corpus.Checkpoint(ctx, dir)
+	if err != nil {
+		return corpus.Checkpoint{}, fmt.Errorf("checkpoint the bus: %w", err)
+	}
+
+	s.checkpoint = &taken
+
+	return taken, nil
 }
 
 // begin publishes the corpus once the service has finished starting, with every consumer but the one
