@@ -10,10 +10,13 @@ import (
 	"github.com/Wintersta7e/stutter/internal/relay"
 )
 
-// Where the copy helper sees its two trees.
+// Where the copy helper sees its two trees, and who it runs as.
 const (
 	helperSource      = "/src"
 	helperDestination = "/dst"
+	// rootUID is root. The relay image has no user database, so a user with no group of its own runs
+	// in group 0 as well.
+	rootUID = "0"
 )
 
 // helperCapabilities are all the copy helper keeps: enough to set any owner, mode and time on what it
@@ -40,7 +43,7 @@ func (d *Dependencies) copyTree(ctx context.Context, service string, from copySo
 		Kind: rules.KindHelper, Service: service, NoNetwork: true,
 		Volumes: []VolumeMount{{Volume: to, Target: helperDestination, NoCopy: true}},
 		Spec: compose.Spec{
-			Service: service, Image: d.cfg.Helper.ID, User: "0:0", ReadOnly: true,
+			Service: service, Image: d.cfg.Helper.ID, User: rootUID, ReadOnly: true,
 			Cmd: relay.Copy{Src: helperSource, Dst: helperDestination}.Args(), CmdSet: true,
 			CapDrop: []string{"ALL"}, CapAdd: helperCapabilities(), SecurityOpt: []string{"no-new-privileges"},
 		},
