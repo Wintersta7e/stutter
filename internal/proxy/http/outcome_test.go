@@ -20,8 +20,10 @@ const (
 	heldFor = 1500 * time.Millisecond
 	// quietFor is how long a row that must not stop is watched after its client is done.
 	quietFor = 300 * time.Millisecond
-	// isolated is how quickly a request is answered beside a held connection.
-	isolated = 200 * time.Millisecond
+	// isolated is how quickly a request is answered beside a held connection: half the first-request
+	// bound, which is what a held connection judged in Accept would cost it. A 200 ms bound failed at
+	// 256 ms under load with nothing held up.
+	isolated = stubHeaderBound / 2
 )
 
 // stubUnderTest is one fresh stub, its run begun.

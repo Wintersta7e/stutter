@@ -87,12 +87,16 @@ func TestTheDeliveryCapKeepsEveryDeadline(t *testing.T) {
 	// The server sent the first delivery, and started its deadline, somewhere between the pull being
 	// issued and the delivery arriving. Measured from the pull, an attempt can only look later than it
 	// was; from the arrival, only earlier. Each bound uses the anchor that cannot flatter it.
+	// A curve trimmed from the wrong end moves an attempt by 300 ms at the least (dropping the 200 ms
+	// entry); a third of that separates the two. One 25 ms poll failed at 45 ms late under load.
+	const slack = 100 * time.Millisecond
+
 	for attempt, offset := range offsets {
-		if early := want[attempt] - (offset + lead); early > drainPoll {
+		if early := want[attempt] - (offset + lead); early > slack {
 			t.Errorf("attempt %d landed %s before %s", attempt+1, early, want[attempt])
 		}
 
-		if late := offset - want[attempt]; late > drainPoll {
+		if late := offset - want[attempt]; late > slack {
 			t.Errorf("attempt %d landed %s after %s", attempt+1, late, want[attempt])
 		}
 	}

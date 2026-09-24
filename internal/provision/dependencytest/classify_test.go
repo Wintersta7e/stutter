@@ -2,7 +2,6 @@ package dependencytest_test
 
 import (
 	"testing"
-	"time"
 
 	"github.com/Wintersta7e/stutter/internal/compose"
 	"github.com/Wintersta7e/stutter/internal/provision"
@@ -75,7 +74,11 @@ func TestAnUnservedPortAnswersNone(t *testing.T) {
 		t.Errorf(`answers["db"][7000] = %q, want %q`, got, pg.AnswerNone)
 	}
 
-	if bound := startupLimit + time.Second; took > bound {
-		t.Errorf("classification took %v, past the startup limit %v by more than 1s", took, startupLimit)
+	// The total includes removing the container after the limit, which took over a second on a 4-CPU
+	// host. Halfway to twice the limit still fails a classification that ignored the limit or applied it
+	// twice; one that restarted it per container adds only create and start, which no wall-clock bound
+	// can resolve on a shared runner (measured 0.4 s).
+	if bound := startupLimit + startupLimit/2; took > bound {
+		t.Errorf("classification took %v, want within %v of a %v startup limit", took, bound, startupLimit)
 	}
 }

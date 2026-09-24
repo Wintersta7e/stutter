@@ -15,9 +15,6 @@ import (
 	"github.com/Wintersta7e/stutter/internal/toy"
 )
 
-// pollSlack is the watch loop's tick: a run's end is noticed on the tick after it happens.
-const pollSlack = 25 * time.Millisecond
-
 // settleMargin is how many quiesces of quiet end a run whose messages are all done.
 const settleMargin = 5
 
@@ -100,10 +97,13 @@ func TestACleanRunOnALongCurveEndsOnSettlement(t *testing.T) {
 
 	lastAck, closed := timings.read().lastAck, timings.read().closed
 	settle := settleMargin * toy.DefaultQuiesce
-	bound := settle + pollSlack + 50*time.Millisecond
+	// Halfway between the settle period and the curve's first redelivery: a run that ended on settlement
+	// lands near the first, one that waited on the curve at or past the second. Settle plus a 75 ms
+	// allowance measured the scheduler instead — a 4-CPU CI runner under -race closed 10 ms past it.
+	bound := settle + (config.AckWait-settle)/2
 
-	t.Logf("closed %s after the last acknowledgement, within %s (settle %s, one tick %s, 50ms for the "+
-		"after-run read)", closed.Sub(lastAck), bound, settle, pollSlack)
+	t.Logf("closed %s after the last acknowledgement, within %s (settle %s, first redelivery %s)",
+		closed.Sub(lastAck), bound, settle, config.AckWait)
 
 	if closed.Sub(lastAck) > bound {
 		t.Errorf("closed %s after the last acknowledgement, want within %s", closed.Sub(lastAck), bound)
