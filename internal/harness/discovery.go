@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,15 @@ var (
 	// errUnbound means such a start was given a corpus bound to no stream, so there is nothing to look
 	// for the service's consumers on.
 	errUnbound = errors.New("a start that publishes nothing needs a corpus bound to a stream")
+)
+
+var (
+	// ErrExitedBeforeConsumer means the service stopped by itself before creating any consumer, so
+	// discovery had nothing to read. The Discovery returned beside it says how it ended and why.
+	ErrExitedBeforeConsumer = errors.New("the service under test exited before creating any consumer")
+	// ErrConsumesElsewhere means the service's consumers are all on streams other than the corpus
+	// stream. The Discovery returned beside it names them.
+	ErrConsumesElsewhere = errors.New("the service under test consumes only from other streams")
 )
 
 // stageDiscovery names discovery in its errors.
@@ -196,7 +206,12 @@ func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
 func (s *Sandbox) settleDiscovery(ctx context.Context, start *bare) (Discovery, error) {
 	var listing corpus.Listing
 
-	_, err := start.observed.await(ctx, start.service.Exited(), s.discoverySettled(start, &listing))
+	ended, err := start.observed.await(ctx, start.service.Exited(), s.discoverySettled(start, &listing))
+
+	// The listing the wait last read can predate the exit.
+	if err == nil && ended == targetExited {
+		listing, err = s.cfg.Corpus.Consumers(ctx)
+	}
 
 	var found Discovery
 	if err == nil {
@@ -208,9 +223,50 @@ func (s *Sandbox) settleDiscovery(ctx context.Context, start *bare) (Discovery, 
 		return Discovery{}, fmt.Errorf("%s: %w", start.stage, err)
 	}
 
+	exit.Exited = exit.Exited || ended == targetExited
 	found.Exit, found.Setup = exit, start.recorder.SetupCount()
+	found.Refusals, found.ClosedAfterInfo = start.recorder.Refusals(), start.recorder.ClosedAfterInfoCount()
+
+	if err := found.verdict(ended); err != nil {
+		return found, fmt.Errorf("%s: %w", start.stage, err)
+	}
 
 	return found, nil
+}
+
+// verdict is what discovery found as an exit row: none when a consumer exists on the corpus stream,
+// or when none exists anywhere and the service is still running — the check then runs unnamed, and its
+// observation gate says what never happened.
+func (d Discovery) verdict(ended interruption) error {
+	switch {
+	case len(d.Consumers) > 0:
+		return nil
+	case len(d.Elsewhere) > 0:
+		return fmt.Errorf("%w: %s; the stream the check was pointed at is likely not the one it consumes from",
+			ErrConsumesElsewhere, strings.Join(d.Elsewhere, ", "))
+	case ended == targetExited:
+		return fmt.Errorf("%w: %s", ErrExitedBeforeConsumer, d.diagnosis())
+	default:
+		return nil
+	}
+}
+
+// diagnosis says why a service that exited before creating a consumer may have done so: how it
+// exited, every JetStream request the bus refused it, and how many bus connections hung up after the
+// greeting — what a client that requires TLS does.
+func (d Discovery) diagnosis() string {
+	parts := make([]string, 0, 1+len(d.Refusals)+1)
+	parts = append(parts, "it "+d.Exit.Describe())
+
+	for _, refusal := range d.Refusals {
+		parts = append(parts, fmt.Sprintf("the bus refused %s (err_code %d: %s)",
+			refusal.Subject, refusal.ErrCode, refusal.Description))
+	}
+
+	parts = append(parts, fmt.Sprintf("%d bus connections closed after the greeting without a byte",
+		d.ClosedAfterInfo))
+
+	return strings.Join(parts, "; ")
 }
 
 // readDiscovered reads every consumer on the corpus stream as the server holds it, on Stutter's own

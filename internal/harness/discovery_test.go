@@ -1,8 +1,10 @@
 package harness_test
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +18,7 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
+	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/harness"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
@@ -27,6 +30,10 @@ const (
 	startDeadline = 20 * time.Second
 	// ordersFilter is what the ORDERS stream captures.
 	ordersFilter = "orders.>"
+	// auditStream is a stream the service consumes from beside the corpus stream.
+	auditStream = "AUDIT"
+	// reserve is the durable consumer most of these services create.
+	reserve = "reserve"
 )
 
 // errStartRefused is a Start that fails; errResetRefused a Reset that does.
@@ -338,7 +345,7 @@ func TestDiscoveryStartsFromItsBaseline(t *testing.T) {
 
 		revision.Store(entry.Revision())
 
-		return idleAfter("reserve")(ctx, js, nil, harness.Addresses{})
+		return idleAfter(reserve)(ctx, js, nil, harness.Addresses{})
 	}
 
 	cfg := startConfig(store, checkpoint, service)
@@ -361,7 +368,7 @@ func TestDiscoveryStartsFromItsBaseline(t *testing.T) {
 		t.Errorf("journal = %q, want it to begin [reset start]", got)
 	}
 
-	if got := names(found.Consumers); !slices.Equal(got, []string{"reserve"}) {
+	if got := names(found.Consumers); !slices.Equal(got, []string{reserve}) {
 		t.Errorf("consumers = %q, want [reserve]", got)
 	}
 }
@@ -377,7 +384,7 @@ func TestDiscoverySettlesOnceTheServiceIsQuiet(t *testing.T) {
 
 	service := &fakeService{}
 	service.script = func(ctx context.Context, js jetstream.JetStream, conn *nats.Conn, _ harness.Addresses) int {
-		if err := createDurable(ctx, js, "ORDERS", "reserve"); err != nil {
+		if err := createDurable(ctx, js, "ORDERS", reserve); err != nil {
 			return 2
 		}
 
@@ -412,7 +419,7 @@ func TestDiscoverySettlesOnceTheServiceIsQuiet(t *testing.T) {
 		t.Errorf("discovery took %s, want at least %s and under the 5s startup limit", elapsed, busyFor)
 	}
 
-	if got := names(found.Consumers); !slices.Equal(got, []string{"reserve"}) {
+	if got := names(found.Consumers); !slices.Equal(got, []string{reserve}) {
 		t.Errorf("consumers = %q, want [reserve]", got)
 	}
 }
@@ -481,7 +488,7 @@ func TestAFailedResetStopsDiscoveryBeforeTheServiceStarts(t *testing.T) {
 	t.Parallel()
 
 	store, checkpoint := newBus(t, withOrders(t))
-	service := &fakeService{script: idleAfter("reserve")}
+	service := &fakeService{script: idleAfter(reserve)}
 	cfg := startConfig(store, checkpoint, service)
 	cfg.Reset = func(context.Context) error { return errResetRefused }
 
@@ -565,7 +572,7 @@ func TestDiscoveryListsEveryConsumerTheServerHolds(t *testing.T) {
 	store, checkpoint := newBus(t, withOrders(t))
 	service := &fakeService{}
 	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
-		audit := jetstream.StreamConfig{Name: "AUDIT", Subjects: []string{"audit.>"}}
+		audit := jetstream.StreamConfig{Name: auditStream, Subjects: []string{"audit.>"}}
 		if _, err := js.CreateStream(ctx, audit); err != nil {
 			return 2
 		}
@@ -582,7 +589,7 @@ func TestDiscoveryListsEveryConsumerTheServerHolds(t *testing.T) {
 
 		defer func() { _ = watcher.Stop() }() //nolint:errcheck // the service is stopping either way.
 
-		if err := createDurable(ctx, js, "AUDIT", "audit"); err != nil {
+		if err := createDurable(ctx, js, auditStream, "audit"); err != nil {
 			return 2
 		}
 
@@ -720,4 +727,192 @@ func targetKinds(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ ha
 	defer consuming.Stop()
 
 	return idle(ctx)
+}
+
+// errRemovalFailed is a service whose removal failed.
+var errRemovalFailed = errors.New("the service could not be removed")
+
+// hangUpAfterGreeting opens a raw connection to the proxied bus, reads the greeting and hangs up without
+// a byte, as a client that requires TLS or a script waiting for the port does.
+func hangUpAfterGreeting(ctx context.Context, at harness.Addresses) error {
+	var dialer net.Dialer
+
+	conn, err := dialer.DialContext(ctx, "tcp", strings.TrimPrefix(at.NATS, "nats://"))
+	if err != nil {
+		return err
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// TestATargetThatExitsBeforeAnyConsumerIsASetupError: a service that stops before creating any
+// consumer leaves discovery nothing to read, and the check stops with everything that says why: how it
+// exited, what the bus refused it, and how many connections hung up after the greeting.
+func TestATargetThatExitsBeforeAnyConsumerIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, at harness.Addresses) int {
+		clash := jetstream.StreamConfig{Name: "CLASH", Subjects: []string{"orders.created"}}
+		if _, err := js.CreateStream(ctx, clash); err == nil {
+			return 2
+		}
+
+		if err := hangUpAfterGreeting(ctx, at); err != nil {
+			return 2
+		}
+
+		return 1
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if !errors.Is(err, harness.ErrExitedBeforeConsumer) {
+		t.Fatalf("Discover() error = %v, want %v", err, harness.ErrExitedBeforeConsumer)
+	}
+
+	t.Logf("E11: %v", err)
+
+	if !found.Exit.Exited || found.Exit.Code != 1 {
+		t.Errorf("exit = %+v, want exited by itself with code 1", found.Exit)
+	}
+
+	refused := slices.IndexFunc(found.Refusals, func(refusal effect.Refusal) bool {
+		return refusal.ErrCode == 10065 && refusal.Description != ""
+	})
+	if refused < 0 {
+		t.Errorf("refusals = %+v, want err_code 10065 with its description", found.Refusals)
+	}
+
+	if found.ClosedAfterInfo != 1 {
+		t.Errorf("closed after the greeting: %d, want 1", found.ClosedAfterInfo)
+	}
+
+	if !strings.Contains(err.Error(), "10065") {
+		t.Errorf("error %q does not name err_code 10065", err)
+	}
+}
+
+// TestATargetThatExitsAfterItsConsumerIsRecordedNotRefused: a durable consumer outlives its client, so
+// a service that exits after creating one is read, and its exit recorded; whether it keeps exiting is
+// for the runs to find.
+func TestATargetThatExitsAfterItsConsumerIsRecordedNotRefused(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		if createDurable(ctx, js, "ORDERS", reserve) != nil {
+			return 2
+		}
+
+		return 0
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	if got := names(found.Consumers); !slices.Equal(got, []string{reserve}) {
+		t.Errorf("consumers = %q, want [reserve]", got)
+	}
+
+	if !found.Exit.Exited {
+		t.Errorf("exit = %+v, want exited by itself", found.Exit)
+	}
+}
+
+// TestConsumersOnlyOnAnotherStreamAreASetupError: a service whose consumers are all on another stream
+// is not consuming from the stream the check was pointed at, and the check stops naming where they are.
+func TestConsumersOnlyOnAnotherStreamAreASetupError(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{script: auditOnly}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if !errors.Is(err, harness.ErrConsumesElsewhere) {
+		t.Fatalf("Discover() error = %v, want %v", err, harness.ErrConsumesElsewhere)
+	}
+
+	if !strings.Contains(err.Error(), "AUDIT/audit") {
+		t.Errorf("error %q does not name AUDIT/audit", err)
+	}
+
+	if !slices.Equal(found.Elsewhere, []string{"AUDIT/audit"}) {
+		t.Errorf("elsewhere = %q, want [AUDIT/audit]", found.Elsewhere)
+	}
+}
+
+// auditOnly is a service consuming from AUDIT alone.
+func auditOnly(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+	audit := jetstream.StreamConfig{Name: auditStream, Subjects: []string{"audit.>"}}
+	if _, err := js.CreateStream(ctx, audit); err != nil {
+		return 2
+	}
+
+	if createDurable(ctx, js, auditStream, "audit") != nil {
+		return 2
+	}
+
+	return idle(ctx)
+}
+
+// TestAnEnvironmentStopDuringDiscoveryIsASetupError: a dependency the proxy cannot reach stops
+// discovery at once, naming it, rather than at the startup limit.
+func TestAnEnvironmentStopDuringDiscoveryIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{script: dialsCache}
+	cfg := startConfig(store, checkpoint, service)
+	cfg.Opaque = map[string]string{"cache": closedPort(t).String()}
+
+	began := time.Now()
+
+	_, err := harness.Discover(startContext(t), cfg)
+
+	elapsed := time.Since(began)
+	t.Logf("discovery stopped after %s: %v", elapsed, err)
+
+	if err == nil || !strings.Contains(err.Error(), "cache") {
+		t.Fatalf("Discover() error = %v, want one naming cache", err)
+	}
+
+	if elapsed >= 2500*time.Millisecond {
+		t.Errorf("discovery stopped after %s, want it well inside the 5s startup limit", elapsed)
+	}
+}
+
+// dialsCache is a service that dials its cache as it starts and writes one line to it.
+func dialsCache(ctx context.Context, _ jetstream.JetStream, _ *nats.Conn, at harness.Addresses) int {
+	var dialer net.Dialer
+
+	conn, err := dialer.DialContext(ctx, "tcp", at.Opaque["cache"])
+	if err == nil {
+		_, _ = conn.Write([]byte("GET warm\n")) //nolint:errcheck // the dependency is unreachable either way.
+		_ = conn.Close()
+	}
+
+	return idle(ctx)
+}
+
+// TestAFailedServiceRemovalIsASetupError: a service that cannot be removed cleanly stops the check.
+func TestAFailedServiceRemovalIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{script: idleAfter(reserve), closeErr: errRemovalFailed}
+
+	if _, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service)); !errors.Is(
+		err, errRemovalFailed) {
+		t.Fatalf("Discover() error = %v, want it to wrap %v", err, errRemovalFailed)
+	}
 }
