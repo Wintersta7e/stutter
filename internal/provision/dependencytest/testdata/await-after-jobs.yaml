@@ -1,0 +1,35 @@
+# A dependency that only listens once a job has run for longer than the dependency wait: its ports
+# must be observed from the job's exit, not from its own start.
+name: awaitafterjobs
+
+x-stutter:
+  roles:
+    later: other
+  endpoints:
+    later:
+      "5432": opaque
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+      LATER_ADDR: later:5432
+    depends_on:
+      hold:
+        condition: service_completed_successfully
+      later:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  later:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    entrypoint: ["sh", "-c", "sleep 5; exec docker-entrypoint.sh postgres"]
+
+  hold:
+    image: postgres:18-alpine
+    entrypoint: ["sh", "-c", "sleep 6"]

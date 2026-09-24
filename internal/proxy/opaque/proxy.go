@@ -23,9 +23,12 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
@@ -40,6 +43,16 @@ const (
 	// deleteByte is DEL, the one control character that sits above the printable range.
 	deleteByte = 0x7f
 )
+
+// DialHold is how long after its dial an upstream that ends without a byte counts as a dial failure,
+// and how long a readiness check holds a connection open before calling a port dialable. Measured on
+// the engine's port forwarder: it accepts for a port nothing serves and ends that connection with zero
+// bytes 0.2 to 0.7 ms later; a listening server keeps it open.
+const DialHold = 100 * time.Millisecond
+
+// ErrUpstreamClosed means the dependency ended a connection within DialHold of its dial without
+// sending a byte: the forwarder refusing on its behalf.
+var ErrUpstreamClosed = errors.New("the dependency ended the connection before answering it")
 
 var (
 	errMissingName     = errors.New("opaque proxy requires a logical dependency name")
@@ -170,9 +183,9 @@ func (p *Proxy) dialFailure() error {
 	return p.dialFailed
 }
 
-// abort closes a client so it reads a reset, never EOF: the upstream could not be reached, and a clean
-// close would tell the client the dependency hung up on it. A relayed connection aborts itself, which
-// carries the reset back through the relay.
+// abort closes a connection so its peer reads a reset, never EOF: a clean close would tell the peer the
+// other side finished, which is not what happened. A relayed connection aborts itself, which carries
+// the reset back through the relay; a connection that can do neither is closed.
 func abort(conn net.Conn) {
 	if aborter, ok := conn.(interface{ Abort() error }); ok {
 		_ = aborter.Abort() //nolint:errcheck // the connection is being refused either way.
@@ -204,29 +217,58 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	defer func() { _ = upstream.Close() }()
 
-	current := &session{sink: p.sink, name: p.name}
+	current := &link{
+		ctx: ctx, proxy: p, client: client, upstream: upstream, dialled: time.Now(),
+		session: &session{sink: p.sink, name: p.name},
+	}
 
 	var pumps sync.WaitGroup
 
-	pumps.Go(func() {
-		pump(upstream, client, current.answered)
-		// Closing the far side unblocks the other direction's Read, so one peer hanging up ends the
-		// whole connection instead of leaving a pump parked until the run is torn down.
-		_ = client.Close()
-	})
+	pumps.Go(func() { current.ended(pump(upstream, client, current.answered), true) })
+	current.ended(pump(client, upstream, current.session.requested), false)
 
-	pump(client, upstream, current.requested)
-	_ = upstream.Close()
-
+	// Both directions have ended; the deferred closes finish a connection both peers finished.
 	pumps.Wait()
 
-	// A request the dependency never answered is still a request. Emitting it at close keeps a
-	// fire-and-forget protocol visible.
-	current.flush()
+	// A request the dependency never answered is still a request: emitting it at close keeps a
+	// fire-and-forget protocol visible. One sent to a dependency that ended before its first byte
+	// never reached one, and was discarded with the dial failure.
+	current.session.flush()
 }
 
-// pump forwards src to dst, showing every chunk to observe on the way past.
-func pump(src, dst net.Conn, observe func([]byte)) {
+// link is one proxied connection: its two legs, and what decides how each direction's end is passed on.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type link struct {
+	ctx      context.Context //nolint:containedctx // the start's context, read when a direction ends.
+	proxy    *Proxy
+	client   net.Conn
+	upstream net.Conn
+	session  *session
+	// dialled is when the upstream dial returned, on the monotonic clock.
+	dialled time.Time
+	once    sync.Once
+	// heard reports that the upstream sent a byte; clientDone that the client's write side ended.
+	heard      atomic.Bool
+	clientDone atomic.Bool
+}
+
+// answered is what the upstream sent: it closes the request it answers.
+func (l *link) answered(chunk []byte) {
+	l.heard.Store(true)
+	l.session.answered(chunk)
+}
+
+// ending is how one direction of a connection ended.
+type ending struct {
+	err error
+	// write reports an error writing the destination, not reading the source.
+	write bool
+}
+
+// pump forwards src to dst, showing every chunk to observe on the way past, until a read or a write
+// fails.
+func pump(src, dst net.Conn, observe func([]byte)) ending {
 	buffer := make([]byte, copyBuffer)
 
 	for {
@@ -235,14 +277,86 @@ func pump(src, dst net.Conn, observe func([]byte)) {
 			observe(buffer[:read])
 
 			if _, writeErr := dst.Write(buffer[:read]); writeErr != nil {
-				return
+				return ending{err: writeErr, write: true}
 			}
 		}
 
 		if err != nil {
+			return ending{err: err}
+		}
+	}
+}
+
+// ended passes on how one direction ended. EOF is a half-close, passed on as one: the other leg's write
+// side is shut and the reverse direction keeps flowing, because a client that shuts its write side
+// still waits for the reply. Any other read error, or any write error, is a reset, passed on as one
+// to both legs. Turning either ending into the other would hand the service a behaviour its real
+// dependency never had. An upstream that ended before its first byte, within the dial hold, is none of
+// these: it is a dial failure.
+func (l *link) ended(end ending, fromUpstream bool) {
+	if l.refused(end, fromUpstream) {
+		l.failDial(end.err)
+
+		return
+	}
+
+	if !end.write && errors.Is(end.err, io.EOF) {
+		dst := l.client
+		if !fromUpstream {
+			// Marked before the upstream can see the half-close: its close in answer is then no refusal.
+			l.clientDone.Store(true)
+
+			dst = l.upstream
+		}
+
+		if closeWrite(dst) == nil {
 			return
 		}
 	}
+
+	l.resetBoth()
+}
+
+// refused reports the upstream leg ending — its read, or a write to it — within DialHold of the dial
+// with no byte from it. A reset or any other error is a refusal; a clean EOF is one unless the client
+// had already finished, when the upstream's close answers the client's. The proxy's own close is not.
+func (l *link) refused(end ending, fromUpstream bool) bool {
+	if l.heard.Load() || time.Since(l.dialled) > DialHold || l.ctx.Err() != nil {
+		return false
+	}
+
+	if fromUpstream == end.write || errors.Is(end.err, net.ErrClosed) {
+		return false
+	}
+
+	return !errors.Is(end.err, io.EOF) || !l.clientDone.Load()
+}
+
+// failDial stops the run on an upstream that ended before its first byte. The request it was sent is
+// discarded, and the failure recorded before the client is reset, so the start sees it first.
+func (l *link) failDial(cause error) {
+	l.session.discard()
+	l.proxy.failDial(fmt.Errorf("%w: upstream %s ended %s after the dial: %w", ErrUpstreamClosed,
+		l.proxy.upstream, time.Since(l.dialled).Round(time.Microsecond), cause))
+	l.resetBoth()
+}
+
+// resetBoth resets both legs, once: the far end of each must read what the near end did.
+func (l *link) resetBoth() {
+	l.once.Do(func() {
+		abort(l.client)
+		abort(l.upstream)
+	})
+}
+
+// closeWrite shuts a connection's write side. Both production connections can — a TCP connection on
+// the Go-caller path, a relayed connection on the compose path — and one that cannot is closed whole.
+func closeWrite(conn net.Conn) error {
+	if half, ok := conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite() //nolint:wrapcheck // the caller only asks whether it worked.
+	}
+
+	return conn.Close() //nolint:wrapcheck // as above.
 }
 
 // session accumulates one connection's requests. Both directions touch it, so it is guarded.
@@ -251,11 +365,17 @@ type session struct {
 	name    string
 	pending []byte
 	mu      sync.Mutex
+	// discarded is a connection whose requests never reached a dependency: nothing more is recorded.
+	discarded bool
 }
 
 func (s *session) requested(chunk []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.discarded {
+		return
+	}
 
 	s.pending = append(s.pending, chunk...)
 
@@ -280,6 +400,14 @@ func (s *session) flush() {
 	defer s.mu.Unlock()
 
 	s.emit()
+}
+
+// discard drops the pending request and everything after it.
+func (s *session) discard() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pending, s.discarded = nil, true
 }
 
 func (s *session) emit() {

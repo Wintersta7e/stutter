@@ -60,6 +60,10 @@ type Image struct {
 	Arch string
 	// Variant is the image's architecture variant, recorded with the platform.
 	Variant string
+	// WorkingDir is the image's `WORKDIR`, which a container inherits when compose sets none.
+	WorkingDir string
+	// User is the image's `USER`, which a container inherits when compose sets none.
+	User string
 	// Env is the image's `ENV`, as `NAME=value` entries.
 	Env []string
 	// Entrypoint is the image's `ENTRYPOINT`.

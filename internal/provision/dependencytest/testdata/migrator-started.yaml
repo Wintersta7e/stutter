@@ -1,0 +1,38 @@
+# The migrator is reached only by service_started, so nothing waits for it to finish: it is not a
+# seed job, and the datastore starts with no seed.
+name: migratorstarted
+
+x-stutter:
+  roles:
+    migrate: sibling
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+      DATABASE_URL: postgres://postgres@db:5432/postgres
+    depends_on:
+      migrate:
+        condition: service_started
+      db:
+        condition: service_healthy
+
+  bus:
+    image: nats:2.14-alpine
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  migrate:
+    image: postgres:18-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: ["sh", "-c", "psql -h db -U postgres -c 'CREATE TABLE never (id int)'"]

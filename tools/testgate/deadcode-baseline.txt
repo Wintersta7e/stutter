@@ -62,10 +62,8 @@ github.com/Wintersta7e/stutter/internal/harness.validateListeners
 github.com/Wintersta7e/stutter/internal/relay.NewToken
 github.com/Wintersta7e/stutter/internal/relay.Spec.Args
 github.com/Wintersta7e/stutter/internal/relay.Verify.Args
-# The copy helper's argv: written and read by the compose path's volume restore.
+# The copy helper's argv: written by the compose path's volume seed and restore.
 github.com/Wintersta7e/stutter/internal/relay.Copy.Args
-github.com/Wintersta7e/stutter/internal/relay.ParseCopy
-github.com/Wintersta7e/stutter/internal/relay.parsePath
 # The static-self check: called by the compose path before it creates any resource.
 github.com/Wintersta7e/stutter/internal/relay.Qualify
 github.com/Wintersta7e/stutter/internal/relay.goArch

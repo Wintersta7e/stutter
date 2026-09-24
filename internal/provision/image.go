@@ -15,6 +15,7 @@ const imageTemplate = `{"id":{{json .Id}},"labels":{{json (index .Config "Labels
 	`"env":{{json (index .Config "Env")}},"entrypoint":{{json (index .Config "Entrypoint")}},` +
 	`"cmd":{{json (index .Config "Cmd")}},"exposed":{{json (index .Config "ExposedPorts")}},` +
 	`"volumes":{{json (index .Config "Volumes")}},"os":{{json (index . "Os")}},` +
+	`"working_dir":{{json (index .Config "WorkingDir")}},"user":{{json (index .Config "User")}},` +
 	`"arch":{{json (index . "Architecture")}},"variant":{{json (index . "Variant")}}}`
 
 // imageReport is what imageTemplate prints.
@@ -26,6 +27,8 @@ type imageReport struct {
 	OS         string                     `json:"os"`
 	Arch       string                     `json:"arch"`
 	Variant    string                     `json:"variant"`
+	WorkingDir string                     `json:"working_dir"`
+	User       string                     `json:"user"`
 	Env        []string                   `json:"env"`
 	Entrypoint []string                   `json:"entrypoint"`
 	Cmd        []string                   `json:"cmd"`
@@ -34,7 +37,8 @@ type imageReport struct {
 // image converts a report to the compose model's image.
 func (r imageReport) image() compose.Image {
 	return compose.Image{
-		Labels: r.Labels, ID: r.ID, OS: r.OS, Arch: r.Arch, Variant: r.Variant, Env: r.Env,
+		Labels: r.Labels, ID: r.ID, OS: r.OS, Arch: r.Arch, Variant: r.Variant, WorkingDir: r.WorkingDir,
+		User: r.User, Env: r.Env,
 		Entrypoint: r.Entrypoint, Cmd: r.Cmd, ExposedPorts: sortedKeys(r.Exposed), Volumes: sortedKeys(r.Volumes),
 	}
 }

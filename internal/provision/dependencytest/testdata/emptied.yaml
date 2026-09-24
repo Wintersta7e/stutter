@@ -1,0 +1,47 @@
+# A dependency whose image holds content where a volume it shares with a job is mounted, and the job
+# that empties that volume. The path's content reaches the volume only by the engine's copy-up, as an
+# image VOLUME's does. The dependency serves the path's tar on 7000 so a test can read it, and has no
+# init: its shell ignores the stop signal until the grace period ends.
+name: emptied
+
+x-stutter:
+  roles:
+    box: other
+  endpoints:
+    box:
+      "5432": opaque
+      "7000": opaque
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+    depends_on:
+      wipe:
+        condition: service_completed_successfully
+      box:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  box:
+    image: postgres:18-alpine
+    entrypoint: ["sh", "-c", "while :; do nc -l -p 7000 -e tar -c -C \"$$0\" .; done", "/usr/local/share/postgresql/tsearch_data"]
+    expose: ["7000"]
+    stop_grace_period: 1s
+    volumes:
+      - shared:/usr/local/share/postgresql/tsearch_data
+
+  wipe:
+    image: postgres:18-alpine
+    depends_on:
+      box:
+        condition: service_started
+    entrypoint: ["sh", "-c", "find /data -mindepth 1 -delete"]
+    volumes:
+      - shared:/data
+
+volumes:
+  shared:

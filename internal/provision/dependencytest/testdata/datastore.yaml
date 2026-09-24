@@ -1,0 +1,74 @@
+# A Postgres datastore migrated by a job, and a second Postgres declared an opaque "other" dependency
+# whose cluster lives under its image's VOLUME and is seeded by the same job.
+name: datastore
+
+x-stutter:
+  roles:
+    cache: other
+  endpoints:
+    cache:
+      "5432": opaque
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+      DATABASE_URL: postgres://postgres@db:5432/postgres
+      CACHE_ADDR: cache:5432
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+    volumes:
+      - dbdata:/var/lib/postgresql
+      - dbsock:/var/run/postgresql
+
+  cache:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    stop_grace_period: 5s
+
+  migrate:
+    image: postgres:18-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        set -e
+        psql -v ON_ERROR_STOP=1 -h db -U postgres <<'SQL'
+        CREATE SCHEMA app;
+        CREATE TABLE app.ledger (id bigint PRIMARY KEY, note text NOT NULL);
+        CREATE SEQUENCE app.ledger_ids;
+        ALTER DATABASE postgres SET search_path = app, public;
+        INSERT INTO app.ledger (id, note) VALUES (nextval('app.ledger_ids'), 'seeded');
+        SQL
+        until pg_isready -q -h cache -U postgres; do sleep 0.2; done
+        psql -v ON_ERROR_STOP=1 -h cache -U postgres <<'SQL'
+        CREATE TABLE seeded (id int PRIMARY KEY);
+        INSERT INTO seeded VALUES (1);
+        SQL
+
+volumes:
+  dbdata:
+  dbsock:

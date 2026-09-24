@@ -25,7 +25,8 @@ func (m *Model) Images(services []string) []ImageRef {
 		}
 
 		ref := ImageRef{
-			Service: name, Ref: svc.Image, Platform: svc.Platform, Policy: PullMissing, Build: svc.Build != nil,
+			Service: name, Ref: unescape(svc.Image), Platform: unescape(svc.Platform), Policy: PullMissing,
+			Build: svc.Build != nil,
 		}
 
 		switch svc.PullPolicy {
