@@ -158,7 +158,11 @@ type Scan struct {
 // A verdict is only as good as the run it is compared against. A service rejecting the corpus, or
 // never reaching its dependencies at all, produces a clean run that agrees with itself perfectly and
 // proves nothing — and the gates cannot tell, because they compare the clean run only with itself.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type Health struct {
+	// Refusals are the requests the bus declined before the first delivery.
+	Refusals []effect.Refusal
 	// Messages is how many recorded messages the run was given.
 	Messages int
 	// Delivered counts deliveries, redeliveries included.
@@ -174,6 +178,14 @@ type Health struct {
 	Setup int
 	// Late counts effects that arrived after their message's window closed.
 	Late int
+	// NoResponders counts requests nothing on the bus answered.
+	NoResponders int
+	// FedBack counts messages Stutter did not publish that reached the consumer and did nothing.
+	FedBack int
+	// Elsewhere counts deliveries on another stream inside a message's window.
+	Elsewhere int
+	// ClosedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
+	ClosedAfterInfo int
 }
 
 // Divergence is one mutated run that behaved differently from the reference run.

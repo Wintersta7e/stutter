@@ -4,30 +4,85 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
 // pauseHorizon is how long Pause holds a consumer. Far longer than any run, because nothing lifts the
-// pause: Clear deletes the consumer with the stream before the next run starts.
+// pause but the next restore, which returns the consumer to how the checkpoint holds it.
 const pauseHorizon = 24 * time.Hour
 
-// errForeignMessages means the corpus stream held a message Fill did not publish.
-var errForeignMessages = errors.New("something other than Stutter published into the corpus stream")
+// ErrFill means the corpus could not be staged exactly as numbered: a publish was refused, the bus
+// took a message for a duplicate, or a message landed somewhere other than where it was numbered.
+var ErrFill = errors.New("the corpus could not be staged as numbered")
+
+// errTooManyPending means a consumer's pending count is past anything a corpus could stage.
+var errTooManyPending = errors.New("pending count out of range")
 
 // Message is one corpus message held outside the stream.
 //
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type Message struct {
-	// Subject and Payload are the message as it was recorded. Headers are not carried: nothing
-	// downstream reads them, and a header the bus adds on ingestion is not the recording's.
+	// Header carries the message's headers, each name with its values in order; nil is none. A
+	// header-keyed dedupe guard reads them, and a corpus published without them fails a correct
+	// handler under duplicate delivery.
+	Header map[string][]string
+	// Subject and Payload are the message as it was recorded.
 	Subject string
 	Payload []byte
-	// Seq is the sequence the message was recorded under. Staging renumbers the stream from one, so
-	// this is the only name for a message that survives a rebuild.
+	// Seq is the sequence the message was recorded under — its rank, for a corpus read from a
+	// directory. Staging lands it wherever the stream is up to, so this is the only name for a message
+	// that survives a run.
 	Seq uint64
+}
+
+// FillError is why Fill stopped, naming the corpus message it was staging.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type FillError struct {
+	// Err is the cause of a refused publish; nil for a duplicate or a misplaced landing.
+	Err error
+	// Seq is the recorded sequence of the message being staged.
+	Seq uint64
+	// Other is the recorded sequence of the corpus message this one duplicated, or zero when the bus
+	// matched it to a message that was already in the stream.
+	Other uint64
+	// Landed is the stream sequence the message landed at instead of the one it was numbered.
+	Landed uint64
+	// want is the stream sequence the message was numbered.
+	want uint64
+	// duplicate says the bus took the message for one it had already stored.
+	duplicate bool
+}
+
+func (e *FillError) Error() string {
+	prefix := fmt.Sprintf("stage message %d: ", e.Seq)
+
+	switch {
+	case e.Err != nil:
+		return prefix + e.Err.Error()
+	case e.duplicate && e.Other != 0:
+		return fmt.Sprintf("%sthe bus took it for a duplicate of message %d", prefix, e.Other)
+	case e.duplicate:
+		return prefix + "the bus took it for a duplicate of a message already in the stream"
+	default:
+		return fmt.Sprintf("%slanded at %d, want %d: something else published into the stream",
+			prefix, e.Landed, e.want)
+	}
+}
+
+// Is makes every Fill failure match ErrFill, whatever its cause.
+func (*FillError) Is(target error) bool {
+	return target == ErrFill
+}
+
+// Unwrap exposes the cause of a refused publish.
+func (e *FillError) Unwrap() error {
+	return e.Err
 }
 
 // Staged is one message as it was staged, pairing the sequence it was recorded under with the one it
@@ -72,7 +127,12 @@ func (c *Corpus) Snapshot(ctx context.Context) ([]Message, error) {
 			return nil, fmt.Errorf("read corpus message %d: %w", sequence, err)
 		}
 
-		messages = append(messages, Message{Subject: raw.Subject, Payload: raw.Data, Seq: sequence})
+		messages = append(messages, Message{
+			Subject: raw.Subject,
+			Payload: raw.Data,
+			Header:  headers(raw.Header),
+			Seq:     sequence,
+		})
 	}
 
 	return messages, nil
@@ -80,62 +140,135 @@ func (c *Corpus) Snapshot(ctx context.Context) ([]Message, error) {
 
 // Clear rebuilds the corpus stream empty, ready for Fill.
 //
-// Clearing and filling are how a run is scoped when the service under test chooses its own messages:
-// it cannot be told to skip one, and holding a delivery back at the proxy breaks the consumer's own
-// batch accounting — a pull consumer counts a swallowed message against the batch it asked for, so
-// its next fetch comes back short. Rebuilding also takes the previous run's consumers with it, which
-// is what stops a second run resuming where the first one stopped.
-//
-// They are two steps rather than one so the service can be started in between, against a stream that
-// holds nothing yet: whatever it does on startup then happens before there is a message to attribute
-// it to.
+// It is not a reset between runs: it leaves every bucket, stream and consumer the service made, and a
+// seeded key at the service's revision. The bus reset is a checkpoint's restore. Clear survives for a
+// Go caller that published its corpus into the stream: the corpus is taken out once, the stream
+// cleared, and a checkpoint taken of the empty stream — so it runs at most once, before the first
+// checkpoint, and is refused after one.
 //
 // The stream is deleted and recreated rather than purged, for the same reason a key/value guard is:
 // a purged stream carries state a virgin one does not, and a run that starts from an equivalent
 // rather than an identical position is not comparable with the one before it.
 func (c *Corpus) Clear(ctx context.Context) error {
+	if c.checkpointed {
+		return errClearAfterCheckpoint
+	}
+
 	if err := c.stream.DeleteStream(ctx, c.topic.Stream); err != nil {
 		return fmt.Errorf("delete the corpus stream: %w", err)
 	}
 
-	if _, err := c.stream.CreateStream(ctx, streamConfig(c.topic)); err != nil {
+	if _, err := c.stream.CreateStream(ctx, streamConfig(c.topic.Stream, c.topic.Subjects)); err != nil {
 		return fmt.Errorf("recreate the corpus stream: %w", err)
 	}
 
 	return nil
 }
 
-// Numbering is the sequence each message will have once Fill has published it into a cleared stream.
+// Next is the stream sequence the next published message will land at: one past the bound stream's
+// last. A stream a job or the service created may already hold messages, so staging starts wherever
+// the stream is up to rather than at one.
+func (c *Corpus) Next(ctx context.Context) (uint64, error) {
+	stream, err := c.stream.Stream(ctx, c.topic.Stream)
+	if err != nil {
+		return 0, fmt.Errorf("open the corpus stream: %w", err)
+	}
+
+	info, err := stream.Info(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("read the corpus stream state: %w", err)
+	}
+
+	return info.State.LastSeq + 1, nil
+}
+
+// Numbering is the sequence each message will have once Fill has published it from first on.
 //
 // A service consuming for itself is handed a message the moment it lands, before Fill has heard back
 // where it landed, so the translation has to be known before publishing rather than read back after.
-// A virgin stream numbers from one, and Fill checks that it did.
-func Numbering(messages []Message) []Staged {
+// Numbering starts at the stream's next sequence (Next), and Fill checks that it did.
+func Numbering(messages []Message, first uint64) []Staged {
 	staged := make([]Staged, len(messages))
 	for at, message := range messages {
-		staged[at] = Staged{Recorded: message.Seq, Sequence: uint64(at) + 1}
+		staged[at] = Staged{Recorded: message.Seq, Sequence: first + uint64(at)}
 	}
 
 	return staged
 }
 
-// Fill publishes messages into a cleared corpus stream, in order.
+// Fill publishes messages into the bound stream in order, headers included, the first at first.
 //
-// A message landing anywhere but where Numbering said is an error rather than a detail: something
-// else published into the stream, and every fault aimed by sequence would hit the wrong message.
-func (c *Corpus) Fill(ctx context.Context, messages []Message) error {
+// Each publish waits for the bus's acknowledgement. A message the bus took for a duplicate, or one
+// landing anywhere but where Numbering said, is an error rather than a detail: the corpus would be
+// missing a message, or something else published into the stream, and every fault aimed by sequence
+// would hit the wrong message.
+func (c *Corpus) Fill(ctx context.Context, messages []Message, first uint64) error {
 	for at, message := range messages {
-		sequence, err := c.Publish(ctx, message.Subject, message.Payload)
-		if err != nil {
-			return fmt.Errorf("stage message %d: %w", message.Seq, err)
+		msg := nats.NewMsg(message.Subject)
+		msg.Data = message.Payload
+
+		for name, values := range message.Header {
+			msg.Header[name] = slices.Clone(values)
 		}
 
-		if want := uint64(at) + 1; sequence != want {
-			return fmt.Errorf("%w: message %d landed at %d, want %d", errForeignMessages, message.Seq, sequence, want)
+		ack, err := c.stream.PublishMsg(ctx, msg)
+		if err != nil {
+			return &FillError{Err: fmt.Errorf("publish: %w", err), Seq: message.Seq}
+		}
+
+		want := first + uint64(at)
+
+		switch {
+		case ack.Duplicate:
+			return &FillError{Seq: message.Seq, Other: filled(messages[:at], first, ack.Sequence), duplicate: true}
+		case ack.Sequence != want:
+			return &FillError{Seq: message.Seq, Landed: ack.Sequence, want: want}
 		}
 	}
 
 	return nil
+}
+
+// filled names the corpus message already published at a stream sequence, or zero when none of
+// them was.
+func filled(published []Message, first, sequence uint64) uint64 {
+	if sequence < first || sequence-first >= uint64(len(published)) {
+		return 0
+	}
+
+	return published[sequence-first].Seq
+}
+
+// Pending is how many messages the consumer has still to be handed or to settle, and the filter
+// subjects the server holds for it, sorted.
+//
+// Both are read from the server: a caller's idea of the consumer's filter need not match the one the
+// service actually created, and counting against the wrong one would call a correct run short.
+func (c *Corpus) Pending(ctx context.Context, consumer string) (int, []string, error) {
+	stream, err := c.stream.Stream(ctx, c.topic.Stream)
+	if err != nil {
+		return 0, nil, fmt.Errorf("open the corpus stream: %w", err)
+	}
+
+	info, err := lookup(ctx, stream, consumer)
+	if err != nil {
+		return 0, nil, fmt.Errorf("find consumer %q: %w", consumer, err)
+	}
+
+	var filters []string
+	if info.Config.FilterSubject != "" {
+		filters = append(filters, info.Config.FilterSubject)
+	}
+
+	filters = append(filters, info.Config.FilterSubjects...)
+	slices.Sort(filters)
+
+	if info.NumPending > math.MaxInt32 {
+		return 0, nil, fmt.Errorf("%w: consumer %q has %d messages pending",
+			errTooManyPending, consumer, info.NumPending)
+	}
+
+	return int(info.NumPending) + info.NumAckPending, slices.Compact(filters), nil
 }
 
 // Consumers names every consumer on the corpus stream, in name order.
@@ -230,12 +363,26 @@ func lookup(ctx context.Context, stream jetstream.Stream, consumer string) (*jet
 	return push.CachedInfo(), nil
 }
 
-// streamConfig is the corpus stream's shape, in one place so a staged stream is identical to the one
-// Start created.
-func streamConfig(topic Topic) jetstream.StreamConfig {
+// headers copies a stored message's headers out of the NATS type, nil when there are none.
+func headers(stored nats.Header) map[string][]string {
+	if len(stored) == 0 {
+		return nil
+	}
+
+	copied := make(map[string][]string, len(stored))
+	for name, values := range stored {
+		copied[name] = slices.Clone(values)
+	}
+
+	return copied
+}
+
+// streamConfig is the shape of a stream Stutter owns, in one place so a staged stream is identical to
+// the one Start created.
+func streamConfig(name string, subjects []string) jetstream.StreamConfig {
 	return jetstream.StreamConfig{
-		Name:      topic.Stream,
-		Subjects:  []string{topic.Filter},
+		Name:      name,
+		Subjects:  subjects,
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	}

@@ -20,9 +20,15 @@ type Delivery struct {
 // Notification happens BEFORE the bytes are forwarded, so a window opened here is already open when
 // the service acts on the message. The other order loses the first effect of every delivery.
 //
-// It only ever watches. Holding a delivery back to scope a run to part of the corpus was tried and
-// does not work: a pull consumer counts a swallowed message against the batch it asked for, so the
-// service's own fetch comes back short and then stalls. Scoping belongs in what the stream contains.
+// It never swallows or reorders a delivery. A pull consumer counts a swallowed message against the
+// batch it asked for, so the service's own fetch comes back short and then stalls: scoping belongs in
+// what the stream contains. A Hold only delays: while the corpus is published every delivery waits,
+// is noted here as it is read, and is forwarded in order on release — well within the consumer's own
+// timers, measured every run, and a hold past its bound stops the run.
 type Deliveries interface {
 	Delivered(delivery Delivery)
+	// CoreDelivered is told of a message handed to a core subscription rather than a consumer: one
+	// whose reply is no acknowledgement subject and that answers no request of the service's. A core
+	// subscriber on a subject the corpus is published to receives every staged message too.
+	CoreDelivered(subject string)
 }

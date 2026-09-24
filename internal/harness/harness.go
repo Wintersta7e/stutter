@@ -90,9 +90,19 @@ type Config struct {
 	// Stutter then has nothing to dispatch and no acknowledgement of its own to withhold, so the run
 	// is watched and faulted on the wire instead.
 	Start Start
-	// Reset returns every dependency to the starting position — datastore AND bus-side state. A
-	// claim left in a key/value bucket corrupts the next run exactly as leftover rows would.
+	// Baseline is the bus checkpoint every observed run restores before the service starts. Nil takes
+	// one of the sandbox's own at the first observed run, after clearing the corpus stream once — the
+	// path for a caller that published its corpus into the stream; a corpus opened without a stream
+	// needs one set. Unused when Stutter dispatches.
+	Baseline *corpus.Checkpoint
+	// Reset returns the caller's dependencies to the starting position. A claim left in a key/value
+	// bucket corrupts the next run exactly as leftover rows would: on the observed model the bus is
+	// returned by restoring Baseline, and Reset covers everything else; when Stutter dispatches, Reset
+	// covers the bus-side state too.
 	Reset func(ctx context.Context) error
+	// Recorded is the corpus every observed run replays. Nil reads it once from the corpus stream,
+	// before the first run; set, the stream is never read for it.
+	Recorded []corpus.Message
 	// Opaque are dependencies on protocols Stutter does not parse, as logical name → real address.
 	// The logical name is what appears in effects, because the proxy's port is assigned per run.
 	Opaque map[string]string
@@ -146,9 +156,14 @@ type Sandbox struct {
 	// certificates is nil unless the stub serves TLS. It is minted once per sandbox, so every run in
 	// a comparison presents the same certificate.
 	certificates *authority
-	// recorded is the corpus held outside the stream, taken before the first observed run. Staging
-	// destroys everything it does not republish, so the messages a later whole-corpus run needs have
-	// to be in hand before the first subset run reduces the stream.
+	// checkpoint is the sandbox's own starting point, taken at the first observed run when the
+	// configuration supplies no Baseline.
+	checkpoint *corpus.Checkpoint
+	// holds is every Fill hold an observed run made, in run order.
+	holds []FillHold
+	// recorded is the corpus held outside the stream, taken before the first observed run. A run
+	// stages only what it replays, so the messages a later whole-corpus run needs have to be in hand
+	// before the first subset run.
 	recorded []corpus.Message
 	upstream string
 	cfg      Config

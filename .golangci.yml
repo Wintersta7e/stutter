@@ -91,6 +91,16 @@ linters:
               desc: Superseded by stdlib errors wrapping; use fmt.Errorf with %w.
             - pkg: io/ioutil
               desc: Deprecated since Go 1.16; use io and os.
+        # The Docker test helpers spawn the docker CLI themselves. The product reaches Docker only
+        # through its own runner, so nothing but a test may import them.
+        test-only:
+          files:
+            - $all
+            - "!$test"
+            - "!**/internal/dockertest/**"
+          deny:
+            - pkg: github.com/Wintersta7e/stutter/internal/dockertest
+              desc: test-only; it reaches Docker outside the product's one runner.
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print.*$
@@ -126,6 +136,14 @@ linters:
         linters:
           - revive
         text: (function-length|cyclomatic|cognitive-complexity)
+      # A test binary that re-executes itself as a helper process must exit from TestMain with the
+      # helper's own code, which is not the redundant os.Exit(m.Run()) this rule targets (and that one
+      # is harmless). Excluded here rather than by a nolint directive at each site, because nolintlint
+      # judged those directives unused on some runs and not others over one unchanged tree.
+      - path: _test\.go
+        linters:
+          - revive
+        text: redundant-test-main-exit
       # Protocol packages intentionally use the protocol name. Here the import path keeps this
       # package distinct from net/http, while renaming it would make every caller less clear.
       - path: ^internal/proxy/http/

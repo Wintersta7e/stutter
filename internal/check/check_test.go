@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -38,8 +39,10 @@ type session struct {
 	silent map[uint64]bool
 	// readGuard are messages whose handler looks its claim up before writing, and looks again when the
 	// message is redelivered. Whether it writes again too is nonIdempotent's business.
-	readGuard   map[uint64]bool
-	messages    []uint64
+	readGuard map[uint64]bool
+	messages  []uint64
+	// bus is what the bus did on every run: its refusals and counts are copied into each result.
+	bus         replay.Result
 	resets      int
 	unstable    bool
 	failOnReset bool
@@ -127,7 +130,16 @@ func (s *session) Run(
 		}
 	}
 
-	return replay.Result{Effects: effects, Clause: "AckPolicy: explicit", Delivered: len(s.scope(retain))}, nil
+	return replay.Result{
+		Effects:         effects,
+		Clause:          "AckPolicy: explicit",
+		Delivered:       len(s.scope(retain)),
+		Refusals:        s.bus.Refusals,
+		NoResponders:    s.bus.NoResponders,
+		FedBack:         s.bus.FedBack,
+		Elsewhere:       s.bus.Elsewhere,
+		ClosedAfterInfo: s.bus.ClosedAfterInfo,
+	}, nil
 }
 
 // redeliveries counts how many more times a mutation hands this message to the handler: once for a
@@ -399,7 +411,7 @@ func TestCleanRunHealthIsReported(t *testing.T) {
 	}
 
 	want := report.Health{Messages: 3, Delivered: 3, Effects: 2, Silent: 1}
-	if *result.Health != want {
+	if !reflect.DeepEqual(*result.Health, want) {
 		t.Errorf("Health = %+v, want %+v", *result.Health, want)
 	}
 
@@ -678,5 +690,44 @@ func TestMaxRunsCapsTheSearch(t *testing.T) {
 	// divergence found on that run may add more, so the bound is on mutated hunting, not total.
 	if len(scripted.names) < 2 {
 		t.Fatalf("only %d runs; the reference pair should always happen", len(scripted.names))
+	}
+}
+
+// TestCleanRunHealthCarriesTheBusCounts: what the bus refused and counted on the reference run reaches
+// the report's health, field by field.
+func TestCleanRunHealthCarriesTheBusCounts(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.bus = replay.Result{
+		Refusals: []effect.Refusal{{
+			Subject:     "$JS.API.STREAM.CREATE.ORDERS",
+			Description: "stream name already in use",
+			Code:        400,
+			ErrCode:     10058,
+		}},
+		NoResponders:    2,
+		FedBack:         3,
+		Elsewhere:       4,
+		ClosedAfterInfo: 5,
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	health := result.Health
+	if health == nil {
+		t.Fatal("Health = nil")
+	}
+
+	if !slices.Equal(health.Refusals, scripted.bus.Refusals) {
+		t.Errorf("Refusals = %+v, want %+v", health.Refusals, scripted.bus.Refusals)
+	}
+
+	got := []int{health.NoResponders, health.FedBack, health.Elsewhere, health.ClosedAfterInfo}
+	if want := []int{2, 3, 4, 5}; !slices.Equal(got, want) {
+		t.Errorf("NoResponders, FedBack, Elsewhere, ClosedAfterInfo = %v, want %v", got, want)
 	}
 }

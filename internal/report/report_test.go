@@ -971,3 +971,53 @@ func lineAt(lines []string, index int) string {
 
 	return lines[index]
 }
+
+// TestHealthNotesNameWhatTheBusDid: a clean run whose startup the bus refused, whose requests found no
+// responder, or whose own output came back to it says so beside its verdict — and a run that saw none
+// of it renders exactly as before.
+func TestHealthNotesNameWhatTheBusDid(t *testing.T) {
+	t.Parallel()
+
+	busy := report.Health{
+		Messages:  3,
+		Delivered: 3,
+		Effects:   3,
+		Refusals: []effect.Refusal{{
+			Subject:     "$JS.API.STREAM.CREATE.ORDERS",
+			Description: "stream name\n  already in   use",
+			Code:        400,
+			ErrCode:     10058,
+		}},
+		NoResponders:    2,
+		FedBack:         3,
+		Elsewhere:       4,
+		ClosedAfterInfo: 5,
+	}
+
+	rendered := withHealth(report.New(report.Scan{Consumers: 1, Messages: 3}, heldGates(), nil), busy).String()
+
+	for _, want := range []string{
+		"$JS.API.STREAM.CREATE.ORDERS 10058 stream name already in use",
+		"2 requests",
+		"3 messages Stutter did not publish",
+		"4 messages on another stream",
+		"5 bus clients",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered report is missing %q:\n%s", want, rendered)
+		}
+	}
+
+	for at, line := range strings.Split(strings.TrimSuffix(rendered, "\n"), "\n") {
+		if strings.HasSuffix(line, " ") {
+			t.Errorf("line %d ends in a space: %q", at+1, line)
+		}
+	}
+
+	quiet := report.Health{Messages: 3, Delivered: 3, Effects: 3}
+	scan := report.Scan{Consumers: 1, Messages: 3}
+
+	if plain := withHealth(report.New(scan, heldGates(), nil), quiet).String(); strings.Contains(plain, "NOTE") {
+		t.Errorf("a clean run that saw none of it rendered a note:\n%s", plain)
+	}
+}

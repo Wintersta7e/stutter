@@ -45,8 +45,9 @@ var (
 	errMissingSink     = errors.New("HTTP proxy requires an effect sink")
 	errOversizeRequest = errors.New("HTTP request body exceeds configured limit")
 	errUnparseable     = errors.New("client traffic is not parseable HTTP/1.1; effects cannot be observed")
-	errNoRequest       = errors.New("the client completed a TLS handshake and sent no request: " +
-		"application-level certificate pinning or a protocol the stub does not serve")
+	errNoRequest       = errors.New("the client completed a TLS handshake and sent no request, and no " +
+		"earlier connection to this host did either: it likely pins certificates or speaks a protocol the " +
+		"stub does not serve")
 )
 
 // Sink receives the effects the stub observes and supplies the run canonical form used as a
