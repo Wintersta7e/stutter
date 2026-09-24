@@ -221,9 +221,9 @@ func TestTheStoreStaysWhereItWasPut(t *testing.T) {
 	t.Cleanup(store.Close)
 
 	js := direct(t, store)
-	createStream(t, js, "ORDERS", "orders.>")
+	createStream(t, js, "ORDERS", allOrders)
 
-	if _, err := js.Publish(t.Context(), "orders.created", []byte(firstOrder)); err != nil {
+	if _, err := js.Publish(t.Context(), orderCreated, []byte(firstOrder)); err != nil {
 		t.Fatalf("Publish() error = %v", err)
 	}
 

@@ -268,10 +268,10 @@ func TestAdmittedMatchesFilterSubjects(t *testing.T) {
 	t.Parallel()
 
 	messages := []corpus.Message{
-		{Subject: "orders.created", Seq: 1},
+		{Subject: orderCreated, Seq: 1},
 		{Subject: "orders.eu.created", Seq: 2},
 		{Subject: "payments.settled", Seq: 3},
-		{Subject: "orders.cancelled", Seq: 4},
+		{Subject: orderCancelled, Seq: 4},
 	}
 
 	cases := []struct {
@@ -280,8 +280,8 @@ func TestAdmittedMatchesFilterSubjects(t *testing.T) {
 		want    []uint64
 	}{
 		{name: "token wildcard", filters: []string{"orders.*"}, want: []uint64{1, 4}},
-		{name: "tail wildcard", filters: []string{"orders.>"}, want: []uint64{1, 2, 4}},
-		{name: "two filters", filters: []string{"payments.settled", "orders.created"}, want: []uint64{1, 3}},
+		{name: "tail wildcard", filters: []string{allOrders}, want: []uint64{1, 2, 4}},
+		{name: "two filters", filters: []string{"payments.settled", orderCreated}, want: []uint64{1, 3}},
 		{name: "no filter", want: []uint64{1, 2, 3, 4}},
 	}
 
