@@ -26,6 +26,34 @@ const (
 	verbVersion
 	verbInfo
 	verbWSLInfo
+	verbComposeConfig
+	verbInspect
+	verbImageInspect
+	verbNetworkInspect
+	verbVolumeInspect
+	verbNetworkList
+	verbNetworkCreate
+	verbVolumeCreate
+	verbRemove
+	verbNetworkRemove
+	verbVolumeRemove
+	verbImageRemove
+	verbContainerList
+	verbVolumeList
+	verbImageList
+	verbKill
+	verbPull
+	verbComposeBuild
+	verbImport
+	verbCommit
+	verbCreate
+	verbCopyIn
+	verbCopyOut
+	verbStart
+	verbStopGraceful
+	verbWait
+	verbLogs
+	verbLogsFollow
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -64,6 +92,10 @@ const (
 	deadlineShort deadline = iota
 	deadlineCopy
 	deadlineLong
+	// deadlineNone lives as long as the caller's context: a wait ends when its container does.
+	deadlineNone
+	// deadlineGrace is the request's grace period plus graceMargin.
+	deadlineGrace
 )
 
 // stderrPolicy is what a row keeps of its stderr. Control flow never reads it either way.
@@ -74,6 +106,8 @@ const (
 	stderrFirstLine stderrPolicy = iota
 	// stderrCount keeps only the number of lines: compose echoes interpolated values there.
 	stderrCount
+	// stderrOutput is a container's own output, never read as the CLI's error.
+	stderrOutput
 )
 
 const (
@@ -86,6 +120,10 @@ const (
 	stderrCap = 64 << 10
 	// waitDelay bounds how long a killed call may hold its output pipes open.
 	waitDelay = 2 * time.Second
+	// pendingCap bounds the call lines kept for a log not yet attached.
+	pendingCap = 16
+	// graceMargin is how long past its grace period a graceful stop may take.
+	graceMargin = 30 * time.Second
 	// shellPath runs groupKiller.
 	shellPath = "/bin/sh"
 	// groupKiller runs its arguments as a background child with stdin passed through, and on
@@ -94,10 +132,13 @@ const (
 	groupKiller = `exec 3<&0; trap "kill -s KILL 0" TERM; "$@" <&3 3<&- & wait $!; exit $?`
 )
 
-// verbSpec is one row of the verb table.
+// verbSpec is one row of the verb table. A call's argv is prefix, its typed arguments, suffix —
+// or alt instead, for a row with two fixed forms — then its typed tail.
 type verbSpec struct {
 	name     string
 	prefix   []string
+	suffix   []string
+	alt      []string
 	program  program
 	mode     mode
 	deadline deadline
@@ -108,7 +149,7 @@ type verbSpec struct {
 
 // verbs returns the verb table: every call the runner can make.
 //
-//nolint:goconst // the table spells every fixed token out, so it reads — and is audited — as the table it is.
+//nolint:goconst,funlen,revive // one literal, every fixed token spelled out: read, and audited, as the table.
 func verbs() [verbCount]verbSpec {
 	return [verbCount]verbSpec{
 		verbContext: {
@@ -126,6 +167,129 @@ func verbs() [verbCount]verbSpec {
 		verbWSLInfo: {
 			name: "wslinfo", program: programWSLInfo, prefix: []string{"--networking-mode"},
 			mode: modeUser, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbComposeConfig: {
+			name: "composeConfig", program: programCompose, prefix: []string{"compose"},
+			suffix: []string{"config", "--format", "json"}, alt: []string{"config", "--environment"},
+			mode: modeUser, deadline: deadlineShort, stderr: stderrCount,
+		},
+		verbInspect: {
+			name: "inspect", program: programDocker, prefix: []string{"inspect", "--type", "container", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbImageInspect: {
+			name: "imageInspect", program: programDocker, prefix: []string{"image", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkInspect: {
+			name: "networkInspect", program: programDocker, prefix: []string{"network", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbVolumeInspect: {
+			name: "volumeInspect", program: programDocker, prefix: []string{"volume", "inspect", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkList: {
+			name: "networkList", program: programDocker, prefix: []string{"network", "ls", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbNetworkCreate: {
+			name: "networkCreate", program: programDocker, prefix: []string{"network", "create"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbVolumeCreate: {
+			name: "volumeCreate", program: programDocker, prefix: []string{"volume", "create"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbRemove: {
+			name: "remove", program: programDocker, prefix: []string{"rm", "-f", "-v"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbNetworkRemove: {
+			name: "networkRemove", program: programDocker, prefix: []string{"network", "rm"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbVolumeRemove: {
+			name: "volumeRemove", program: programDocker, prefix: []string{"volume", "rm"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbImageRemove: {
+			name: "imageRemove", program: programDocker, prefix: []string{"rmi", "--no-prune"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbContainerList: {
+			name: "containerList", program: programDocker, prefix: []string{"ps", "-a", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbVolumeList: {
+			name: "volumeList", program: programDocker, prefix: []string{"volume", "ls", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbImageList: {
+			name: "imageList", program: programDocker, prefix: []string{"images", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbKill: {
+			name: "kill", program: programDocker, prefix: []string{"stop", "--signal", "KILL"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbPull: {
+			name: "pull", program: programDocker, prefix: []string{"pull", "-q"},
+			mode: modeUser, deadline: deadlineLong, stderr: stderrFirstLine, mutates: true,
+		},
+		verbComposeBuild: {
+			name:    "composeBuild",
+			program: programCompose,
+			prefix:  []string{"compose", "-p"},
+			suffix: []string{
+				"-f",
+				"-",
+				"build",
+			},
+			mode:     modeUser,
+			deadline: deadlineLong,
+			stderr:   stderrCount,
+			mutates:  true,
+		},
+		verbImport: {
+			name: "import", program: programDocker, prefix: []string{"import"}, suffix: []string{"-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCommit: {
+			name: "commit", program: programDocker, prefix: []string{"commit"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCreate: {
+			name: "create", program: programDocker, prefix: []string{"create", "--pull", "never"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCopyIn: {
+			name: "copyIn", program: programDocker, prefix: []string{"cp", "-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCopyOut: {
+			name: "copyOut", program: programDocker, prefix: []string{"cp"}, suffix: []string{"-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine,
+		},
+		verbStart: {
+			name: "start", program: programDocker, prefix: []string{"start"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true,
+		},
+		verbStopGraceful: {
+			name: "stopGraceful", program: programDocker, prefix: []string{"stop"},
+			mode: modeConstructed, deadline: deadlineGrace, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbWait: {
+			name: "wait", program: programDocker, prefix: []string{"wait"},
+			mode: modeConstructed, deadline: deadlineNone, stderr: stderrFirstLine,
+		},
+		verbLogs: {
+			name: "logs", program: programDocker, prefix: []string{"logs"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrOutput,
+		},
+		verbLogsFollow: {
+			name: "logsFollow", program: programDocker, prefix: []string{"logs", "--follow"},
+			mode: modeConstructed, deadline: deadlineNone, stderr: stderrFirstLine,
 		},
 	}
 }
@@ -146,14 +310,45 @@ type arg struct {
 	model bool
 }
 
-// request is one call: a verb and its typed arguments.
+// request is one call: a verb, its typed arguments and tail, and which fixed form it takes.
 type request struct {
-	stdin    io.Reader
-	stdout   io.Writer
+	stdin  io.Reader
+	stdout io.Writer
+	// stderr, when set, receives the call's stderr too: a build's output goes to its log file.
+	stderr   io.Writer
 	dir      string
 	args     []arg
+	tail     []arg
 	extraEnv []string
-	verb     verb
+	// grace is a graceful stop's grace period; its deadline is grace plus graceMargin.
+	grace time.Duration
+	verb  verb
+	alt   bool
+}
+
+// tokens returns a call's whole argv after the program, as typed arguments: the row's fixed tokens
+// are never model tokens.
+func (s verbSpec) tokens(req request) ([]arg, error) {
+	suffix := s.suffix
+	if req.alt {
+		if s.alt == nil {
+			return nil, fmt.Errorf("%w: the %s row has no second form", ErrEngine, s.name)
+		}
+
+		suffix = s.alt
+	}
+
+	out := make([]arg, 0, len(s.prefix)+len(req.args)+len(suffix)+len(req.tail))
+	for _, token := range s.prefix {
+		out = append(out, arg{val: token})
+	}
+
+	out = append(out, req.args...)
+	for _, token := range suffix {
+		out = append(out, arg{val: token})
+	}
+
+	return append(out, req.tail...), nil
 }
 
 // result is what a call returned. elapsed is measured on the monotonic clock.
@@ -219,6 +414,7 @@ func (*CallError) Unwrap() error {
 type execRunner struct {
 	logCall   func(callLine)
 	limits    map[deadline]time.Duration
+	pending   []callLine
 	docker    string
 	wslinfo   string
 	pin       string
@@ -300,7 +496,12 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 			ErrEngine, spec.name)
 	}
 
-	path, argv, err := r.command(spec, req)
+	typed, err := spec.tokens(req)
+	if err != nil {
+		return result{}, err
+	}
+
+	path, argv, err := r.command(spec, typed)
 	if err != nil {
 		return result{}, err
 	}
@@ -311,24 +512,34 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 	}
 
 	limit := r.limits[spec.deadline]
+	if spec.deadline == deadlineGrace {
+		limit = req.grace + graceMargin
+	}
+
 	callCtx, cancel := spec.bound(ctx, limit)
 
 	defer cancel()
 
 	res, sink, err := spawn(callCtx, path, argv, env, spec, req)
-	r.record(spec, req, res, sink)
+	r.record(spec, typed, res, sink)
 
+	return res, outcome(ctx, callCtx, spec, limit, res, err)
+}
+
+// outcome names how a call ended: its own deadline, its caller's cancellation, a failure to run,
+// or a non-zero exit.
+func outcome(ctx, callCtx context.Context, spec verbSpec, limit time.Duration, res result, err error) error {
 	switch {
 	case err == nil && res.exit == 0:
-		return res, nil
+		return nil
 	case errors.Is(context.Cause(callCtx), errPastDeadline):
-		return res, fmt.Errorf("%w: %s call exceeded its %s deadline", ErrDeadline, spec.name, limit)
+		return fmt.Errorf("%w: %s call exceeded its %s deadline", ErrDeadline, spec.name, limit)
 	case !spec.hold && ctx.Err() != nil:
-		return res, fmt.Errorf("%s call cancelled: %w", spec.name, context.Cause(ctx))
+		return fmt.Errorf("%s call cancelled: %w", spec.name, context.Cause(ctx))
 	case err != nil:
-		return res, err
+		return err
 	default:
-		return res, &CallError{Verb: spec.name, Code: res.exit, Stderr: res.stderrFirst}
+		return &CallError{Verb: spec.name, Code: res.exit, Stderr: res.stderrFirst}
 	}
 }
 
@@ -336,9 +547,9 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 var errPastDeadline = errors.New("past the call's deadline")
 
 // command returns the program to spawn and its argv.
-func (r *execRunner) command(spec verbSpec, req request) (string, []string, error) {
-	tokens := append([]string(nil), spec.prefix...)
-	for _, a := range req.args {
+func (r *execRunner) command(spec verbSpec, typed []arg) (string, []string, error) {
+	tokens := make([]string, 0, len(typed))
+	for _, a := range typed {
 		tokens = append(tokens, a.val)
 	}
 
@@ -430,6 +641,10 @@ func spawn(
 		cmd.Stdout = req.stdout
 	}
 
+	if req.stderr != nil {
+		cmd.Stderr = io.MultiWriter(sink, req.stderr)
+	}
+
 	runtime.LockOSThread()
 
 	defer runtime.UnlockOSThread()
@@ -459,12 +674,9 @@ func spawn(
 	return res, sink, nil
 }
 
-// record hands the call's line to the invocation log, when one is attached.
-func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderrSink) {
-	if r.logCall == nil {
-		return
-	}
-
+// record hands the call's line to the invocation log. Before a log is attached, the first few lines
+// wait for it: the precondition reads happen before the check has a directory to log into.
+func (r *execRunner) record(spec verbSpec, typed []arg, res result, sink *stderrSink) {
 	line := callLine{
 		Kind: "call", Verb: spec.name, Program: r.docker, Mode: "user",
 		Exit: res.exit, MS: res.elapsed.Milliseconds(),
@@ -478,9 +690,7 @@ func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderr
 		line.Mode = "constructed"
 	}
 
-	line.Argv = append(line.Argv, spec.prefix...)
-
-	for _, a := range req.args {
+	for _, a := range typed {
 		if a.model {
 			line.Argv = append(line.Argv, "<model>")
 		} else {
@@ -496,7 +706,28 @@ func (r *execRunner) record(spec verbSpec, req request, res result, sink *stderr
 		line.StderrLines = &lines
 	}
 
-	r.logCall(line)
+	if r.logCall != nil {
+		r.logCall(line)
+	} else if len(r.pending) < pendingCap {
+		r.pending = append(r.pending, line)
+	}
+}
+
+// attach hands the runner its client configuration directory and invocation log, flushes the
+// lines that waited for the log, and says whether it may mutate the engine from now on. A nil log
+// discards every line.
+func (r *execRunner) attach(configDir string, logCall func(callLine), mutable bool) {
+	r.configDir, r.logCall, r.mutable = configDir, logCall, mutable
+
+	if logCall == nil {
+		r.logCall = func(callLine) {}
+	}
+
+	for _, line := range r.pending {
+		r.logCall(line)
+	}
+
+	r.pending = nil
 }
 
 // stderrSink counts a call's stderr lines and, for a first-line row, keeps up to stderrCap bytes.

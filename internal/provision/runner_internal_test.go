@@ -21,6 +21,8 @@ func shimEnv(t *testing.T, script string, extra ...string) []string {
 	t.Helper()
 
 	dir := t.TempDir()
+	// `env` would show what the shell exports; /proc shows exactly what the runner passed.
+	script = strings.ReplaceAll(script, "env\n", "tr '\\0' '\\n' < /proc/$$/environ\n")
 	writeShim(t, dir, "#!/bin/sh\n"+script)
 
 	return append([]string{"PATH=" + dir + ":/usr/bin:/bin"}, extra...)
