@@ -2,6 +2,7 @@ package corpus_test
 
 import (
 	"errors"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -231,6 +232,17 @@ func TestFillRefusesADuplicateAcknowledgement(t *testing.T) {
 		}
 	}
 
+	// Far more messages than Fill keeps in flight at once, the last repeating the first: the check
+	// reaches every acknowledgement, not only those of the first batch.
+	const many = 1000
+
+	pastTheWindow := make([]corpus.Message, 0, many)
+	for seq := uint64(1); seq < many; seq++ {
+		pastTheWindow = append(pastTheWindow, withID(seq, fmt.Sprintf("many-%d", seq)))
+	}
+
+	pastTheWindow = append(pastTheWindow, withID(many, "many-1"))
+
 	cases := []struct {
 		name     string
 		already  string
@@ -243,6 +255,7 @@ func TestFillRefusesADuplicateAcknowledgement(t *testing.T) {
 			messages: []corpus.Message{withID(1, "dup-2"), withID(2, "dup-2")},
 			other:    1,
 		},
+		{name: "past the first batch in flight", messages: pastTheWindow, other: 1},
 	}
 
 	for _, testCase := range cases {

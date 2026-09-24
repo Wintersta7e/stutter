@@ -182,11 +182,13 @@ func createBindings(values []string) []portReport {
 	return bindings
 }
 
-// createPorts publishes each binding on an engine-assigned host port.
+// createPorts publishes each binding on the host port it names, or on an engine-assigned one.
 func createPorts(values []string) []portReport {
 	ports := createBindings(values)
 	for n := range ports {
-		ports[n].HostPort = strconv.Itoa(49153 + n)
+		if ports[n].HostPort == "" {
+			ports[n].HostPort = strconv.Itoa(49153 + n)
+		}
 	}
 
 	return ports
