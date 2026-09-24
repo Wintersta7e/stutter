@@ -24,14 +24,8 @@ func TestAnotherConsumersTrafficIsNotTheRunsBusiness(t *testing.T) {
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), make([]byte, 32))
-	run := newObservedRun(
-		"clean-1",
-		stream,
-		wire,
-		recorder,
-		[]corpus.Staged{{Recorded: 1, Sequence: 1}},
-		time.Millisecond,
-	)
+	run := newObservedRun("clean-1", stream, wire, recorder, time.Millisecond)
+	run.stage([]corpus.Message{{Subject: "corpus.orders", Seq: 1}}, 1)
 	run.scope("under_test", time.Second)
 
 	bystander := natsproxy.Ack{Stream: stream, Consumer: "bystander", StreamSeq: 1, Deliveries: 1}
@@ -72,14 +66,8 @@ func TestAFedBackDeliveryIsNeverAttributedToACorpusMessage(t *testing.T) {
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), make([]byte, 32))
-	run := newObservedRun(
-		"duplicate-1",
-		stream,
-		wire,
-		recorder,
-		[]corpus.Staged{{Recorded: 2, Sequence: 1}},
-		time.Millisecond,
-	)
+	run := newObservedRun("duplicate-1", stream, wire, recorder, time.Millisecond)
+	run.stage([]corpus.Message{{Subject: "corpus.orders", Seq: 2}}, 1)
 	run.scope("under_test", time.Second)
 
 	if got := run.sequence(2); got != 0 {

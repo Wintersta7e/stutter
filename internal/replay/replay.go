@@ -228,6 +228,9 @@ type Result struct {
 	Clause string
 	// Effects is the sequence the run produced, in observation order.
 	Effects []effect.Effect
+	// Refusals are the requests the bus declined before the first delivery, with its own code and
+	// description: the likeliest reason a service never consumed.
+	Refusals []effect.Refusal
 	// Delivered counts handler invocations, including redeliveries.
 	Delivered int
 	// Failed counts handler invocations that returned an error. A high count on a clean run means
@@ -242,6 +245,13 @@ type Result struct {
 	// handling did nothing observable — the service's own output fed back through the stream it
 	// consumes. They belong to no corpus message and are left out of the comparison.
 	FedBack int
+	// Elsewhere counts deliveries on another stream while a message's window was open: the service's
+	// own bus work, neither scoped nor checked.
+	Elsewhere int
+	// NoResponders counts requests nothing on the bus answered.
+	NoResponders int
+	// ClosedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
+	ClosedAfterInfo int
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.

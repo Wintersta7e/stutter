@@ -62,3 +62,50 @@ func TestRecorderStillExcludesStubbedSetupTraffic(t *testing.T) {
 		t.Errorf("SetupCount() = %d, want 1", got)
 	}
 }
+
+// TestARefusalBeforeTheFirstDeliveryIsKept: a service whose startup request the bus refused never
+// gets as far as consuming, and the refusal is the only record of why. After the first delivery a
+// refusal is an effect's Rejected mark, and is not kept a second time.
+func TestARefusalBeforeTheFirstDeliveryIsKept(t *testing.T) {
+	t.Parallel()
+
+	recorder := effect.NewRecorder(effect.NewCanonicaliser(), []byte("test hash key"))
+
+	startup := effect.Refusal{
+		Subject:     "$JS.API.STREAM.CREATE.ORDERS",
+		Description: "stream name already in use",
+		Code:        400,
+		ErrCode:     10058,
+	}
+
+	recorder.Declined(startup)
+	recorder.Open("orders", 1, []byte(`{}`))
+	recorder.Declined(effect.Refusal{Subject: "$JS.API.STREAM.CREATE.LATER", Code: 400, ErrCode: 10058})
+
+	got := recorder.Refusals()
+	if len(got) != 1 || got[0] != startup {
+		t.Errorf("Refusals() = %+v, want only the one before the first delivery", got)
+	}
+}
+
+// TestBusCountsAreKeptAcrossTheRun: requests nothing answered and clients that hung up after the
+// greeting are counted whenever they happen, before the first delivery or after it.
+func TestBusCountsAreKeptAcrossTheRun(t *testing.T) {
+	t.Parallel()
+
+	recorder := effect.NewRecorder(effect.NewCanonicaliser(), []byte("test hash key"))
+
+	recorder.NoResponder()
+	recorder.ClosedAfterInfo()
+	recorder.Open("orders", 1, []byte(`{}`))
+	recorder.NoResponder()
+	recorder.ClosedAfterInfo()
+
+	if got := recorder.NoResponders(); got != 2 {
+		t.Errorf("NoResponders() = %d, want 2", got)
+	}
+
+	if got := recorder.ClosedAfterInfoCount(); got != 2 {
+		t.Errorf("ClosedAfterInfoCount() = %d, want 2", got)
+	}
+}
