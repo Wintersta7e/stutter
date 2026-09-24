@@ -2,6 +2,8 @@ package harness_test
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -199,5 +201,71 @@ func TestAnEnvironmentStopDuringTheProbeStartIsASetupError(t *testing.T) {
 
 	if elapsed >= 2500*time.Millisecond {
 		t.Errorf("the probe start stopped after %s, want it well inside the 5s startup limit", elapsed)
+	}
+}
+
+// TestAProbeStartThatCreatesTheStreamDoublesAsDiscovery: a service that creates the stream has also
+// shown what it consumes from it, so the same start goes on to discover its consumers; no second start
+// is spent on it.
+func TestAProbeStartThatCreatesTheStreamDoublesAsDiscovery(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t)
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		if createOrders(ctx, js) != nil {
+			return 2
+		}
+
+		if _, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+			Durable:       reserve,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			MaxAckPending: 10,
+		}); err != nil {
+			return 2
+		}
+
+		return idle(ctx)
+	}
+
+	probed, err := harness.ProbeStart(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("ProbeStart() error = %v", err)
+	}
+
+	t.Logf("starts: %d", service.starts.Load())
+
+	if !probed.Created || probed.Discovery == nil {
+		t.Fatalf("probe = %+v, want the stream created and a discovery", probed)
+	}
+
+	if got := names(probed.Discovery.Consumers); !slices.Equal(got, []string{reserve}) {
+		t.Fatalf("consumers = %q, want [reserve]", got)
+	}
+
+	if got := probed.Discovery.Consumers[0].Policy.MaxAckPending; got != 10 {
+		t.Errorf("reserve reads MaxAckPending %d, want 10", got)
+	}
+}
+
+// TestADoubledProbeStartAppliesDiscoveryRows: once the stream exists the start is discovery, so a
+// service that exits before creating any consumer stops the check as discovery's would, instead of
+// ending the probe start quietly.
+func TestADoubledProbeStartAppliesDiscoveryRows(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t)
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		if createOrders(ctx, js) != nil {
+			return 2
+		}
+
+		return 1
+	}
+
+	_, err := harness.ProbeStart(startContext(t), startConfig(store, checkpoint, service))
+	if !errors.Is(err, harness.ErrExitedBeforeConsumer) {
+		t.Fatalf("ProbeStart() error = %v, want %v", err, harness.ErrExitedBeforeConsumer)
 	}
 }

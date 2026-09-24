@@ -37,6 +37,10 @@ func ProbeStart(ctx context.Context, cfg Config) (Probe, error) {
 }
 
 // probe runs the probe start and reads whether the stream exists at its end.
+//
+// Once the stream exists the start is discovery, on the same start and the same clock: its settle rule,
+// its reads and its exit rows apply from there, so a service that creates the stream and then exits
+// before any consumer is discovery's failure, not a probe start that simply ended.
 func (s *Sandbox) probe(ctx context.Context) (Probe, error) {
 	start, err := s.bareStart(ctx, stageProbe)
 	if err != nil {
@@ -49,6 +53,12 @@ func (s *Sandbox) probe(ctx context.Context) (Probe, error) {
 	var created bool
 	if err == nil {
 		created, err = s.streamExists(ctx)
+	}
+
+	if err == nil && created {
+		found, discoverErr := s.settleDiscovery(ctx, start)
+
+		return Probe{Discovery: &found, Created: true}, discoverErr
 	}
 
 	_, discardErr := start.discard(ctx)
