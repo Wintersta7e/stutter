@@ -55,6 +55,13 @@ var (
 		"Postgres TLS termination is not supported, so the service's sslmode must change")
 )
 
+// ErrUpstreamClosed means the database ended a connection before sending a byte. A Postgres server
+// always answers a startup message, if only with an error, so silence then a close is the engine's
+// port forwarder accepting for a port nothing serves: a dial failure, however late it shows. Its one
+// false reading is a live server closing an idle connection before the client's startup arrived (its
+// authentication timeout) — a stopped run, loud, never a finding.
+var ErrUpstreamClosed = errors.New("the database ended the connection before answering it")
+
 // Sink receives the effects the proxy observes, and what the database made of each.
 type Sink interface {
 	Record(observed effect.Observation)
@@ -200,43 +207,95 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	defer func() { _ = upstream.Close() }()
 
-	current := &session{
-		client:      client,
-		upstream:    upstream,
-		sink:        p.sink,
-		completions: &completions{sink: p.sink},
-		statements:  make(map[string]statement),
-		portals:     make(map[string]portal),
-		id:          p.sessions.Add(1),
-	}
+	current := p.newSession(ctx, client, upstream)
 
 	// A connection that ends inside the negotiation carried no statement; nothing is recorded.
 	if err := current.negotiate(); err != nil {
-		switch {
-		case errors.Is(err, ErrDirectTLS):
-			p.fail(err)
-			abort(client)
-		case current.refused:
-			p.refusals.Add(1)
-		default:
-		}
+		p.unnegotiated(current, err)
 
 		return
 	}
 
 	p.startups.Add(1)
 
-	go current.pumpBackend()
+	var backend sync.WaitGroup
 
+	backend.Go(current.pumpBackend)
 	current.pumpFrontend()
+
+	// Closing the database's leg ends the backend pump, whose failure is then the proxy's own close. The
+	// connection is done only once both pumps are, so a failure either reports precedes Serve's verdict.
+	_ = upstream.Close()
+
+	backend.Wait()
+}
+
+// newSession starts the bookkeeping of one proxied connection.
+func (p *Proxy) newSession(ctx context.Context, client, upstream net.Conn) *session {
+	current := &session{
+		client:      client,
+		upstream:    upstream,
+		backend:     &heardReader{conn: upstream},
+		sink:        p.sink,
+		completions: &completions{sink: p.sink},
+		statements:  make(map[string]statement),
+		portals:     make(map[string]portal),
+		id:          p.sessions.Add(1),
+	}
+	current.lost = func(cause error) { p.lostUpstream(ctx, current, client, cause) }
+
+	return current
+}
+
+// unnegotiated accounts for a connection that ended before its startup message reached the database:
+// a TLS client stops the run, and one refused encryption counts toward ErrTLSRequired.
+func (p *Proxy) unnegotiated(current *session, err error) {
+	switch {
+	case errors.Is(err, ErrDirectTLS):
+		p.fail(err)
+		abort(current.client)
+	case current.refused:
+		p.refusals.Add(1)
+	default:
+	}
+}
+
+// lostUpstream stops the run when the database's leg ended — a read or a write failed — before it
+// sent a byte. The proxy's own close of that leg is the connection ending, and a run that is over is
+// no failure. The client is reset once the failure is recorded, so the start sees it first.
+func (p *Proxy) lostUpstream(ctx context.Context, current *session, client net.Conn, cause error) {
+	if current.backend.heard.Load() || errors.Is(cause, net.ErrClosed) || ctx.Err() != nil {
+		return
+	}
+
+	p.fail(fmt.Errorf("%w: upstream %s: %w", ErrUpstreamClosed, p.upstream, cause))
+	abort(client)
+}
+
+// heardReader reads the database's leg and remembers whether it ever sent a byte.
+type heardReader struct {
+	conn  net.Conn
+	heard atomic.Bool
+}
+
+func (h *heardReader) Read(p []byte) (int, error) {
+	n, err := h.conn.Read(p)
+	if n > 0 {
+		h.heard.Store(true)
+	}
+
+	return n, err //nolint:wrapcheck // a reader passes its connection's error on unchanged.
 }
 
 // session is one client connection and its upstream counterpart.
 //
 // The two pumps run concurrently and both touch the statement map, so it is guarded.
 type session struct {
-	client      net.Conn
-	upstream    net.Conn
+	client   net.Conn
+	upstream net.Conn
+	backend  *heardReader
+	// lost is told every failure on the database's leg.
+	lost        func(cause error)
 	sink        Sink
 	completions *completions
 	statements  map[string]statement
@@ -266,6 +325,8 @@ func (s *session) negotiate() error {
 
 		if !isEncryptionRequest(message[lengthWidth:]) {
 			if _, err := s.upstream.Write(message); err != nil {
+				s.lost(err)
+
 				return fmt.Errorf("forward startup message: %w", err)
 			}
 
@@ -291,6 +352,8 @@ func (s *session) pumpFrontend() {
 		s.inspectFrontend(msgType, body)
 
 		if err := writeTyped(s.upstream, msgType, body); err != nil {
+			s.lost(err)
+
 			return
 		}
 	}
@@ -303,8 +366,10 @@ func (s *session) pumpFrontend() {
 // read only to learn a parameter's type, and whether a statement changed anything at all.
 func (s *session) pumpBackend() {
 	for {
-		msgType, body, err := readTyped(s.upstream)
+		msgType, body, err := readTyped(s.backend)
 		if err != nil {
+			s.lost(err)
+
 			return
 		}
 
