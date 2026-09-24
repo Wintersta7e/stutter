@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -37,6 +38,12 @@ const (
 	namedVerbSegments = 3
 	// createSegment is the path segment of every create.
 	createSegment = "create"
+	// engineHost is the host a request to the engine's socket names; the socket answers any.
+	engineHost = "docker"
+	// mountVolume is the mount type of a volume.
+	mountVolume = "volume"
+	// noNetwork is the network of a container on none.
+	noNetwork = "none"
 	// imagesSegment is the first path segment of every image call, and imagesPath prefixes its path.
 	imagesSegment = "images"
 	imagesPath    = "/" + imagesSegment + "/"
@@ -103,11 +110,53 @@ type Summary struct {
 // Recorder is an Engine API reverse proxy on a unix socket: point a client's DOCKER_HOST at Host and
 // it records every call the client makes, then judges each by what the recorder saw created.
 type Recorder struct {
-	server   *http.Server
-	upstream string
-	socket   string
-	calls    []Call
-	mu       sync.Mutex
+	server    *http.Server
+	transport *http.Transport
+	before    census
+	socket    string
+	calls     []Call
+	inspects  []Inspect
+	failures  int
+	mu        sync.Mutex
+}
+
+// Phase is when the recorder read a container back: right after its create, or its start.
+type Phase string
+
+// The phases a container is inspected at.
+const (
+	PhaseCreate Phase = "create"
+	PhaseStart  Phase = "start"
+)
+
+// Mount is one of a container's mounts, as the engine reports it.
+type Mount struct {
+	Type        string `json:"Type"`        //nolint:tagliatelle // the engine's own field name
+	Name        string `json:"Name"`        //nolint:tagliatelle // the engine's own field name
+	Source      string `json:"Source"`      //nolint:tagliatelle // the engine's own field name
+	Destination string `json:"Destination"` //nolint:tagliatelle // the engine's own field name
+	RW          bool   `json:"RW"`          //nolint:tagliatelle // the engine's own field name
+}
+
+// Inspect is one full read of a container, taken by the recorder before the engine's answer to its
+// create or start reached the client, so a client that removes the container at once cannot outrun
+// it. Raw holds the whole inspect, the environment included: it is held in memory, never logged.
+type Inspect struct {
+	Raw      json.RawMessage
+	ID       string
+	Name     string
+	Kind     string
+	Check    string
+	Phase    Phase
+	Mounts   []Mount
+	Networks []string
+	Seq      int
+}
+
+// census is the volumes and networks that existed before the recorder started.
+type census struct {
+	volumes  map[string]bool
+	networks map[string]bool
 }
 
 // callKey carries a request's index in the log from the handler to the response hook.
@@ -134,7 +183,18 @@ func (e Engine) Recorder(tb testing.TB) *Recorder {
 		tb.Fatalf("listening on %s: %v", socket, err)
 	}
 
-	r := &Recorder{upstream: strings.TrimPrefix(e.Endpoint(), "unix://"), socket: socket}
+	upstream := strings.TrimPrefix(e.Endpoint(), "unix://")
+	r := &Recorder{socket: socket, transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", upstream)
+		},
+		DisableCompression: true,
+	}}
+
+	if r.before, err = r.takeCensus(tb.Context()); err != nil {
+		tb.Fatalf("listing the volumes and networks that exist before the recorder: %v", err)
+	}
+
 	r.server = &http.Server{Handler: r.handler(r.proxy()), ReadHeaderTimeout: headerTimeout}
 	served := make(chan error, 1)
 
@@ -191,13 +251,46 @@ func (r *Recorder) Created() Created {
 		}
 	}
 
+	// A volume a container got at create that did not exist before the recorder started — an image's
+	// anonymous volume, or one its create named — was created with that container.
+	for _, in := range r.InspectsOf("", PhaseCreate) {
+		for _, m := range in.Mounts {
+			if m.Type == mountVolume && !r.before.volumes[m.Name] && !slices.Contains(c.Volumes, m.Name) {
+				c.Volumes = append(c.Volumes, m.Name)
+			}
+		}
+	}
+
 	return c
 }
 
 // Summary audits the recorded calls for the check checkID: an image reference under that check's
 // scheme is its own, as is anything the recorder saw it create.
 func (r *Recorder) Summary(checkID string) Summary {
-	return summarize(r.Calls(), checkID)
+	r.mu.Lock()
+	failures := r.failures
+	r.mu.Unlock()
+
+	s := summarize(r.Calls(), r.Inspects(), r.before, checkID)
+	s.InspectFailures = failures
+
+	return s
+}
+
+// Inspects returns every read-back the recorder took, in the order of the calls that caused them.
+func (r *Recorder) Inspects() []Inspect {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return slices.Clone(r.inspects)
+}
+
+// InspectsOf returns the read-backs of containers of kind, the Stutter kind label's value, taken at
+// phase; an empty kind matches every container.
+func (r *Recorder) InspectsOf(kind string, phase Phase) []Inspect {
+	return slices.DeleteFunc(r.Inspects(), func(in Inspect) bool {
+		return in.Phase != phase || kind != "" && in.Kind != kind
+	})
 }
 
 // Line formats the summary as its audit line.
@@ -243,18 +336,11 @@ func (s Summary) Err() error {
 // proxy returns the reverse proxy to the engine's socket: responses flushed as they arrive, protocol
 // upgrades passed through.
 func (r *Recorder) proxy() *httputil.ReverseProxy {
-	upstream := r.upstream
-
 	return &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
-			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = "http", "docker", "docker"
+			pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.Host = "http", engineHost, engineHost
 		},
-		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", upstream)
-			},
-			DisableCompression: true,
-		},
+		Transport:      r.transport,
 		FlushInterval:  -1,
 		ModifyResponse: r.response,
 		ErrorHandler: func(w http.ResponseWriter, req *http.Request, err error) {
@@ -347,10 +433,136 @@ func (r *Recorder) response(resp *http.Response) error {
 		if raw, err := readBack(&resp.Body); err == nil && json.Unmarshal(raw, &created) == nil {
 			r.update(i, func(c *Call) { c.Created = cmpOr(created.ID, created.Name) })
 		}
+
+		if cl.creates == ObjectContainer {
+			r.inspect(resp.Request.Context(), created.ID, PhaseCreate, i)
+		}
+	case started(resp.Request.Method, resp.Request.URL.Path):
+		r.inspect(resp.Request.Context(), cl.targets[0], PhaseStart, i)
 	default:
 	}
 
 	return nil
+}
+
+// started reports whether a call is a container start.
+func started(method, path string) bool {
+	segs := strings.Split(strings.TrimPrefix(versionPrefix.ReplaceAllString(path, "/"), "/"), "/")
+
+	return method == http.MethodPost && len(segs) == namedVerbSegments && segs[0] == "containers" &&
+		segs[2] == "start"
+}
+
+// inspect reads the container id back from the engine, straight to its socket and outside the log,
+// for the call at index i. A read that fails, or finds nothing, is counted: the audit fails on it.
+func (r *Recorder) inspect(ctx context.Context, id string, phase Phase, i int) {
+	in, err := r.readContainer(ctx, id)
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if err != nil || id == "" {
+		r.failures++
+
+		return
+	}
+
+	in.Phase, in.Seq = phase, r.calls[i].Seq
+	r.inspects = append(r.inspects, in)
+}
+
+// inspected is what the recorder reads of a container inspect.
+type inspected struct {
+	Config          labelledConfig    `json:"Config"`          //nolint:tagliatelle // the engine's own field name
+	NetworkSettings inspectedNetworks `json:"NetworkSettings"` //nolint:tagliatelle // the engine's own field name
+	ID              string            `json:"Id"`              //nolint:tagliatelle // the engine's own field name
+	Name            string            `json:"Name"`            //nolint:tagliatelle // the engine's own field name
+	Mounts          []Mount           `json:"Mounts"`          //nolint:tagliatelle // the engine's own field name
+}
+
+// inspectedNetworks is the networks a container is on, by name.
+type inspectedNetworks struct {
+	Networks map[string]json.RawMessage `json:"Networks"` //nolint:tagliatelle // the engine's own field name
+}
+
+// readContainer takes one full inspect of the container id.
+func (r *Recorder) readContainer(ctx context.Context, id string) (Inspect, error) {
+	raw, err := r.get(ctx, "/containers/"+url.PathEscape(id)+"/json")
+	if err != nil {
+		return Inspect{}, err
+	}
+
+	var read inspected
+	if err := json.Unmarshal(raw, &read); err != nil {
+		return Inspect{}, fmt.Errorf("decoding the inspect of %s: %w", id, err)
+	}
+
+	return Inspect{
+		Raw: raw, ID: read.ID, Name: strings.TrimPrefix(read.Name, "/"), Mounts: read.Mounts,
+		Kind: read.Config.Labels[rules.LabelKind], Check: read.Config.Labels[rules.LabelCheck],
+		Networks: slices.Sorted(maps.Keys(read.NetworkSettings.Networks)),
+	}, nil
+}
+
+// takeCensus lists the volumes and networks the engine holds now.
+func (r *Recorder) takeCensus(ctx context.Context) (census, error) {
+	c := census{volumes: map[string]bool{}, networks: map[string]bool{}}
+
+	var volumes struct {
+		Volumes []createdBody `json:"Volumes"` //nolint:tagliatelle // the engine's own field name
+	}
+
+	var networks []createdBody
+
+	for path, into := range map[string]any{"/volumes": &volumes, "/networks": &networks} {
+		raw, err := r.get(ctx, path)
+		if err != nil {
+			return census{}, err
+		}
+
+		if err := json.Unmarshal(raw, into); err != nil {
+			return census{}, fmt.Errorf("decoding %s: %w", path, err)
+		}
+	}
+
+	for _, v := range volumes.Volumes {
+		c.volumes[v.Name] = true
+	}
+
+	for _, n := range networks {
+		c.networks[n.ID], c.networks[n.Name] = true, true
+	}
+
+	return c, nil
+}
+
+// get makes one read-only call straight to the engine.
+func (r *Recorder) get(ctx context.Context, path string) ([]byte, error) {
+	// The engine's socket answers plain HTTP, whatever host a request names.
+	target := &url.URL{Scheme: "http", Host: engineHost, Path: path}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), http.NoBody)
+	if err != nil {
+		return nil, fmt.Errorf("a request for %s: %w", path, err)
+	}
+
+	resp, err := r.transport.RoundTrip(req)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: %s answered %d", errRecorder, path, resp.StatusCode)
+	}
+
+	return raw, nil
 }
 
 // createdBody is what a create or commit response names.
@@ -665,10 +877,12 @@ func inspectedImage(c Call) (string, bool) {
 	return strings.TrimSuffix(strings.TrimPrefix(p, imagesPath), "/json"), true
 }
 
-// ownership is what an audit has seen created, and which images it saw inspected absent.
+// ownership is what an audit has seen created, which images it saw inspected absent, and what
+// existed before it started.
 type ownership struct {
 	created map[string]bool
 	absent  map[string]bool
+	before  census
 	scheme  string
 }
 
@@ -711,11 +925,46 @@ func (o ownership) saw(c Call, cl callClass, targets []string) {
 	}
 }
 
-// summarize audits calls, in arrival order, for the check checkID.
-func summarize(calls []Call, checkID string) Summary {
+// mountedForeign returns what a container's create-time read-back shows it touching that the
+// invocation did not create: a volume that existed before the recorder started and was not created
+// by it, or a network other than none that it did not create. A volume that did not exist before was
+// created with the container, and becomes the invocation's.
+func (o ownership) mountedForeign(in Inspect) []string {
+	var foreign []string
+
+	for _, m := range in.Mounts {
+		switch {
+		case m.Type != mountVolume, o.created[m.Name]:
+		case !o.before.volumes[m.Name]:
+			o.created[m.Name] = true
+		default:
+			foreign = append(foreign, m.Name)
+		}
+	}
+
+	for _, network := range in.Networks {
+		if network != noNetwork && !o.created[network] {
+			foreign = append(foreign, network)
+		}
+	}
+
+	return foreign
+}
+
+// summarize audits calls, in arrival order, and the containers they created as read back at create,
+// for the check checkID; before is what existed when the recorder started.
+func summarize(calls []Call, inspects []Inspect, before census, checkID string) Summary {
 	s := Summary{Calls: len(calls)}
 	o := ownership{
-		created: map[string]bool{}, absent: map[string]bool{}, scheme: rules.ImageDomain + "/" + checkID + "/",
+		created: map[string]bool{}, absent: map[string]bool{}, before: before,
+		scheme: rules.ImageDomain + "/" + checkID + "/",
+	}
+	atCreate := map[int]Inspect{}
+
+	for _, in := range inspects {
+		if in.Phase == PhaseCreate {
+			atCreate[in.Seq] = in
+		}
 	}
 
 	for _, c := range slices.SortedFunc(slices.Values(calls), func(a, b Call) int { return a.Seq - b.Seq }) {
@@ -736,15 +985,20 @@ func summarize(calls []Call, checkID string) Summary {
 		}
 
 		targets, foreign := o.foreign(c, cl)
+		if !foreign {
+			o.saw(c, cl, targets)
+
+			if in, ok := atCreate[c.Seq]; ok {
+				targets = o.mountedForeign(in)
+				foreign = len(targets) > 0
+			}
+		}
+
 		if foreign {
 			c.Targets = targets
 			s.ForeignTouched++
 			s.Foreign = append(s.Foreign, c)
-
-			continue
 		}
-
-		o.saw(c, cl, targets)
 	}
 
 	return s

@@ -3,6 +3,7 @@ package dockertest_test
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"os"
 	"slices"
 	"strings"
@@ -61,7 +62,7 @@ func TestTheRecorderSeesEveryCallTheCLIMakes(t *testing.T) {
 	check := checkID(t)
 
 	image := stutterImage(t, engine, docker, check)
-	id := docker.Create(t, dockertest.CreateSpec{Image: image})
+	id := docker.Create(t, dockertest.CreateSpec{Image: image, Network: "none"})
 	docker.Start(t, id)
 
 	if code := docker.Wait(t, id); code != 0 {
@@ -117,5 +118,118 @@ func TestABypassedRecorderFails(t *testing.T) {
 
 	if line := s.Line(check); !strings.Contains(line, " calls=0 ") || s.Err() == nil {
 		t.Fatalf("%s: %v; a recorder nothing went through must fail", line, s.Err())
+	}
+}
+
+// isolated is a container on no network, so joining one is never what an audit reads.
+func isolated(image string) dockertest.CreateSpec {
+	return dockertest.CreateSpec{Image: image, Network: "none"}
+}
+
+func TestTheRecorderRecordsAnAnonymousVolumeAtCreate(t *testing.T) {
+	t.Parallel()
+
+	engine := dockertest.Require(t)
+	recorder := engine.Recorder(t)
+	docker := engine.DockerVia(t, recorder)
+	check := checkID(t)
+
+	id := docker.Create(t, isolated(stutterImage(t, engine, docker, check)))
+	docker.Remove(t, id)
+
+	var mine []dockertest.Inspect
+
+	for _, in := range recorder.Inspects() {
+		if in.ID == id {
+			mine = append(mine, in)
+		}
+	}
+
+	if len(mine) != 1 || mine[0].Phase != dockertest.PhaseCreate {
+		t.Fatalf("inspects of the never-started container: %+v; want exactly one, at create", mine)
+	}
+
+	if m := mine[0].Mounts; len(m) != 1 || m[0].Type != "volume" || m[0].Destination != "/data" ||
+		!slices.Contains(recorder.Created().Volumes, m[0].Name) {
+		t.Fatalf("mounts %+v, created volumes %q; want the image's anonymous volume at /data, created", m,
+			recorder.Created().Volumes)
+	}
+
+	if s := recorder.Summary(check); s.Err() != nil {
+		t.Fatalf("%s: %v", s.Line(check), s.Err())
+	}
+}
+
+// runState is a container's state as an inspect reports it.
+type runState struct {
+	Status string `json:"Status"` //nolint:tagliatelle // the engine's own field name
+}
+
+// containerState is the part of a container inspect that holds its state.
+type containerState struct {
+	State runState `json:"State"` //nolint:tagliatelle // the engine's own field name
+}
+
+func TestTheRecorderInspectsAtCreateAndAtStart(t *testing.T) {
+	t.Parallel()
+
+	engine := dockertest.Require(t)
+	recorder := engine.Recorder(t)
+	docker := engine.DockerVia(t, recorder)
+
+	id := docker.Create(t, isolated(stutterImage(t, engine, docker, checkID(t))))
+	docker.Start(t, id)
+	docker.Wait(t, id)
+
+	var phases []dockertest.Phase
+
+	seq := 0
+
+	for _, in := range recorder.Inspects() {
+		if in.ID != id {
+			continue
+		}
+
+		if in.Seq <= seq {
+			t.Errorf("inspect at %s has seq %d after %d", in.Phase, in.Seq, seq)
+		}
+
+		seq = in.Seq
+		phases = append(phases, in.Phase)
+
+		var state containerState
+
+		if err := json.Unmarshal(in.Raw, &state); err != nil {
+			t.Fatal(err)
+		}
+
+		if in.Phase == dockertest.PhaseStart && state.State.Status != "running" && state.State.Status != "exited" {
+			t.Errorf("at start the container is %q; want running or exited", state.State.Status)
+		}
+	}
+
+	if !slices.Equal(phases, []dockertest.Phase{dockertest.PhaseCreate, dockertest.PhaseStart}) {
+		t.Fatalf("inspect phases %q; want create then start", phases)
+	}
+}
+
+func TestMountingAPreexistingVolumeIsForeign(t *testing.T) {
+	t.Parallel()
+
+	engine := dockertest.Require(t)
+	direct := engine.Docker(t)
+	volume := direct.CreateVolume(t, "", nil)
+
+	recorder := engine.Recorder(t)
+	docker := engine.DockerVia(t, recorder)
+	check := checkID(t)
+
+	spec := isolated(stutterImage(t, engine, docker, check))
+	spec.Mounts = []string{"type=volume,source=" + volume + ",target=/data"}
+	docker.Create(t, spec)
+
+	if s := recorder.Summary(check); s.ForeignTouched != 1 || s.Err() == nil {
+		t.Fatalf("%s: %v; a container mounting a volume that existed before the invocation touched it",
+			s.Line(check), s.Err())
 	}
 }

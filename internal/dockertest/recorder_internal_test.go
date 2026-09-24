@@ -164,7 +164,7 @@ func TestOwnershipFollowsWhatTheRecorderSaw(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		s := summarize(tc.calls, check)
+		s := summarize(tc.calls, nil, census{}, check)
 		if s.ForeignTouched != tc.foreign || len(s.Foreign) != tc.foreign {
 			t.Errorf("%s: foreign-touched=%d (%v), want %d", tc.name, s.ForeignTouched, s.Foreign, tc.foreign)
 		}
