@@ -91,26 +91,32 @@ func (s *scriptedEngine) create(_ context.Context, subnet netip.Prefix) (*Networ
 	failure := s.failures[0]
 	s.failures = s.failures[1:]
 
-	if errors.Is(failure, ErrSubnetTaken) {
-		// The engine now holds the subnet: another network won the race for it.
+	if errors.Is(failure, ErrSubnetTaken) || errors.Is(failure, ErrSubnetOverlap) {
+		// The subnet is held now: another network won the race for it.
 		s.held = append(s.held, network("racer", subnet.String()))
 	}
 
 	return nil, failure
 }
 
+// TestAnOverlapRefusalMovesToTheNextFreeSubnet moves on whichever way the race was lost: the engine
+// refusing the pool, or — measured on a native Docker 28 engine, where another network's bridge is a
+// host interface — the driver's own interface check refusing it first.
 func TestAnOverlapRefusalMovesToTheNextFreeSubnet(t *testing.T) {
 	t.Parallel()
 
-	engine := &scriptedEngine{held: thisHost(), failures: []error{fmt.Errorf("%w: race", ErrSubnetTaken)}}
+	for _, lost := range []error{ErrSubnetTaken, ErrSubnetOverlap} {
+		engine := &scriptedEngine{held: thisHost(), failures: []error{fmt.Errorf("%w: race", lost)}}
 
-	created, err := createWithSubnet(t.Context(), engine.occupied, engine.create)
-	if err != nil {
-		t.Fatalf("err = %v, want the next subnet", err)
-	}
+		created, err := createWithSubnet(t.Context(), engine.occupied, engine.create)
+		if err != nil {
+			t.Fatalf("%v: err = %v, want the next subnet", lost, err)
+		}
 
-	if created.name != "net-172.16.1.0/24" || len(engine.created) != 2 {
-		t.Errorf("created %s after %v, want 172.16.1.0/24 on the second attempt", created.name, engine.created)
+		if created.name != "net-172.16.1.0/24" || len(engine.created) != 2 {
+			t.Errorf("%v: created %s after %v, want 172.16.1.0/24 on the second attempt", lost, created.name,
+				engine.created)
+		}
 	}
 }
 

@@ -82,10 +82,15 @@ func CreateNetworks(ctx context.Context, eng *provision.Engine) (Networks, error
 		return Networks{}, err
 	}
 
+	gateway, err := gatewayOf(dependencyState)
+	if err != nil {
+		return Networks{}, fmt.Errorf("the %s network: %w", roleDependency, err)
+	}
+
 	return Networks{
 		ServiceSubnet:    serviceState.Subnet,
 		DependencySubnet: dependencyState.Subnet,
-		Gateway:          dependencyState.Gateway,
+		Gateway:          gateway,
 		Service:          service,
 		Dependency:       dependency,
 	}, nil
@@ -107,12 +112,23 @@ func createNetwork(
 		return nil, provision.NetworkState{}, fmt.Errorf("the %s network: %w", role, err)
 	}
 
-	if !state.Gateway.Is4() {
-		return nil, provision.NetworkState{}, fmt.Errorf("%w: the %s network has gateway %q", errNetwork, role,
-			state.Gateway)
+	return network, state, nil
+}
+
+// gatewayOf is a network's IPv4 gateway: the one the engine recorded, or, where it recorded none — a
+// Docker 28 engine records none for a network created with a subnet alone — the subnet's first address,
+// which is the one the engine gives the bridge. Either way it is only a candidate: the verifier's dial
+// is what proves the host answers there.
+func gatewayOf(state provision.NetworkState) (netip.Addr, error) {
+	if state.Gateway.Is4() {
+		return state.Gateway, nil
 	}
 
-	return network, state, nil
+	if !state.Subnet.Addr().Is4() {
+		return netip.Addr{}, fmt.Errorf("%w: no gateway and no IPv4 subnet to derive one from", errNetwork)
+	}
+
+	return state.Subnet.Masked().Addr().Next(), nil
 }
 
 // Config is what the topology is built from, once per check.
