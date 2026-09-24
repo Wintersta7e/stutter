@@ -13,7 +13,7 @@ import (
 )
 
 // pauseHorizon is how long Pause holds a consumer. Far longer than any run, because nothing lifts the
-// pause: Clear deletes the consumer with the stream before the next run starts.
+// pause but the next restore, which returns the consumer to how the checkpoint holds it.
 const pauseHorizon = 24 * time.Hour
 
 // ErrFill means the corpus could not be staged exactly as numbered: a publish was refused, the bus
@@ -140,20 +140,20 @@ func (c *Corpus) Snapshot(ctx context.Context) ([]Message, error) {
 
 // Clear rebuilds the corpus stream empty, ready for Fill.
 //
-// Clearing and filling are how a run is scoped when the service under test chooses its own messages:
-// it cannot be told to skip one, and holding a delivery back at the proxy breaks the consumer's own
-// batch accounting — a pull consumer counts a swallowed message against the batch it asked for, so
-// its next fetch comes back short. Rebuilding also takes the previous run's consumers with it, which
-// is what stops a second run resuming where the first one stopped.
-//
-// They are two steps rather than one so the service can be started in between, against a stream that
-// holds nothing yet: whatever it does on startup then happens before there is a message to attribute
-// it to.
+// It is not a reset between runs: it leaves every bucket, stream and consumer the service made, and a
+// seeded key at the service's revision. The bus reset is a checkpoint's restore. Clear survives for a
+// Go caller that published its corpus into the stream: the corpus is taken out once, the stream
+// cleared, and a checkpoint taken of the empty stream — so it runs at most once, before the first
+// checkpoint, and is refused after one.
 //
 // The stream is deleted and recreated rather than purged, for the same reason a key/value guard is:
 // a purged stream carries state a virgin one does not, and a run that starts from an equivalent
 // rather than an identical position is not comparable with the one before it.
 func (c *Corpus) Clear(ctx context.Context) error {
+	if c.checkpointed {
+		return errClearAfterCheckpoint
+	}
+
 	if err := c.stream.DeleteStream(ctx, c.topic.Stream); err != nil {
 		return fmt.Errorf("delete the corpus stream: %w", err)
 	}

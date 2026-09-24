@@ -87,6 +87,8 @@ type Corpus struct {
 	// dir is the JetStream store directory the server runs from.
 	dir   string
 	topic Topic
+	// checkpointed is set by the first checkpoint, after which Clear is refused.
+	checkpointed bool
 }
 
 // Topic reports which stream and subjects this corpus occupies.
@@ -241,11 +243,7 @@ func (c *Corpus) Replay(ctx context.Context, name string, opts ConsumerOptions) 
 //
 // Shutdown must be followed by WaitForShutdown or JetStream's final flush can truncate.
 func (c *Corpus) Close() {
-	if c.conn != nil {
-		c.conn.Close()
-	}
-
-	shutdown(c.server)
+	c.stop()
 }
 
 // options is the embedded server's one configuration.
