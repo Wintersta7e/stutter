@@ -329,12 +329,12 @@ func (s *Sandbox) awaitStartup(
 	var consumers []string
 
 	ended, err := observed.await(ctx, exited, func(ctx context.Context) (bool, error) {
-		listed, err := s.cfg.Corpus.Consumers(ctx)
+		listing, err := s.cfg.Corpus.Consumers(ctx)
 		if err != nil {
-			return false, fmt.Errorf("list the corpus stream's consumers: %w", err)
+			return false, fmt.Errorf("list the consumers: %w", err)
 		}
 
-		consumers = listed
+		consumers = listing.Corpus
 
 		if count := recorder.SetupCount(); count != setup {
 			quietSince, setup = time.Now(), count

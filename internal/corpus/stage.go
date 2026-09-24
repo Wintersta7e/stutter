@@ -255,43 +255,12 @@ func (c *Corpus) Pending(ctx context.Context, consumer string) (int, []string, e
 		return 0, nil, fmt.Errorf("find consumer %q: %w", consumer, err)
 	}
 
-	var filters []string
-	if info.Config.FilterSubject != "" {
-		filters = append(filters, info.Config.FilterSubject)
-	}
-
-	filters = append(filters, info.Config.FilterSubjects...)
-	slices.Sort(filters)
-
 	if info.NumPending > math.MaxInt32 {
 		return 0, nil, fmt.Errorf("%w: consumer %q has %d messages pending",
 			errTooManyPending, consumer, info.NumPending)
 	}
 
-	return int(info.NumPending) + info.NumAckPending, slices.Compact(filters), nil
-}
-
-// Consumers names every consumer on the corpus stream, in name order.
-func (c *Corpus) Consumers(ctx context.Context) ([]string, error) {
-	stream, err := c.stream.Stream(ctx, c.topic.Stream)
-	if err != nil {
-		return nil, fmt.Errorf("open the corpus stream: %w", err)
-	}
-
-	lister := stream.ConsumerNames(ctx)
-
-	var names []string
-	for name := range lister.Name() {
-		names = append(names, name)
-	}
-
-	if err := lister.Err(); err != nil {
-		return nil, fmt.Errorf("list the corpus stream's consumers: %w", err)
-	}
-
-	slices.Sort(names)
-
-	return names, nil
+	return int(info.NumPending) + info.NumAckPending, filterSubjects(info.Config), nil
 }
 
 // Pause stops the bus delivering to one consumer on the corpus stream for the rest of the run.

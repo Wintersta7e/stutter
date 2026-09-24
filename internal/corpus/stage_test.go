@@ -378,7 +378,7 @@ func TestAPausedConsumerIsHandedNothing(t *testing.T) {
 	create("paused")
 	create("scoped")
 
-	names, err := store.Consumers(t.Context())
+	names, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}
