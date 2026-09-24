@@ -32,7 +32,7 @@ func runnable() []string {
 func TestEveryRunContainerUsesThePinnedImage(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	moved := testRef("moved")
 	pinnedID := docker.Import(t, layer(t, "a", "A"), testRef("kept"), runnable())
 	docker.AddTag(t, pinnedID, moved)
@@ -147,7 +147,7 @@ func sentinelIntact(t *testing.T, docker *dockertest.Docker, volume, hash string
 func TestAVolumeNotCreatedByThisCheckIsNeverUsed(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	stateDir := newStateDir(t)
 	engine := openEngine(t, provision.Options{StateDir: stateDir})
 
@@ -195,7 +195,7 @@ func TestAVolumeNotCreatedByThisCheckIsNeverUsed(t *testing.T) {
 func TestEveryBindIsRecursivelyReadOnly(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	engine := openEngine(t, provision.Options{})
 	image := pinImage(t, engine, testImage)
 
@@ -285,7 +285,7 @@ func anonymousVolumes(
 func TestNoAnonymousVolumeSurvives(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	stateDir := newStateDir(t)
 	engine := openEngine(t, provision.Options{StateDir: stateDir})
 	image := pinImage(t, engine, testImage)

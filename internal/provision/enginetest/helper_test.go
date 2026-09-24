@@ -279,6 +279,35 @@ func cleanCheck(t *testing.T, stateDir, check string) {
 	}
 }
 
+// engineSlots bounds how many engine tests run at once. Each spawns docker CLIs, helper processes
+// and containers on the one engine the whole test run shares; unbounded, the suite's load pushed
+// timing-bound tests in other packages past their bounds (measured: a 50 ms hold bound failed 6 and
+// 14 times beside it, 0 alone).
+var engineSlots = make(chan struct{}, 3)
+
+// slot waits for one of the engine slots and gives it back when the test ends, after its cleanups.
+func slot(t *testing.T) {
+	t.Helper()
+
+	select {
+	case engineSlots <- struct{}{}:
+	case <-t.Context().Done():
+		t.Fatal("the test ended waiting for an engine slot")
+	}
+
+	t.Cleanup(func() { <-engineSlots })
+}
+
+// requireEngine is the gate every engine test passes first, then its slot.
+func requireEngine(t *testing.T) dockertest.Engine {
+	t.Helper()
+
+	engine := dockertest.Require(t)
+	slot(t)
+
+	return engine
+}
+
 // helperEnv is the environment a helper runs a check in: the docker CLI reachable, the engine
 // the gate accepted, and dockerConfig as the user's client configuration.
 func helperEnv(engine dockertest.Engine, path, dockerConfig string) []string {

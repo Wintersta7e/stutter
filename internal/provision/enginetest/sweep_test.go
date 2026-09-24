@@ -63,7 +63,7 @@ func checkContainers(t *testing.T, docker *dockertest.Docker, check string) []st
 func TestAnEditedLedgerNeverRemovesADecoy(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 	docker := gate.Docker(t)
 	stateDir := newStateDir(t)
 
@@ -150,7 +150,7 @@ func writeLedger(t *testing.T, path string, data []byte) {
 func TestOnlyADeadCheckIsSwept(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 	docker := gate.Docker(t)
 	stateDir := newStateDir(t)
 

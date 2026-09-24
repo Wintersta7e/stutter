@@ -18,7 +18,7 @@ import (
 func TestATakenSubnetIsRefusedByTheEngine(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	engine := openEngine(t, provision.Options{})
 
 	// The helper picks the subnet from its own range, retrying while another test holds one.

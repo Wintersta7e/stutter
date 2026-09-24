@@ -51,7 +51,7 @@ func gone(path string) bool {
 func TestLogsSurviveASetupExit(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 	docker := gate.Docker(t)
 	stateDir := newStateDir(t)
 
@@ -133,7 +133,7 @@ func present(t *testing.T, docker *dockertest.Docker, what dockertest.Object, id
 func TestAKeptCheckIsLeftForClean(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 	docker := gate.Docker(t)
 	stateDir := newStateDir(t)
 
@@ -227,7 +227,7 @@ var createdCount = regexp.MustCompile(`^teardown \S+ created=([1-9][0-9]*) `)
 func TestAPlantedLabelledResourceIsListedNeverRemoved(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 
 	engine, err := provision.Open(t.Context(), provision.Options{StateDir: newStateDir(t), TempDir: t.TempDir()})
 	if err != nil {

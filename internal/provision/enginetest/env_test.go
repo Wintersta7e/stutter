@@ -35,7 +35,7 @@ func containerEnv(t *testing.T, docker *dockertest.Docker, id string) []string {
 func TestEnvironmentReachesTheContainerByteForByte(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	engine := openEngine(t, provision.Options{})
 
 	want := map[string]string{
@@ -73,7 +73,7 @@ func TestEnvironmentReachesTheContainerByteForByte(t *testing.T) {
 func TestNoProxyVariableReachesTheTarget(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 	docker := gate.Docker(t)
 
 	image := testRef("proxied")
@@ -154,7 +154,7 @@ func dockerCLI(t *testing.T) string {
 func TestNoEnvironmentValueReachesArgv(t *testing.T) {
 	t.Parallel()
 
-	gate := dockertest.Require(t)
+	gate := requireEngine(t)
 
 	dockerPath := dockerCLI(t)
 	shimDir := t.TempDir()

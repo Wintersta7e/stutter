@@ -86,6 +86,7 @@ func TestASecondInterruptLeavesTheRestToTheSweep(t *testing.T) {
 	for _, finish := range []string{"open", "clean"} {
 		t.Run(finish, func(t *testing.T) {
 			t.Parallel()
+			slot(t)
 
 			docker := gate.Docker(t)
 			decoy, started := decoyContainer(t, docker)

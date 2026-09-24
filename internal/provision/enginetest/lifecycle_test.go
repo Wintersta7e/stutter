@@ -47,7 +47,7 @@ func running(
 func TestAStopNeverWaitsOnSIGTERM(t *testing.T) {
 	t.Parallel()
 
-	dockertest.Require(t)
+	requireEngine(t)
 
 	engine := openEngine(t, provision.Options{})
 	c := running(t, engine, freeNetwork(t, engine, serviceRole), rules.KindTarget, ignoresTerm)
@@ -75,7 +75,7 @@ func TestAStopNeverWaitsOnSIGTERM(t *testing.T) {
 func TestStateIsReadBeforeTheKill(t *testing.T) {
 	t.Parallel()
 
-	dockertest.Require(t)
+	requireEngine(t)
 
 	engine := openEngine(t, provision.Options{})
 	network := freeNetwork(t, engine, serviceRole)
@@ -116,7 +116,7 @@ func TestStateIsReadBeforeTheKill(t *testing.T) {
 func TestASeedStopsGracefully(t *testing.T) {
 	t.Parallel()
 
-	dockertest.Require(t)
+	requireEngine(t)
 
 	engine := openEngine(t, provision.Options{})
 	network := freeNetwork(t, engine, serviceRole)
@@ -153,7 +153,7 @@ func TestASeedStopsGracefully(t *testing.T) {
 func TestTheReadyLineIsReadFromARunningContainer(t *testing.T) {
 	t.Parallel()
 
-	dockertest.Require(t)
+	requireEngine(t)
 
 	engine := openEngine(t, provision.Options{})
 	c := running(t, engine, freeNetwork(t, engine, serviceRole), rules.KindTarget,
@@ -176,7 +176,7 @@ func TestTheReadyLineIsReadFromARunningContainer(t *testing.T) {
 func TestHealthIsReadFromTheEngine(t *testing.T) {
 	t.Parallel()
 
-	dockertest.Require(t)
+	requireEngine(t)
 
 	engine := openEngine(t, provision.Options{})
 	image := pinImage(t, engine, testImage)
@@ -216,7 +216,7 @@ func TestHealthIsReadFromTheEngine(t *testing.T) {
 func TestTwoNetworksAtCreate(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	engine := openEngine(t, provision.Options{})
 	first := freeNetwork(t, engine, serviceRole)
 	second := freeNetwork(t, engine, "egress")
@@ -256,7 +256,7 @@ func TestTwoNetworksAtCreate(t *testing.T) {
 func TestAHelperRunsWithNoNetwork(t *testing.T) {
 	t.Parallel()
 
-	docker := dockertest.Require(t).Docker(t)
+	docker := requireEngine(t).Docker(t)
 	engine := openEngine(t, provision.Options{})
 
 	spec := targetSpec(pinImage(t, engine, testImage), nil)

@@ -216,6 +216,7 @@ func TestNoComposeChildOutlivesStutter(t *testing.T) {
 	for _, plugin := range []string{"installed", "deaf"} {
 		t.Run(plugin, func(t *testing.T) {
 			t.Parallel()
+			slot(t)
 
 			dir := t.TempDir()
 			fifo := filepath.Join(dir, "compose.yaml")
