@@ -39,6 +39,11 @@ const (
 // stopped rather than risk the consumer's own timers redelivering or losing a message.
 var ErrHoldExceeded = errors.New("the Fill hold outlasted its bound")
 
+// ErrPending means the consumer under test will not be handed exactly the run's messages its filter
+// admits: some were discarded or skipped before it could be, or others already in the stream would
+// reach it too.
+var ErrPending = errors.New("the consumer under test will not receive exactly the corpus")
+
 // FillHold is one run's hold while its corpus was published: how long it lasted, the bound it had to
 // stay under and the timer that set that bound, and what was published meanwhile.
 //
@@ -71,7 +76,7 @@ func (s *Sandbox) fill(ctx context.Context, run *observedRun, target string, mes
 
 	run.hold.begin(target, s.cfg.Policy.Deadline(1), cancel)
 
-	err := s.publish(held, run, messages)
+	err := s.publish(held, run, target, messages)
 
 	record := run.hold.end()
 	record.Messages = len(messages)
@@ -91,11 +96,12 @@ func (s *Sandbox) fill(ctx context.Context, run *observedRun, target string, mes
 	return err
 }
 
-// publish numbers the run's messages from wherever the stream is up to and publishes them.
+// publish numbers the run's messages from wherever the stream is up to, publishes them, and checks the
+// consumer under test will be handed them.
 //
 // The translation is installed before the first publish: the proxy notes a delivery as it reads it,
 // and a service consuming for itself is handed a message before Fill hears back where it landed.
-func (s *Sandbox) publish(ctx context.Context, run *observedRun, messages []corpus.Message) error {
+func (s *Sandbox) publish(ctx context.Context, run *observedRun, target string, messages []corpus.Message) error {
 	first, err := s.cfg.Corpus.Next(ctx)
 	if err != nil {
 		return fmt.Errorf("number the corpus: %w", err)
@@ -107,7 +113,41 @@ func (s *Sandbox) publish(ctx context.Context, run *observedRun, messages []corp
 		return fmt.Errorf("stage the corpus: %w", err)
 	}
 
-	return nil
+	// A consumer created after publication was never held to one message in flight, and scope already
+	// refuses whatever it takes; there is nothing to count against yet.
+	if target == "" {
+		return nil
+	}
+
+	return s.pending(ctx, target, messages)
+}
+
+// pending checks the consumer under test has exactly the run's messages its filter admits still to be
+// handed or settled, read from the server on Stutter's own connection.
+//
+// A stream limit or age can discard a staged message, and a delivery policy can skip one, before the
+// service is ever handed it; a run over part of the corpus reads as a handler that did less. Messages
+// already in the stream would reach it beside the corpus. Either way the run stops, saying which.
+func (s *Sandbox) pending(ctx context.Context, target string, messages []corpus.Message) error {
+	count, filters, err := s.cfg.Corpus.Pending(ctx, target)
+	if err != nil {
+		return fmt.Errorf("read what consumer %q has pending: %w", target, err)
+	}
+
+	want := len(corpus.Admitted(messages, filters))
+
+	switch {
+	case count < want:
+		return fmt.Errorf("%w: consumer %q has %d of the %d staged messages its filter admits still to "+
+			"receive, a shortfall of %d — the stream's limits or age discarded some, or its delivery "+
+			"policy skips them", ErrPending, target, count, want, want-count)
+	case count > want:
+		return fmt.Errorf("%w: consumer %q has %d messages still to receive, an excess of %d over the %d "+
+			"staged ones its filter admits — the stream already held messages it will also receive",
+			ErrPending, target, count, count-want, want)
+	default:
+		return nil
+	}
 }
 
 // pullLimit is the shortest a consumer's pull requests let a hold last, and the timer that set it:

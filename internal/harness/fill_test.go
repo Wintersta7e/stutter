@@ -3,9 +3,14 @@ package harness_test
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wintersta7e/stutter/internal/check"
 	"github.com/Wintersta7e/stutter/internal/corpus"
@@ -150,5 +155,117 @@ func TestEveryFilledRunLeavesOneHoldRecord(t *testing.T) {
 		if hold.Length >= hold.Bound {
 			t.Errorf("hold %d lasted %s, not within its bound %s", at+1, hold.Length, hold.Bound)
 		}
+	}
+}
+
+// ownedBus opens a bus bound to the corpus stream, lets job make the bus's starting state on a direct
+// connection, and checkpoints it as B1 — the shape a compose check hands every run.
+func ownedBus(t *testing.T, job func(stream jetstream.JetStream)) (*corpus.Corpus, *corpus.Checkpoint) {
+	t.Helper()
+
+	root := t.TempDir()
+	bus := filepath.Join(root, "bus")
+
+	if err := os.Mkdir(bus, 0o700); err != nil {
+		t.Fatalf("Mkdir() error = %v", err)
+	}
+
+	store, err := corpus.Open(t.Context(), filepath.Join(bus, "store"), corpus.StreamName)
+	if err != nil {
+		t.Fatalf("corpus.Open() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	connection, err := nats.Connect(store.URL())
+	if err != nil {
+		t.Fatalf("nats.Connect() error = %v", err)
+	}
+
+	stream, err := jetstream.New(connection)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+
+	job(stream)
+	connection.Close()
+
+	b1, err := store.Checkpoint(t.Context(), filepath.Join(bus, "B1"))
+	if err != nil {
+		t.Fatalf("Checkpoint(B1) error = %v", err)
+	}
+
+	return store, &b1
+}
+
+// createCorpusStream is a job creating the corpus stream the way a user's migration would.
+func createCorpusStream(t *testing.T, stream jetstream.JetStream, maxMsgs int64) {
+	t.Helper()
+
+	if _, err := stream.CreateStream(t.Context(), jetstream.StreamConfig{
+		Name:     corpus.StreamName,
+		Subjects: []string{filterAll},
+		MaxMsgs:  maxMsgs,
+		Discard:  jetstream.DiscardOld,
+	}); err != nil {
+		t.Fatalf("CreateStream() error = %v", err)
+	}
+}
+
+// TestAPendingShortfallStopsTheRun: a stream limit discards part of the corpus before the service is
+// handed it, and a run over part of the corpus reads as a handler that did less. It stops, naming how
+// many are missing.
+func TestAPendingShortfallStopsTheRun(t *testing.T) {
+	t.Parallel()
+
+	store, b1 := ownedBus(t, func(stream jetstream.JetStream) { createCorpusStream(t, stream, 2) })
+
+	built, _ := quirkySandbox(t, observedConfig(), quirks{}, func(settings *harness.Config) {
+		settings.Corpus = store
+		settings.Baseline = b1
+		settings.Recorded = orders("ORD-SHORT", 3, 0)
+	})
+
+	result, err := built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if !errors.Is(err, harness.ErrPending) {
+		t.Fatalf("Run() error = %v (delivered %d), want ErrPending", err, result.Delivered)
+	}
+
+	if !strings.Contains(err.Error(), "shortfall of 1") {
+		t.Errorf("Run() error = %v, want it to name a shortfall of 1", err)
+	}
+}
+
+// TestAStreamAlreadyHoldingAdmittedMessagesNeverReachesAVerdict: messages a job left in the stream
+// would reach the consumer beside the corpus; the run stops before or when it is handed them.
+func TestAStreamAlreadyHoldingAdmittedMessagesNeverReachesAVerdict(t *testing.T) {
+	t.Parallel()
+
+	store, b1 := ownedBus(t, func(stream jetstream.JetStream) {
+		createCorpusStream(t, stream, 0)
+
+		for _, order := range []string{"ORD-LEFT-1", "ORD-LEFT-2"} {
+			left := orderPayload(order, "WIDGET-FILL")
+			if _, err := stream.Publish(t.Context(), toy.SubjectOrderCreated, left); err != nil {
+				t.Fatalf("Publish() error = %v", err)
+			}
+		}
+	})
+
+	built, _ := quirkySandbox(t, observedConfig(), quirks{}, func(settings *harness.Config) {
+		settings.Corpus = store
+		settings.Baseline = b1
+		settings.Recorded = orders("ORD-NEW", 3, 0)
+	})
+
+	_, err := built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if err == nil {
+		t.Fatal("Run() error = nil: a run over messages Stutter did not publish reached a verdict")
+	}
+
+	t.Logf("the run stopped: %v", err)
+
+	if !errors.Is(err, harness.ErrPending) && !strings.Contains(err.Error(), "Stutter did not publish") {
+		t.Errorf("Run() error = %v, want ErrPending or the fed-back stop", err)
 	}
 }
