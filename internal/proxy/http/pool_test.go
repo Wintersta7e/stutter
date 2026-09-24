@@ -45,6 +45,13 @@ func TestAnUnusedPooledConnectionIsNotAStop(t *testing.T) {
 
 	_ = unused.Close()
 
+	// A connection that closes having sent nothing is judged at once, so a stop it caused is here by now.
+	select {
+	case serveErr := <-done:
+		t.Fatalf("Serve() stopped when a pooled connection closed after a served one: %v", serveErr)
+	case <-time.After(quietFor):
+	}
+
 	if abortErr := run.Abort(); abortErr != nil {
 		t.Fatal(abortErr)
 	}

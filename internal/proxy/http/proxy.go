@@ -191,17 +191,19 @@ type Proxy struct {
 	// failure is the first error net/http reported while serving. It stops the run rather than
 	// being recorded, so a broken connection can never be mistaken for a side effect.
 	failure error
-	// served holds the server names at least one TLS connection has sent a request for. A later
-	// connection to one of them that sends nothing is the client's pool, not a client that cannot
-	// reach the stub (see tunnel.Read).
-	served      sync.Map
+	// served holds what the connections that sent a request were, by entry, port and server name. It
+	// is this run's only: the stub is built once per run, so a name served in one run exempts nothing in
+	// the next. A later connection with the same key that sends nothing is the client's pool, not a
+	// client that cannot reach the stub (see tunnel.closedUnused).
+	served      map[servedKey]struct{}
 	logicalHost string
 	entries     []*entry
 
 	closeOnce sync.Once
 	failOnce  sync.Once
 	failed    sync.Mutex
-	heldMu    sync.Mutex
+	// heldMu guards held, served, closing and teardown.
+	heldMu sync.Mutex
 	// closing is set once the stub has begun to close, so its own closes are never read as a client's.
 	closing bool
 	// teardown is set at the teardown point (MarkTeardown).
@@ -241,6 +243,7 @@ func New(
 		script:      script,
 		sink:        sink,
 		held:        make(map[net.Conn]struct{}),
+		served:      make(map[servedKey]struct{}),
 		tlsConfig: &tls.Config{
 			GetCertificate:     certificate,
 			GetConfigForClient: recordServerName,
@@ -294,6 +297,7 @@ type tunnel struct {
 	// offered are the application protocols the client's hello listed, sorted.
 	offered []string
 	port    uint16
+	class   entryClass
 }
 
 // HandshakeContext stops the run on a failed handshake, naming the server name the client asked
@@ -361,7 +365,7 @@ func (t *tunnel) firstRequest() (net.Conn, error) {
 		return nil, stop
 	}
 
-	t.proxy.served.Store(t.serverName, struct{}{})
+	t.proxy.markServed(t.key())
 
 	return checked, nil
 }
@@ -372,7 +376,7 @@ func (t *tunnel) firstRequest() (net.Conn, error) {
 // freed first, and pools the fresh one unused; a client that pins certificates never gets a first
 // connection through, so it still stops the run. Otherwise it is a client that cannot talk to the stub.
 func (t *tunnel) closedUnused() error {
-	if t.proxy.tornDown() || t.proxy.wasServed(t.serverName) {
+	if t.proxy.tornDown() || t.proxy.wasServed(t.key()) {
 		return io.EOF
 	}
 
@@ -383,6 +387,11 @@ func (t *tunnel) closedUnused() error {
 }
 
 func (t *tunnel) destination() (uint16, string) { return t.port, t.serverName }
+
+// key is what the tunnel is for the served set.
+func (t *tunnel) key() servedKey {
+	return servedKey{name: t.serverName, port: t.port, class: t.class}
+}
 
 // tunnelKey carries a tunnel through its own handshake, so the one TLS config every connection
 // shares can tell which tunnel a ClientHello belongs to. A config per connection would give each its
@@ -556,13 +565,6 @@ func (p *Proxy) fail(err error) {
 
 		_ = p.Close()
 	})
-}
-
-// wasServed reports whether a TLS connection has already sent a request for serverName.
-func (p *Proxy) wasServed(serverName string) bool {
-	_, served := p.served.Load(serverName)
-
-	return served
 }
 
 func (p *Proxy) serveFailure() error {

@@ -696,3 +696,120 @@ func isTimeout(err error) bool {
 
 	return isNetwork && network.Timeout()
 }
+
+const (
+	// pooledRuns is how many fresh stubs each pooled shape is tried against.
+	pooledRuns = 20
+	// stopWatch is how long a pooled run is watched for a stop once the client has closed its pool: a
+	// close is judged at once, so a stop it causes is already on its way.
+	stopWatch = 100 * time.Millisecond
+)
+
+// pooledShape is a Go client's traffic against one fresh stub: warm requests, then fan concurrent
+// ones, then idle for settle with the client's pool as the Transport left it.
+type pooledShape struct {
+	name        string
+	idleTimeout time.Duration
+	settle      time.Duration
+	warm, fan   int
+}
+
+// stopsOn runs shape against one fresh TLS stub and reports whether the stub stopped the run.
+func (shape pooledShape) stopsOn(t *testing.T) bool {
+	t.Helper()
+
+	under := tlsStub(t)
+	address := under.proxy.Addr()
+	client, transport := goClient(under.trust, func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, address)
+	})
+
+	if shape.idleTimeout > 0 {
+		transport.IdleConnTimeout = shape.idleTimeout
+	}
+
+	fanOut(t, client, "https://"+serverName+"/fan", shape.warm, shape.fan)
+	time.Sleep(shape.settle)
+	transport.CloseIdleConnections()
+
+	defer under.abort(t)
+
+	select {
+	case err := <-under.done:
+		t.Logf("stopped: %v", err)
+
+		return true
+	case <-time.After(stopWatch):
+		closeProxy(t, under.proxy, under.done)
+
+		return false
+	}
+}
+
+// TestAGoClientsPooledConnectionsNeverStopTheRun: Go's http.Transport leaves a connection it dialled
+// and never used in its pool, and past its idle limit closes one at once. Neither carried a request,
+// and beside a served connection to the same name neither hides one, so neither stops the run.
+func TestAGoClientsPooledConnectionsNeverStopTheRun(t *testing.T) {
+	t.Parallel()
+
+	for _, shape := range []pooledShape{
+		{name: "443 warm1 fan2 pooled idle", warm: 1, fan: 2, settle: poolSettle},
+		{name: "443 warm2 fan3 overflow close", warm: 2, fan: 3, settle: poolSettle},
+		{
+			name: "443 idle timeout mid-run", warm: 1, fan: 2,
+			idleTimeout: 200 * time.Millisecond, settle: 500 * time.Millisecond,
+		},
+	} {
+		t.Run(shape.name, func(t *testing.T) {
+			t.Parallel()
+
+			stopped := 0
+
+			for range pooledRuns {
+				if shape.stopsOn(t) {
+					stopped++
+				}
+			}
+
+			t.Logf("shape=%s stopped=%d/%d", shape.name, stopped, pooledRuns)
+
+			if stopped != 0 {
+				t.Errorf("stopped=%d/%d: a Go client's pooled connections stopped the run", stopped, pooledRuns)
+			}
+		})
+	}
+
+	t.Run("443 control: no request for the name", func(t *testing.T) {
+		t.Parallel()
+
+		under := tlsStub(t)
+
+		_ = dialTunnel(t, under).conn.Close()
+
+		outcome{stop: proxyhttp.StopNoRequest}.expect(t, under)
+	})
+}
+
+// TestServedIsForgottenBetweenRuns: that a name was served is known for one run only. A later run's
+// stub starts knowing nothing, so a client there that never gets a request through still stops it.
+func TestServedIsForgottenBetweenRuns(t *testing.T) {
+	t.Parallel()
+
+	script := proxyhttp.NewScript(proxyhttp.Response{}, nil)
+	first := begun(t, &stubUnderTest{sink: &sink{}}, script)
+	first.proxy, first.done, first.trust = startTLSProxy(t, first.sink, script)
+
+	tunnelServed(t, first)
+	closeProxy(t, first.proxy, first.done)
+
+	if err := first.run.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	second := begun(t, &stubUnderTest{sink: &sink{}}, script)
+	second.proxy, second.done, second.trust = startTLSProxy(t, second.sink, script)
+
+	_ = dialTunnel(t, second).conn.Close()
+
+	outcome{stop: proxyhttp.StopNoRequest}.expect(t, second)
+}

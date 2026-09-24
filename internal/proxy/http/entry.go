@@ -35,6 +35,15 @@ var (
 	errNoCertificates = errors.New("HTTP stub serving TLS requires a certificate source")
 )
 
+// servedKey is what a connection that sent a request was: the entry it arrived on, the port it was
+// dialled on, and the server name it asked for. A request for a name on one port says nothing about a
+// connection to the same name on another.
+type servedKey struct {
+	name  string
+	port  uint16
+	class entryClass
+}
+
 // connectError is a first request that asks for a tunnel to target.
 type connectError struct{ target string }
 
@@ -179,7 +188,13 @@ func (e *entry) judgeTLS(conn net.Conn) {
 
 	replaying := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(first), conn), port: e.port}
 
-	e.handOver(&tunnel{Conn: tls.Server(replaying, e.proxy.tlsConfig), raw: conn, proxy: e.proxy, port: e.port})
+	e.handOver(&tunnel{
+		Conn:  tls.Server(replaying, e.proxy.tlsConfig),
+		raw:   conn,
+		proxy: e.proxy,
+		port:  e.port,
+		class: e.class,
+	})
 }
 
 // MarkTeardown marks the teardown point: the harness has begun removing the service under test. A TLS
@@ -269,6 +284,24 @@ func (p *Proxy) stopOn(err error) {
 	if !p.isClosing() {
 		p.fail(err)
 	}
+}
+
+// markServed records that a connection with key has sent a request.
+func (p *Proxy) markServed(key servedKey) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	p.served[key] = struct{}{}
+}
+
+// wasServed reports whether a connection with key has already sent a request in this run.
+func (p *Proxy) wasServed(key servedKey) bool {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	_, served := p.served[key]
+
+	return served
 }
 
 // firstByte waits for a connection's first byte.
