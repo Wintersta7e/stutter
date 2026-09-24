@@ -308,11 +308,15 @@ func (s *Sandbox) advertise(addr string) string {
 }
 
 // egress is the proxies standing in front of the service's dependencies.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type egress struct {
 	httpRun *httpproxy.Run
 	served  chan error
 	at      Addresses
 	closers []func(context.Context) error
+	// taken counts the Serve results a wait took before teardown: the proxies that stopped early.
+	taken int
 }
 
 // start registers a proxy and begins serving it.
@@ -354,6 +358,9 @@ func (e *egress) settle(ctx context.Context, runErr error) error {
 
 // close tears the proxies down. A proxy that died mid-run would otherwise present as a handler that
 // simply stopped producing effects, so its error is surfaced rather than discarded.
+//
+// Only the results still to come are drained: one a wait took early already ended that wait, and is
+// the run's error.
 func (e *egress) close(ctx context.Context) error {
 	var err error
 
@@ -361,7 +368,7 @@ func (e *egress) close(ctx context.Context) error {
 		err = errors.Join(err, closer(ctx))
 	}
 
-	for range len(e.closers) {
+	for range len(e.closers) - e.taken {
 		err = errors.Join(err, <-e.served)
 	}
 

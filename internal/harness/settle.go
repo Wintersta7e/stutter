@@ -2,6 +2,7 @@ package harness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -29,7 +30,13 @@ const (
 	// targetExited means the service under test stopped by itself, so there was nothing left to wait
 	// for.
 	targetExited
+	// proxyStopped means a proxy's Serve returned: the service's traffic through it is no longer
+	// observed, so nothing the wait could see would be complete.
+	proxyStopped
 )
+
+// errProxyStopped wraps a proxy's error that ended a wait before its teardown.
+var errProxyStopped = errors.New("a proxy stopped during the run")
 
 // await is the one wait every start of the service under test goes through — a run's startup and its
 // end alike — so each ends by the same rules.
@@ -37,8 +44,10 @@ const (
 // It checks until every drainPoll, first at once, and returns finished when until reports true. An
 // error from until ends the wait with that error. It returns targetExited the moment exited closes,
 // because a service that has stopped will never satisfy anything a start is waiting for, and waiting
-// the condition out would only report the exit late as something else.
-func (*egress) await(
+// the condition out would only report the exit late as something else. It returns proxyStopped, with
+// the proxy's error, the moment any proxy's Serve returns, for the same reason: from then on the
+// service's traffic through it goes unobserved.
+func (e *egress) await(
 	ctx context.Context,
 	exited <-chan struct{},
 	until func(context.Context) (bool, error),
@@ -50,6 +59,8 @@ func (*egress) await(
 		select {
 		case <-exited:
 			return targetExited, nil
+		case err := <-e.served:
+			return proxyStopped, e.stopped(err)
 		default:
 		}
 
@@ -67,9 +78,23 @@ func (*egress) await(
 			return finished, fmt.Errorf("cancelled while waiting: %w", ctx.Err())
 		case <-exited:
 			return targetExited, nil
+		case err := <-e.served:
+			return proxyStopped, e.stopped(err)
 		case <-ticker.C:
 		}
 	}
+}
+
+// stopped takes one proxy's Serve result before teardown, as the error that ended the wait. It is
+// counted, so teardown drains only the results still to come.
+func (e *egress) stopped(err error) error {
+	e.taken++
+
+	if err == nil {
+		return errProxyStopped
+	}
+
+	return fmt.Errorf("%w: %w", errProxyStopped, err)
 }
 
 // answer is the latest word the server has had on one message's latest delivery.
