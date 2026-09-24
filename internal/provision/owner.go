@@ -36,6 +36,9 @@ const (
 	imageIDTemplate   = `{"id":{{json .Id}},"labels":{{json (index .Config "Labels")}}}`
 	networkIDTemplate = `{"id":{{json .Id}},"labels":{{json .Labels}}}`
 	volumeTemplate    = `{"name":{{json .Name}},"labels":{{json .Labels}}}`
+	// presenceTemplate prints a constant. It cannot fail on an object the engine holds, so an inspect
+	// through it exits zero exactly when its reference resolves.
+	presenceTemplate = `present`
 )
 
 var (
@@ -140,8 +143,10 @@ func (e *Engine) owns(h Handle) error {
 	return nil
 }
 
-// read runs one identifying read into into. A failed read on an engine that answers a version call
-// is a missing object; on one that does not, it is an error. Stderr is never consulted.
+// read runs one identifying read, an inspect whose arguments are its template and one reference,
+// into into. A failed read is a missing object only when the engine answers a version call and the
+// same inspect through presenceTemplate does not find the reference either; otherwise it is an
+// error. Stderr is never consulted.
 func (e *Engine) read(ctx context.Context, req request, into any) (bool, error) {
 	res, err := e.run.call(ctx, req)
 	if err == nil {
@@ -149,7 +154,7 @@ func (e *Engine) read(ctx context.Context, req request, into any) (bool, error) 
 	}
 
 	// Only a call that ran and exited non-zero can mean a missing object.
-	if callErr, ran := errors.AsType[*CallError](err); !ran || callErr.ExitCode() <= 0 {
+	if !exitedNonZero(err) {
 		return false, err
 	}
 
@@ -157,7 +162,24 @@ func (e *Engine) read(ctx context.Context, req request, into any) (bool, error) 
 		return false, fmt.Errorf("%w, and the engine does not answer: %w", err, reachErr)
 	}
 
+	// A template that fails on the object's JSON exits non-zero too. An inspect that found the
+	// object, or one that never finished, leaves it unreadable, never absent.
+	probe := req
+	probe.args = slices.Concat([]arg{{val: presenceTemplate}}, req.args[1:])
+
+	if _, probeErr := e.run.call(ctx, probe); !exitedNonZero(probeErr) {
+		return false, errors.Join(fmt.Errorf("%w: %s is not proven absent, and its read failed: %w", ErrEngine,
+			req.args[1].val, err), probeErr)
+	}
+
 	return false, nil
+}
+
+// exitedNonZero reports a call that ran and exited non-zero.
+func exitedNonZero(err error) bool {
+	callErr, ran := errors.AsType[*CallError](err)
+
+	return ran && callErr.ExitCode() > 0
 }
 
 // reachable proves the engine answers.
