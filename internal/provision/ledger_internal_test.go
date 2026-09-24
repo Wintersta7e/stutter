@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
@@ -98,8 +99,17 @@ func TestALedgerIsLockedBeforeItIsVisible(t *testing.T) {
 	}
 }
 
+// closeLedger leaves led as a dead owner does: closed, its lock free. A child this process forks
+// while the descriptor is open holds a copy of it, and with it the lock, until the child's exec
+// closes it, so the lock is released on the descriptor before it is closed. Measured beside four
+// goroutines spawning children: a close alone left 116-126 of 300 ledgers locked, and waiting on
+// ForkLock after it 35-47, because a vforked child wakes its parent before its exec closes the copy.
 func closeLedger(t *testing.T, led *ledger) {
 	t.Helper()
+
+	if err := syscall.Flock(int(led.file.Fd()), syscall.LOCK_UN); err != nil {
+		t.Errorf("unlock ledger: %v", err)
+	}
 
 	if err := led.close(); err != nil {
 		t.Errorf("close ledger: %v", err)
