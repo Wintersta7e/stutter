@@ -1,11 +1,38 @@
 package harness
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 )
+
+// TestAShortPendingCountIsReadAgainUntilItCatchesUp: the bus counts a message against its consumers
+// after it has acknowledged the publish, so a count read straight after Fill can be short and catch up
+// a moment later. A count that never catches up is returned as it stands once the wait ends.
+func TestAShortPendingCountIsReadAgainUntilItCatchesUp(t *testing.T) {
+	t.Parallel()
+
+	rising, reads := []int{1, 2, 3}, 0
+
+	got, err := caughtUp(t.Context(), 0, 3, func(context.Context) (int, error) {
+		reads++
+
+		return rising[min(reads, len(rising))-1], nil
+	})
+	if err != nil || got != 3 {
+		t.Errorf("caughtUp() = %d, %v after %d reads, want 3 once the count caught up", got, err, reads)
+	}
+
+	ended, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+
+	got, err = caughtUp(ended, 2, 3, func(context.Context) (int, error) { return 2, nil })
+	if err != nil || got != 2 {
+		t.Errorf("caughtUp() = %d, %v, want the short count 2 once the wait ended", got, err)
+	}
+}
 
 // TestTheHoldBoundTakesItsLowestTerm: the hold is a tenth of the shortest timer that would redeliver
 // or lose a message, raised to the floor a loaded machine's scheduling needs but never past half that
