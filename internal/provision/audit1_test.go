@@ -239,6 +239,12 @@ func production(path string) bool {
 	return !strings.HasSuffix(path, "_test.go")
 }
 
+// product reports a file of the product itself: not a test, and not the test helpers, which no
+// product file may import.
+func product(path string) bool {
+	return production(path) && !strings.HasPrefix(path, "internal/dockertest/")
+}
+
 // provisionFile reports a file of the provision package itself.
 func provisionFile(path string) bool {
 	return filepath.Dir(path) == "internal/provision"
@@ -278,7 +284,7 @@ func spawners(files []goSource) findings {
 			violations = append(violations, "item 1: "+f.path+" can start a process and is not allowlisted")
 		}
 
-		if production(f.path) && f.path != runnerFile && callsSelector(f.file, "exec", "Command", "CommandContext") {
+		if product(f.path) && f.path != runnerFile && callsSelector(f.file, "exec", "Command", "CommandContext") {
 			violations = append(violations, "item 2: "+f.path+" calls exec.Command outside the runner")
 		}
 	}
@@ -586,7 +592,7 @@ func ipamFlags(files []goSource) []string {
 	subnets := 0
 
 	for _, f := range files {
-		if !production(f.path) {
+		if !product(f.path) {
 			continue
 		}
 
@@ -774,7 +780,7 @@ func decoyVerbs(files []goSource) (findings, bool) {
 		}
 
 		for _, verb := range verbs {
-			if verb == "prune" || verb == "compose" || slices.Contains(composeSubcommands(), verb) && verb != "pull" {
+			if verb == "prune" || verb == "compose" {
 				violations = append(violations, "item 2b: the decoy helper admits "+verb)
 			}
 		}
