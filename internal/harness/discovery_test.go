@@ -1058,3 +1058,42 @@ func TestAStartIsAddedOnlyForADurableLessName(t *testing.T) {
 		})
 	}
 }
+
+// TestAnExcludedConsumerCostsNoStart: a consumer that can never be a target is never looked for by
+// name, so its having no durable name costs no second start.
+func TestAnExcludedConsumerCostsNoStart(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, conn *nats.Conn, at harness.Addresses) int {
+		ordered, err := js.OrderedConsumer(ctx, "ORDERS", jetstream.OrderedConsumerConfig{})
+		if err != nil {
+			return 2
+		}
+
+		consuming, err := ordered.Consume(func(jetstream.Msg) {})
+		if err != nil {
+			return 2
+		}
+
+		defer consuming.Stop()
+
+		return idleAfter(reserve)(ctx, js, conn, at)
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	t.Logf("starts: %d", service.starts.Load())
+
+	if len(found.Consumers) != 2 {
+		t.Fatalf("consumers = %q, want the ordered one beside reserve", names(found.Consumers))
+	}
+
+	if got := service.starts.Load(); got != 1 {
+		t.Errorf("starts: %d, want 1", got)
+	}
+}
