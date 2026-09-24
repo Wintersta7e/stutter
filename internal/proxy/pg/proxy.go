@@ -35,15 +35,9 @@ const (
 	lengthWidth = 4
 	// typedHeaderSize is one type byte followed by the length field.
 	typedHeaderSize = lengthWidth + 1
+	// encryptionRefused is Postgres' one-byte answer declining an encryption request.
+	encryptionRefused = 'N'
 )
-
-// errEncrypted means the client negotiated TLS, leaving nothing for the proxy to read.
-//
-// Failing here is deliberate. A silently unparsed connection would report a handler as having no
-// side effects at all, which reads as "idempotent" — the most dangerous wrong answer this tool can
-// give.
-var errEncrypted = errors.New("client negotiated TLS with the database; " +
-	"effects cannot be observed — disable TLS on the sandbox connection")
 
 // Sink receives the effects the proxy observes, and what the database made of each.
 type Sink interface {
@@ -177,15 +171,8 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 		id:          p.sessions.Add(1),
 	}
 
+	// A connection that ends inside the negotiation carried no statement; nothing is recorded.
 	if err := current.negotiate(); err != nil {
-		if errors.Is(err, errEncrypted) {
-			p.sink.Record(effect.Observation{
-				Raw:       errEncrypted.Error(),
-				Printable: errEncrypted.Error(),
-				Kind:      effect.KindPostgres,
-			})
-		}
-
 		return
 	}
 
@@ -212,32 +199,29 @@ type session struct {
 	mu     sync.Mutex
 }
 
-// negotiate forwards the untyped startup exchange that precedes the typed message stream.
+// negotiate settles the untyped exchange that precedes the typed message stream.
 //
-// The single-byte reply to an SSL or GSSAPI request is read here rather than by the backend pump,
-// because that pump must not start until the stream shape is settled.
+// An SSL or GSSAPI encryption request is answered N by the proxy itself and never forwarded: a
+// database that accepted one would turn the session into TLS the proxy cannot read, and a default
+// client asks whether or not it needs encryption. The first other untyped message is the startup
+// message; it goes to the database, and the typed stream follows it.
 func (s *session) negotiate() error {
 	for {
-		body, err := s.forwardUntyped()
+		message, err := readUntyped(s.client)
 		if err != nil {
 			return err
 		}
 
-		if !isEncryptionRequest(body) {
+		if !isEncryptionRequest(message[lengthWidth:]) {
+			if _, err := s.upstream.Write(message); err != nil {
+				return fmt.Errorf("forward startup message: %w", err)
+			}
+
 			return nil
 		}
 
-		reply := make([]byte, 1)
-		if _, readErr := io.ReadFull(s.upstream, reply); readErr != nil {
-			return fmt.Errorf("read encryption reply: %w", readErr)
-		}
-
-		if _, writeErr := s.client.Write(reply); writeErr != nil {
-			return fmt.Errorf("forward encryption reply: %w", writeErr)
-		}
-
-		if reply[0] == 'S' {
-			return errEncrypted
+		if _, err := s.client.Write([]byte{encryptionRefused}); err != nil {
+			return fmt.Errorf("refuse encryption: %w", err)
 		}
 	}
 }
@@ -419,9 +403,11 @@ func isRead(sql string) bool {
 	}
 }
 
-func (s *session) forwardUntyped() ([]byte, error) {
+// readUntyped reads one untyped message from the client — its length word, then its body — and returns
+// it whole.
+func readUntyped(from io.Reader) ([]byte, error) {
 	header := make([]byte, lengthWidth)
-	if _, err := io.ReadFull(s.client, header); err != nil {
+	if _, err := io.ReadFull(from, header); err != nil {
 		return nil, fmt.Errorf("read startup header: %w", err)
 	}
 
@@ -430,20 +416,14 @@ func (s *session) forwardUntyped() ([]byte, error) {
 		return nil, fmt.Errorf("startup message length %d out of range: %w", length, io.ErrUnexpectedEOF)
 	}
 
-	body := make([]byte, length-lengthWidth)
-	if _, err := io.ReadFull(s.client, body); err != nil {
+	message := make([]byte, length)
+	copy(message, header)
+
+	if _, err := io.ReadFull(from, message[lengthWidth:]); err != nil {
 		return nil, fmt.Errorf("read startup body: %w", err)
 	}
 
-	out := make([]byte, 0, lengthWidth+len(body))
-	out = append(out, header...)
-	out = append(out, body...)
-
-	if _, err := s.upstream.Write(out); err != nil {
-		return nil, fmt.Errorf("forward startup message: %w", err)
-	}
-
-	return body, nil
+	return message, nil
 }
 
 func readTyped(from io.Reader) (byte, []byte, error) {
