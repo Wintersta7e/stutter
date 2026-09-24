@@ -19,6 +19,14 @@ import (
 // rather than a likelihood.
 const freshRestarts = 3
 
+// The server's layout inside a store: <store>/jetstream/<account>/streams/<stream>, and the directory a
+// purge moves a stream's messages into while it removes them.
+const (
+	jetStreamDir = "jetstream"
+	streamsDir   = "streams"
+	purgedDir    = "__msgs__"
+)
+
 var (
 	// ErrCheckpoint means the bus could not be checkpointed or restored: copying the store or
 	// restarting the server failed. It is a flake of the machine, never a verdict on the service.
@@ -69,6 +77,10 @@ func (c *Corpus) Checkpoint(ctx context.Context, dir string) (Checkpoint, error)
 	}
 
 	err := c.restart(ctx, func() error {
+		if err := finishDeletions(c.dir); err != nil {
+			return err
+		}
+
 		if err := os.Mkdir(dir, storeMode); err != nil {
 			return fmt.Errorf("create the checkpoint directory: %w", err)
 		}
@@ -114,6 +126,83 @@ func (c *Corpus) Restore(ctx context.Context, checkpoint Checkpoint) error {
 
 		return nil
 	})
+}
+
+// finishDeletions removes what the stopped server was still deleting in store.
+//
+// The server answers a stream deletion before the files are gone: it renames the stream's directory
+// with a "." prefix, which no stream name can carry, and removes it in the background. A purge does the
+// same with the stream's __msgs__ directory. Shutting down waits for neither, so a copy made straight
+// after either fails on a file that vanished mid-copy, or keeps a half-removed stream in the checkpoint.
+// Both are what the server itself deletes at its next start.
+func finishDeletions(store string) error {
+	return eachStreamsDir(store, finishStreamDeletions)
+}
+
+// removeStream deletes a stream from a stopped server's store, and finishes whatever the server was
+// still deleting there.
+func removeStream(store, name string) error {
+	return eachStreamsDir(store, func(streams string) error {
+		if err := os.RemoveAll(filepath.Join(streams, name)); err != nil {
+			return fmt.Errorf("remove stream %s: %w", name, err)
+		}
+
+		return finishStreamDeletions(streams)
+	})
+}
+
+// eachStreamsDir calls visit with the streams directory of every account in store.
+func eachStreamsDir(store string, visit func(streams string) error) error {
+	accounts, err := os.ReadDir(filepath.Join(store, jetStreamDir))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("list the bus store: %w", err)
+	}
+
+	for _, account := range accounts {
+		if !account.IsDir() {
+			continue
+		}
+
+		if err := visit(filepath.Join(store, jetStreamDir, account.Name(), streamsDir)); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// finishStreamDeletions removes the deleted streams and purged messages in one account's streams
+// directory.
+func finishStreamDeletions(streams string) error {
+	entries, err := os.ReadDir(streams)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+
+	if err != nil {
+		return fmt.Errorf("list the streams in the bus store: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		removing := filepath.Join(streams, entry.Name(), purgedDir)
+		if strings.HasPrefix(entry.Name(), ".") {
+			removing = filepath.Join(streams, entry.Name())
+		}
+
+		if err := os.RemoveAll(removing); err != nil {
+			return fmt.Errorf("finish removing %s: %w", removing, err)
+		}
+	}
+
+	return nil
 }
 
 // checkpointDir refuses a checkpoint directory that exists, whose parent does not, or that lies

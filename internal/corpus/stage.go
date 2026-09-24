@@ -154,7 +154,14 @@ func (c *Corpus) Clear(ctx context.Context) error {
 		return errClearAfterCheckpoint
 	}
 
-	if err := c.stream.DeleteStream(ctx, c.topic.Stream); err != nil {
+	if _, err := c.stream.Stream(ctx, c.topic.Stream); err != nil {
+		return fmt.Errorf("delete the corpus stream: %w", err)
+	}
+
+	// Deleted with the server stopped, not through it. The server answers a delete before it is done:
+	// goroutines of its own go on removing the stream's files and then its account's emptied
+	// directories, and a create that meets them fails with "error creating store for stream".
+	if err := c.restart(ctx, func() error { return removeStream(c.dir, c.topic.Stream) }); err != nil {
 		return fmt.Errorf("delete the corpus stream: %w", err)
 	}
 

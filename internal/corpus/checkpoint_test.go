@@ -114,6 +114,46 @@ func TestEveryRestartServesAFreshPort(t *testing.T) {
 	}
 }
 
+// TestACheckpointHoldsNothingTheBusWasStillDeleting: the bus answers a stream deletion or a purge
+// before the files are gone and removes them in the background, which shutting it down does not wait
+// for. A checkpoint copied meanwhile fails on a file that vanished mid-copy, or keeps what was being
+// removed.
+func TestACheckpointHoldsNothingTheBusWasStillDeleting(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := startIn(t, root)
+
+	// What a deleted stream and a purged one leave behind while their removal is still under way.
+	streams := filepath.Join("jetstream", "$G", "streams")
+	deleting := []string{
+		filepath.Join(streams, ".GONE"),
+		filepath.Join(streams, corpus.StreamName, "__msgs__"),
+	}
+
+	for _, dir := range deleting {
+		planted := filepath.Join(store.StoreDir(), dir, "msgs")
+		if err := os.MkdirAll(planted, 0o700); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+
+		if err := os.WriteFile(filepath.Join(planted, "1.blk"), []byte("removed"), 0o600); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
+	}
+
+	checkpoint, err := store.Checkpoint(t.Context(), filepath.Join(root, "B0"))
+	if err != nil {
+		t.Fatalf("Checkpoint() error = %v", err)
+	}
+
+	for _, dir := range deleting {
+		if _, statErr := os.Lstat(filepath.Join(checkpoint.Dir(), dir)); !errors.Is(statErr, fs.ErrNotExist) {
+			t.Errorf("the checkpoint holds %s, which the bus was deleting (Lstat error = %v)", dir, statErr)
+		}
+	}
+}
+
 // TestACheckpointRefusesMemoryStorage: a memory-storage stream or consumer does not survive the
 // restart, so a restore would silently drop it; the checkpoint is refused by name instead, and the
 // server is never stopped.
