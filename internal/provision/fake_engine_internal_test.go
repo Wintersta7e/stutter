@@ -162,7 +162,10 @@ func (f *fakeEngine) answer(v verb, spec verbSpec, rest []string) (result, error
 		verbVersion:       func() (result, error) { return result{out: []byte(healthyVersion)}, nil },
 		verbNetworkCreate: func() (result, error) { return f.createNetwork(spec, rest) },
 		verbVolumeCreate:  func() (result, error) { return f.createVolume(rest) },
-		verbNetworkList:   func() (result, error) { return f.list(ResourceNetwork, rest[1:]) },
+		verbNetworkList:   func() (result, error) { return f.list(ResourceNetwork, rest) },
+		verbContainerList: func() (result, error) { return f.list(ResourceContainer, rest) },
+		verbVolumeList:    func() (result, error) { return f.list(ResourceVolume, rest) },
+		verbImageList:     func() (result, error) { return f.list(ResourceImage, rest) },
 	}
 
 	if answer, ok := answers[v]; ok {
@@ -246,18 +249,40 @@ func (f *fakeEngine) createVolume(rest []string) (result, error) {
 	return result{out: []byte(obj.name + "\n")}, nil
 }
 
+// list answers a listing: IDs for the ID template, else one JSON line per object in the shape the
+// listing templates build; `--filter label=key[=value]` is honoured.
 func (f *fakeEngine) list(typ ResourceType, rest []string) (result, error) {
 	var out strings.Builder
 
 	for _, obj := range f.objects[typ] {
-		if len(rest) == 2 && rest[0] == "--filter" {
-			key, value, hasValue := strings.Cut(strings.TrimPrefix(rest[1], "label="), "=")
+		if len(rest) == 3 && rest[1] == "--filter" {
+			key, value, hasValue := strings.Cut(strings.TrimPrefix(rest[2], "label="), "=")
 			if got, ok := obj.labels[key]; !ok || hasValue && got != value {
 				continue
 			}
 		}
 
-		out.WriteString(obj.id + "\n")
+		if rest[0] == idTemplate {
+			out.WriteString(obj.id + "\n")
+
+			continue
+		}
+
+		line := map[string]string{
+			"id": obj.id, "name": obj.name, "check": obj.labels[rules.LabelCheck], "kind": obj.labels[rules.LabelKind],
+		}
+
+		if typ == ResourceImage {
+			repo, tag, _ := strings.Cut(obj.tags[0], ":")
+			line = map[string]string{"id": obj.id, "name": repo, "tag": tag}
+		}
+
+		encoded, err := json.Marshal(line)
+		if err != nil {
+			return result{}, err
+		}
+
+		out.Write(append(encoded, '\n'))
 	}
 
 	return result{out: []byte(out.String())}, nil
@@ -344,9 +369,23 @@ func openFakeEngine(t *testing.T) (*Engine, *fakeEngine) {
 
 	fake := newFakeEngine()
 
-	engine, err := openWith(t.Context(), Options{StateDir: t.TempDir() + "/state", TempDir: t.TempDir()}, openDeps{
+	return openFakeEngineWith(t, t.TempDir()+"/state", fake), fake
+}
+
+// openFakeEngineWith opens an Engine over fake with its ledger in state, sweeping what is there.
+func openFakeEngineWith(t *testing.T, state string, fake *fakeEngine) *Engine {
+	t.Helper()
+
+	return openFakeEngineHost(t, state, fake, defaultHostFS())
+}
+
+// openFakeEngineHost is openFakeEngineWith on a host the test stands in for.
+func openFakeEngineHost(t *testing.T, state string, fake *fakeEngine, host hostFS) *Engine {
+	t.Helper()
+
+	engine, err := openWith(t.Context(), Options{StateDir: state, TempDir: t.TempDir()}, openDeps{
 		admit: func(context.Context) (Identity, engineCaller, error) { return testIdentity(), fake, nil },
-		host:  defaultHostFS(),
+		host:  host,
 	})
 	if err != nil {
 		t.Fatalf("open: %v", err)
@@ -363,7 +402,7 @@ func openFakeEngine(t *testing.T) (*Engine, *fakeEngine) {
 		}
 	})
 
-	return engine, fake
+	return engine
 }
 
 // ourLabels is the label set this engine gives a resource of kind.

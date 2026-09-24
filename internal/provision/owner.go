@@ -343,7 +343,7 @@ func removalOf(typ ResourceType) (removal, bool) {
 	case ResourceImage:
 		return removal{template: imageIDTemplate, inspect: verbImageInspect, remove: verbImageRemove, byName: true},
 			true
-	case ResourceHostPath:
+	case ResourceHostPath, ResourceAnonymousVolume:
 		return removal{}, false
 	}
 

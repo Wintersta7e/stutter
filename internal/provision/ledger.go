@@ -2,6 +2,7 @@ package provision
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
@@ -132,23 +134,22 @@ func (e entry) valid() bool {
 		return true
 	}
 
-	switch e.Type {
-	case ResourceContainer, ResourceNetwork, ResourceVolume, ResourceImage, ResourceHostPath:
-		return e.Seq > 0
-	default:
-		return false
-	}
+	// An anonymous volume is recorded as a volume with a parent; its listing type never appears here.
+	recorded := []ResourceType{ResourceContainer, ResourceNetwork, ResourceVolume, ResourceImage, ResourceHostPath}
+
+	return e.Seq > 0 && slices.Contains(recorded, e.Type)
 }
 
 // hostFS is the host-filesystem and process facts the ledger relies on, as fields so tests can
 // stand in for the filesystem type and the lock.
 type hostFS struct {
-	statfs  func(path string) (int64, error)
-	tryLock func(file *os.File) (bool, error)
-	sync    func(file *os.File) error
-	lstat   func(path string) (fs.FileInfo, error)
-	owner   func(info fs.FileInfo) (int, bool)
-	euid    int
+	statfs    func(path string) (int64, error)
+	tryLock   func(file *os.File) (bool, error)
+	sync      func(file *os.File) error
+	lstat     func(path string) (fs.FileInfo, error)
+	owner     func(info fs.FileInfo) (int, bool)
+	startTime func(pid int) (uint64, error)
+	euid      int
 }
 
 // remoteFilesystems are the filesystem types whose modes and locks cannot be trusted: 9p reports
@@ -232,11 +233,12 @@ func stateDir(given string, env []string, host hostFS) (string, error) {
 
 // ledger is a check's own ledger file, locked for the life of the process.
 type ledger struct {
-	file *os.File
-	host hostFS
-	path string
-	mu   sync.Mutex
-	seq  int
+	file   *os.File
+	host   hostFS
+	path   string
+	header header
+	mu     sync.Mutex
+	seq    int
 }
 
 // createLedger writes the check's ledger into dir: as a temporary file, locked, its header synced,
@@ -255,7 +257,7 @@ func createLedger(dir string, host hostFS, hdr header) (*ledger, error) {
 		return nil, fmt.Errorf("%w: create the ledger for check %s: %w", ErrStateDir, hdr.Check, err)
 	}
 
-	led := &ledger{file: file, host: host, path: temp}
+	led := &ledger{file: file, host: host, path: temp, header: hdr}
 
 	if err := led.place(hdr, final); err != nil {
 		// Removed before the lock is released, wherever the failure left it.
@@ -317,9 +319,12 @@ func fillHost(hdr *header) error {
 		return err
 	}
 
-	hdr.Format, hdr.Host, hdr.BootID, hdr.PIDNS = ledgerFormat, host, boot, namespace
-	hdr.PID, hdr.StartTime, hdr.Build = os.Getpid(), start, version.String()
-	hdr.Started = time.Now().UTC().Format(time.RFC3339)
+	// A fact already set is kept: tests write another owner's ledger through this same writer.
+	hdr.Format = ledgerFormat
+	hdr.Host, hdr.BootID, hdr.PIDNS = cmp.Or(hdr.Host, host), cmp.Or(hdr.BootID, boot), cmp.Or(hdr.PIDNS, namespace)
+	hdr.PID, hdr.StartTime = cmp.Or(hdr.PID, os.Getpid()), cmp.Or(hdr.StartTime, start)
+	hdr.Build = cmp.Or(hdr.Build, version.String())
+	hdr.Started = cmp.Or(hdr.Started, time.Now().UTC().Format(time.RFC3339))
 
 	return nil
 }
@@ -485,6 +490,76 @@ func (b *book) children(parent int) []record {
 	}
 
 	return out
+}
+
+// all returns copies of every record, oldest first.
+func (b *book) all() []record {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	out := make([]record, 0, len(b.order))
+	for _, seq := range b.order {
+		out = append(out, *b.records[seq])
+	}
+
+	return out
+}
+
+// newestFirst returns copies of the records of one type, in reverse creation order.
+func (b *book) newestFirst(typ ResourceType) []record {
+	var out []record
+
+	for _, rec := range b.all() {
+		if rec.typ == typ {
+			out = append(out, rec)
+		}
+	}
+
+	slices.Reverse(out)
+
+	return out
+}
+
+// engineDone reports whether nothing the ledger names is left on the engine: every engine record
+// removed, or absent — and an absent counts only once a later sweep confirmed it (confirmed holds
+// the seqs already absent before this one). A nil confirmed accepts every absent.
+func (b *book) engineDone(confirmed map[int]bool) bool {
+	for _, rec := range b.all() {
+		switch {
+		case rec.typ == ResourceHostPath, rec.state == opRemoved:
+		case rec.state == opAbsent && (confirmed == nil || confirmed[rec.seq]):
+		default:
+			return false
+		}
+	}
+
+	return true
+}
+
+// noteOnce appends a check-wide op unless the ledger already carries it.
+func (b *book) noteOnce(o op) error {
+	b.mu.Lock()
+	present := o == opKept && b.kept || o == opRetained && b.retained
+	b.mu.Unlock()
+
+	if present {
+		return nil
+	}
+
+	return b.note(entry{Op: o})
+}
+
+// hostPathGone records the host path at path removed, when the ledger names it.
+func (b *book) hostPathGone(path string) error {
+	for _, rec := range b.all() {
+		if rec.typ == ResourceHostPath && rec.name == path && rec.state != opRemoved {
+			if err := b.note(entry{Seq: rec.seq, Op: opRemoved, Type: ResourceHostPath}); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }
 
 // knows reports whether any record holds id.

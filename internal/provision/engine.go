@@ -42,10 +42,11 @@ type Engine struct {
 	book       *book
 	interfaces func() ([]localAddr, error)
 	log        *invLog
-	host       hostFS
 	identity   Identity
 	id         string
 	private    string
+	host       hostFS
+	swept      SweepResult
 	privateSeq int
 	mu         sync.Mutex
 	keep       bool
@@ -109,6 +110,8 @@ func openWith(ctx context.Context, opts Options, deps openDeps) (*Engine, error)
 	if err := e.prepare(); err != nil {
 		return nil, errors.Join(err, e.discard())
 	}
+
+	e.swept = e.sweepAll(ctx)
 
 	return e, nil
 }

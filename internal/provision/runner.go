@@ -38,6 +38,9 @@ const (
 	verbNetworkRemove
 	verbVolumeRemove
 	verbImageRemove
+	verbContainerList
+	verbVolumeList
+	verbImageList
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -192,6 +195,18 @@ func verbs() [verbCount]verbSpec {
 		verbImageRemove: {
 			name: "imageRemove", program: programDocker, prefix: []string{"rmi", "--no-prune"},
 			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbContainerList: {
+			name: "containerList", program: programDocker, prefix: []string{"ps", "-a", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbVolumeList: {
+			name: "volumeList", program: programDocker, prefix: []string{"volume", "ls", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbImageList: {
+			name: "imageList", program: programDocker, prefix: []string{"images", "--no-trunc", "--format"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
 		},
 	}
 }
