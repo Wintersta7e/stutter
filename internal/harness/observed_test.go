@@ -59,8 +59,10 @@ type pulling struct {
 	// seeded is the job-seeded bucket the handler writes to, under the seededKey quirk.
 	seeded jetstream.KeyValue
 	// stream is the service's JetStream context, and side its consumer on its own stream.
-	stream  jetstream.JetStream
-	side    jetstream.Consumer
+	stream jetstream.JetStream
+	side   jetstream.Consumer
+	// keys are the idempotency keys the handler has seen, under the headerGuard quirk.
+	keys    map[string]bool
 	done    chan struct{}
 	stopped chan struct{}
 	quirks  quirks
@@ -74,6 +76,8 @@ type quirks struct {
 	seen *startups
 	// filter is the one subject the service's consumer admits. Empty admits the whole stream.
 	filter string
+	// stream is the stream the service consumes from. Empty is the corpus stream's default name.
+	stream string
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
 	// Zero never does.
 	nakFor time.Duration
@@ -114,7 +118,13 @@ type quirks struct {
 	// conflictingStream makes the service try, at startup, to create the corpus stream over other
 	// subjects — which the bus refuses — and carry on.
 	conflictingStream bool
+	// headerGuard makes the handler skip a message whose Idempotency-Key header it has already seen.
+	// A message without the header is never skipped.
+	headerGuard bool
 }
+
+// idempotencyKey is the header a header-keyed dedupe guard reads.
+const idempotencyKey = "Idempotency-Key"
 
 // The service's own stream, under the sideStream quirk.
 const (
@@ -283,7 +293,12 @@ func startPulling(
 		name = ""
 	}
 
-	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
+	consumes := corpus.StreamName
+	if behaviour.stream != "" {
+		consumes = behaviour.stream
+	}
+
+	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, consumes, jetstream.ConsumerConfig{
 		Name:          name,
 		FilterSubject: behaviour.filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
@@ -469,6 +484,7 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 		if json.Unmarshal(msg.Data(), &note) != nil || (p.quirks.echoWrites && p.call("ECHO "+note.EchoOf) != nil) {
 			settle = msg.Nak
 		}
+	case p.seenKey(msg):
 	case !p.quirks.idempotent || firstDelivery(msg):
 		if err := p.reserve(msg.Data()); err != nil {
 			settle = msg.Nak
@@ -500,6 +516,28 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+}
+
+// seenKey reports whether the header guard has already handled this message's idempotency key, and
+// remembers the key. A message without one is never a repeat: the guard has nothing to key on.
+func (p *pulling) seenKey(msg jetstream.Msg) bool {
+	if !p.quirks.headerGuard {
+		return false
+	}
+
+	key := msg.Headers().Get(idempotencyKey)
+	if key == "" {
+		return false
+	}
+
+	if p.keys == nil {
+		p.keys = make(map[string]bool)
+	}
+
+	seen := p.keys[key]
+	p.keys[key] = true
+
+	return seen
 }
 
 // noteAside publishes a note into the service's own stream and takes it straight back off it: bus work
