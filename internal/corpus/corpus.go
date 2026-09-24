@@ -1,6 +1,7 @@
 // Package corpus stores recorded messages as a JetStream stream inside an embedded NATS server.
 //
-// The corpus is a stream rather than a file format so that replay uses real JetStream consumers
+// A corpus is handed over as a directory of files (LoadDir), but it is replayed from a stream rather
+// than from those files, so that replay uses real JetStream consumers
 // with real acknowledgement semantics: a duplicate is an actual server redelivery, a withheld ack
 // is an actual Nak, and the ack window is an actual AckWait. The delivery semantics under test are
 // the bus's own rather than Stutter's model of them, which is the whole reason the dependency is
