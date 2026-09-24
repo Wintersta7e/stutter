@@ -206,7 +206,8 @@ func ListenTLS(
 	certificate tls.Certificate,
 ) (*Proxy, error) {
 	return bind(ctx, addr, logicalHost, sink, script, &tls.Config{
-		Certificates: []tls.Certificate{certificate},
+		Certificates:       []tls.Certificate{certificate},
+		GetConfigForClient: recordServerName,
 		// HTTP/1.1 is all the stub serves. Agreeing on it in the handshake makes an h2-only client
 		// fail there, loudly, instead of connecting and hanging up unseen.
 		NextProtos: []string{"http/1.1"},
@@ -300,12 +301,7 @@ func (l tunnelListener) Accept() (net.Conn, error) {
 		return nil, fmt.Errorf("accept HTTPS connection: %w", err)
 	}
 
-	tunnel := &tunnel{proxy: l.proxy}
-	config := l.config.Clone()
-	config.GetConfigForClient = tunnel.hello
-	tunnel.Conn = tls.Server(connection, config)
-
-	return tunnel, nil
+	return &tunnel{Conn: tls.Server(connection, l.config), proxy: l.proxy}, nil
 }
 
 // tunnel is one TLS connection to the stub. net/http completes its handshake through
@@ -322,7 +318,7 @@ type tunnel struct {
 // HandshakeContext stops the run on a failed handshake, naming the server name the client asked
 // for. The error goes back to net/http unchanged, so its answer to a cleartext client is too.
 func (t *tunnel) HandshakeContext(ctx context.Context) error {
-	err := t.Conn.HandshakeContext(ctx)
+	err := t.Conn.HandshakeContext(context.WithValue(ctx, tunnelKey{}, t))
 	if err != nil {
 		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, err)))
 	}
@@ -348,20 +344,27 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-// hello records the server name the client asked for. It is taken from the ClientHello because a
-// handshake that fails on ALPN never stores it on the connection.
-func (t *tunnel) hello(info *tls.ClientHelloInfo) (*tls.Config, error) {
-	t.serverName = info.ServerName
-
-	return nil, nil //nolint:nilnil // A nil config keeps the listener's own, as crypto/tls documents.
-}
-
 func (t *tunnel) named(err error) error {
 	if t.serverName == "" {
 		return fmt.Errorf("TLS connection without SNI: %w", err)
 	}
 
 	return fmt.Errorf("TLS connection for %q: %w", t.serverName, err)
+}
+
+// tunnelKey carries a tunnel through its own handshake, so the one TLS config every connection
+// shares can tell which tunnel a ClientHello belongs to. A config per connection would give each its
+// own session ticket keys, and no client could resume a session.
+type tunnelKey struct{}
+
+// recordServerName hands each tunnel the server name its client asked for. It runs on the
+// ClientHello, before ALPN can fail the handshake, which is the only point every stop can name it.
+func recordServerName(hello *tls.ClientHelloInfo) (*tls.Config, error) {
+	if current, ok := hello.Context().Value(tunnelKey{}).(*tunnel); ok {
+		current.serverName = hello.ServerName
+	}
+
+	return nil, nil //nolint:nilnil // A nil config keeps the listener's own, as crypto/tls documents.
 }
 
 type replayConn struct {
