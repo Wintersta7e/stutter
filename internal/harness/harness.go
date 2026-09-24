@@ -15,7 +15,6 @@ package harness
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
@@ -75,11 +74,14 @@ type Addresses struct {
 	Postgres string
 	// NATS is the bus URL.
 	NATS string
-	// HTTP is the base URL of the HTTP stub.
+	// HTTP is the base URL of the HTTP stub's cleartext entry, always http://.
 	HTTP string
-	// HTTPCACert is the PEM-encoded certificate authority the HTTP stub's certificate was signed
-	// with, and is empty unless the stub is serving TLS. A service that does not trust it cannot
-	// reach the stub at all, which reads as a handler that produced no effects.
+	// HTTPS is the base URL of the HTTP stub's TLS entry. It presents, for every server name a client
+	// asks for, a leaf signed by HTTPCACert.
+	HTTPS string
+	// HTTPCACert is the PEM-encoded certificate authority the stub's TLS entry presents leaves from. A
+	// service that does not trust it cannot reach the stub over TLS at all, which reads as a handler
+	// that produced no effects.
 	HTTPCACert []byte
 }
 
@@ -154,9 +156,6 @@ type Config struct {
 	// Startup is how long a service that consumes for itself may take to create a consumer on the
 	// corpus stream before the corpus is published regardless. Zero uses DefaultStartup.
 	Startup time.Duration
-	// HTTPTLS serves the stub over TLS instead of cleartext, for a service that will not talk to a
-	// dependency any other way. Addresses.HTTPCACert is then what the service must trust.
-	HTTPTLS bool
 }
 
 // Sandbox provisions one service under test. It satisfies the interface a check drives.
@@ -164,8 +163,8 @@ type Config struct {
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type Sandbox struct {
 	httpScript *httpproxy.Script
-	// certificates is nil unless the stub serves TLS. It is minted once per sandbox, so every run in
-	// a comparison presents the same leaf for a name.
+	// certificates is the authority the stub's TLS entry presents leaves from: minted once per sandbox,
+	// or the listener set's, so every run in a comparison presents the same leaf for a name.
 	certificates *authority
 	// checkpoint is the sandbox's own starting point, taken at the first observed run when the
 	// configuration supplies no Baseline.
@@ -209,15 +208,9 @@ func New(cfg Config) (*Sandbox, error) {
 		cfg.HTTPHost = defaultHTTPHost
 	}
 
-	var certificates *authority
-
-	if cfg.HTTPTLS {
-		minted, mintErr := newAuthority(cfg.HTTPHost, cfg.AdvertiseHost)
-		if mintErr != nil {
-			return nil, mintErr
-		}
-
-		certificates = minted
+	certificates, err := newAuthority(cfg.HTTPHost, cfg.AdvertiseHost)
+	if err != nil {
+		return nil, err
 	}
 
 	return &Sandbox{
@@ -344,7 +337,9 @@ func (s *Sandbox) runDriven(
 	}
 
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
-	// holding an idle connection open would make teardown hang rather than fail.
+	// holding an idle connection open would make teardown hang rather than fail. The teardown point is
+	// marked first: a connection the service closes as it goes away hid nothing.
+	observed.markTeardown()
 	service.Close(ctx)
 
 	if err := observed.settle(ctx, runErr); err != nil {
@@ -387,7 +382,9 @@ func (s *Sandbox) advertise(addr string) string {
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type egress struct {
 	httpRun *httpproxy.Run
-	served  chan error
+	// stub is the run's HTTP stub; nil until it is built.
+	stub   *httpproxy.Proxy
+	served chan error
 	// attached is the start's hold on the invocation listeners; nil on the Go-caller path.
 	attached *attachment
 	at       Addresses
@@ -425,6 +422,14 @@ func (e *egress) start(
 
 		e.served <- err
 	}()
+}
+
+// markTeardown marks the teardown point on the run's stub: the service under test is about to be
+// removed.
+func (e *egress) markTeardown() {
+	if e.stub != nil {
+		e.stub.MarkTeardown()
+	}
 }
 
 // settle tears the proxies down and decides the run's fate.
@@ -569,6 +574,8 @@ func (s *Sandbox) observeDatabase(ctx context.Context, sink *effect.Recorder, ob
 	return nil
 }
 
+// observeHTTP stands the run's HTTP stub in front of every external host: a cleartext entry and a TLS
+// entry, each on a listener of its own, recording into one sink and replying from one script.
 func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observed *egress) error {
 	httpRun, err := s.httpScript.Begin()
 	if err != nil {
@@ -577,47 +584,32 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 
 	observed.httpRun = httpRun
 
-	proxy, err := s.listenStub(ctx, sink)
+	var config net.ListenConfig
+
+	cleartext, err := config.Listen(ctx, "tcp", s.bind())
 	if err != nil {
-		return fmt.Errorf("listen for HTTP egress: %w", err)
+		return fmt.Errorf("bind the HTTP stub: %w", err)
 	}
 
-	observed.start(ctx, KeyHTTP, proxy.CloseContext, proxy.Serve)
-
-	if s.certificates == nil {
-		observed.at.HTTP = "http://" + s.advertise(proxy.Addr())
-
-		return nil
+	secure, err := config.Listen(ctx, "tcp", s.bind())
+	if err != nil {
+		return errors.Join(fmt.Errorf("bind the HTTPS stub: %w", err), cleartext.Close())
 	}
 
-	observed.at.HTTP = "https://" + s.advertise(proxy.Addr())
+	entries := httpproxy.Entries{Cleartext: cleartext, TLS: secure}
+
+	stub, err := httpproxy.New(entries, s.cfg.HTTPHost, sink, s.httpScript, s.certificates.certificate)
+	if err != nil {
+		return errors.Join(fmt.Errorf("build the HTTP stub: %w", err), cleartext.Close(), secure.Close())
+	}
+
+	observed.stub = stub
+	observed.start(ctx, KeyHTTP, stub.CloseContext, stub.Serve)
+	observed.at.HTTP = "http://" + s.advertise(cleartext.Addr().String())
+	observed.at.HTTPS = "https://" + s.advertise(secure.Addr().String())
 	observed.at.HTTPCACert = s.certificates.pem
 
 	return nil
-}
-
-func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpproxy.Proxy, error) {
-	var config net.ListenConfig
-
-	listener, err := config.Listen(ctx, "tcp", s.bind())
-	if err != nil {
-		return nil, fmt.Errorf("bind the HTTP stub: %w", err)
-	}
-
-	entries := httpproxy.Entries{Cleartext: listener}
-
-	var certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
-
-	if s.certificates != nil {
-		entries, certificate = httpproxy.Entries{TLS: listener}, s.certificates.certificate
-	}
-
-	proxy, err := httpproxy.New(entries, s.cfg.HTTPHost, sink, s.httpScript, certificate)
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("build the HTTP stub: %w", err), listener.Close())
-	}
-
-	return proxy, nil
 }
 
 // observeOpaque proxies every dependency Stutter cannot parse, in name order so that teardown and

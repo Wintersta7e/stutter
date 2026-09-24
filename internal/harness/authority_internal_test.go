@@ -40,7 +40,7 @@ func TestOneAuthorityServesEveryConsumerCheck(t *testing.T) {
 		t.Errorf("advertised host = %s, want 192.168.65.254", got)
 	}
 
-	own, err := New(Config{Start: start, HTTPTLS: true})
+	own, err := New(Config{Start: start})
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}

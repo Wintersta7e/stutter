@@ -1,13 +1,21 @@
 package harness_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -248,5 +256,294 @@ func TestSandboxTallyIsItsScripts(t *testing.T) {
 	want := []httpproxy.HostTally{{Host: "dependency.invalid", Calls: 1, Routed: 1}}
 	if got := built.Tally(); !reflect.DeepEqual(got, want) {
 		t.Errorf("Tally() = %+v, want %+v", got, want)
+	}
+}
+
+// driven builds a sandbox Stutter dispatches to, over a corpus of one message, with the service connect
+// builds and the rest of the configuration tune sets.
+func driven(t *testing.T, connect harness.Connect, tune func(*harness.Config)) *harness.Sandbox {
+	t.Helper()
+
+	store, err := corpus.Start(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("corpus.Start() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	if _, publishErr := store.Publish(
+		t.Context(),
+		toy.SubjectOrderCreated,
+		orderPayload("ORD-EGRESS", "W"),
+	); publishErr != nil {
+		t.Fatalf("Publish() error = %v", publishErr)
+	}
+
+	key := make([]byte, hashKeyLen)
+	if _, keyErr := rand.Read(key); keyErr != nil {
+		t.Fatalf("generate hash key: %v", keyErr)
+	}
+
+	settings := harness.Config{
+		Corpus:  store,
+		HashKey: key,
+		Policy:  observedConfig(),
+		Quiesce: toy.DefaultQuiesce,
+		Connect: connect,
+	}
+
+	if tune != nil {
+		tune(&settings)
+	}
+
+	built, err := harness.New(settings)
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	return built
+}
+
+// trusting is a TLS configuration that trusts only the stub's CA.
+func trusting(t *testing.T, at harness.Addresses) *tls.Config {
+	t.Helper()
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(at.HTTPCACert) {
+		t.Error("Addresses.HTTPCACert holds no certificate")
+	}
+
+	return &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}
+}
+
+// namesClient is a service that calls each of its names over HTTPS, through the stub's TLS entry
+// whatever the name resolves to, and keeps the leaf each name was presented.
+type namesClient struct {
+	client *http.Client
+	leaves map[string][]byte
+	names  []string
+	mu     sync.Mutex
+}
+
+func (c *namesClient) Handle(ctx context.Context, _ replay.Message) error {
+	for index, name := range c.names {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			"https://"+name+"/"+string(rune('a'+index)), nil)
+		if err != nil {
+			return err
+		}
+
+		response, err := c.client.Do(request)
+		if err != nil {
+			return fmt.Errorf("call %s: %w", name, err)
+		}
+
+		_ = response.Body.Close()
+
+		c.mu.Lock()
+		c.leaves[name] = response.TLS.PeerCertificates[0].Raw
+		c.mu.Unlock()
+	}
+
+	return nil
+}
+
+func (c *namesClient) Close(context.Context) { c.client.CloseIdleConnections() }
+
+// namesSandbox is a driven sandbox whose service is a namesClient with a clock skewed by skew, and
+// the clients each start built.
+func namesSandbox(t *testing.T, skew time.Duration, names ...string) (*harness.Sandbox, *[]*namesClient) {
+	t.Helper()
+
+	var started []*namesClient
+
+	built := driven(t, func(_ context.Context, at harness.Addresses) (harness.Service, error) {
+		stub, err := url.Parse(at.HTTPS)
+		if err != nil {
+			return nil, err
+		}
+
+		config := trusting(t, at)
+		config.Time = func() time.Time { return time.Now().Add(skew) }
+
+		client := &namesClient{
+			names:  names,
+			leaves: make(map[string][]byte),
+			client: &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+				TLSClientConfig: config,
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, stub.Host)
+				},
+			}},
+		}
+		started = append(started, client)
+
+		return client, nil
+	}, nil)
+
+	return built, &started
+}
+
+// TestEveryServerNameGetsItsOwnLeaf: a service reaches the stub under the names it already dials, so
+// every one of them verifies against the one CA it was given, run after run, even on a clock half an
+// hour behind.
+func TestEveryServerNameGetsItsOwnLeaf(t *testing.T) {
+	t.Parallel()
+
+	built, clients := namesSandbox(t, 0, "api.example.test", "other.example.test")
+
+	first, err := built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if _, err := built.Run(t.Context(), "clean-2", replay.Clean{}, nil); err != nil {
+		t.Fatalf("second Run() error = %v", err)
+	}
+
+	rendered := make([]string, 0, len(first.Effects))
+	for _, observed := range first.Effects {
+		rendered = append(rendered, observed.Printable)
+	}
+
+	for _, want := range []string{"GET api.example.test/a", "GET other.example.test/b"} {
+		if !slices.ContainsFunc(rendered, func(effect string) bool { return strings.HasPrefix(effect, want) }) {
+			t.Errorf("effects = %q, want one beginning %q", rendered, want)
+		}
+	}
+
+	if runs := *clients; len(runs) != 2 ||
+		!bytes.Equal(runs[0].leaves["api.example.test"], runs[1].leaves["api.example.test"]) {
+		t.Error("two runs were presented different leaves for api.example.test")
+	}
+
+	skewed, _ := namesSandbox(t, -30*time.Minute, "api.example.test")
+	if _, err := skewed.Run(t.Context(), "skewed", replay.Clean{}, nil); err != nil {
+		t.Errorf("a client 30 minutes behind: Run() error = %v", err)
+	}
+}
+
+// TestANoSNIClientVerifiesTheAdvertisedAddress: a client told to dial an address sends no server
+// name and verifies that address, although its connection arrives on the address the stub bound.
+func TestANoSNIClientVerifiesTheAdvertisedAddress(t *testing.T) {
+	t.Parallel()
+
+	const advertised = "192.0.2.10"
+
+	built := driven(t, func(ctx context.Context, at harness.Addresses) (harness.Service, error) {
+		stub, err := url.Parse(at.HTTPS)
+		if err != nil {
+			return nil, err
+		}
+
+		config := trusting(t, at)
+		config.ServerName = advertised
+
+		conn, err := (&tls.Dialer{Config: config}).DialContext(ctx, "tcp", net.JoinHostPort(loopbackHost, stub.Port()))
+		if err != nil {
+			return nil, fmt.Errorf("handshake for %s: %w", advertised, err)
+		}
+
+		return &idleTLS{conn: conn}, nil
+	}, func(settings *harness.Config) {
+		settings.BindHost = loopbackHost
+		settings.AdvertiseHost = advertised
+	})
+
+	if _, err := built.Run(t.Context(), "clean", replay.Clean{}, nil); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+// loopbackHost is where the stub binds when a test names the interface.
+const loopbackHost = "127.0.0.1"
+
+// idleTLS is a service holding a TLS connection to the stub that it never sends a request on, and
+// closes when it is closed, taking a moment to shut down afterwards.
+type idleTLS struct {
+	conn net.Conn
+}
+
+func (*idleTLS) Handle(context.Context, replay.Message) error { return nil }
+
+func (s *idleTLS) Close(context.Context) {
+	_ = s.conn.Close()
+
+	// Long enough for the stub to judge the close before its own teardown begins.
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestAServiceLeavingAnIdleTLSConnectionIsNotStopped: a connection a service opened and never used is
+// closed as the service goes away. It hid nothing, and the stub must not read it as a client that
+// could not talk to it.
+func TestAServiceLeavingAnIdleTLSConnectionIsNotStopped(t *testing.T) {
+	t.Parallel()
+
+	built := driven(t, func(ctx context.Context, at harness.Addresses) (harness.Service, error) {
+		stub, err := url.Parse(at.HTTPS)
+		if err != nil {
+			return nil, err
+		}
+
+		config := trusting(t, at)
+		config.ServerName = "api.example.test"
+
+		conn, err := (&tls.Dialer{Config: config}).DialContext(ctx, "tcp", stub.Host)
+		if err != nil {
+			return nil, fmt.Errorf("handshake: %w", err)
+		}
+
+		return &idleTLS{conn: conn}, nil
+	}, nil)
+
+	if _, err := built.Run(t.Context(), "clean", replay.Clean{}, nil); err != nil {
+		t.Fatalf("Run() error = %v, want an idle connection closed at teardown to stop nothing", err)
+	}
+}
+
+// TestHTTPTLSIsGone: the stub always serves TLS, so the switch that once turned it on is gone from the
+// tree.
+func TestHTTPTLSIsGone(t *testing.T) {
+	t.Parallel()
+
+	// Built in pieces, so this file matches only through its own name, which is discounted.
+	needle, self := []byte("HTTP"+"TLS"), []byte("Test"+"HTTP"+"TLS"+"IsGone")
+	searched, matches := 0, 0
+
+	module, err := os.OpenRoot(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	defer func() { _ = module.Close() }()
+
+	err = fs.WalkDir(module.FS(), ".", func(path string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".go") {
+			return err
+		}
+
+		content, readErr := fs.ReadFile(module.FS(), path)
+		if readErr != nil {
+			return readErr
+		}
+
+		searched++
+
+		if bytes.Count(content, needle) > bytes.Count(content, self) {
+			matches++
+
+			t.Logf("found in %s", path)
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("files searched: %d matches: %d", searched, matches)
+
+	if searched == 0 || matches > 0 {
+		t.Errorf("files searched: %d matches: %d, want files searched and no match", searched, matches)
 	}
 }

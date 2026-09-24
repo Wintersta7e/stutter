@@ -182,7 +182,10 @@ func (s *Sandbox) watch(
 	run.finish()
 
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
-	// holding an idle connection open would make teardown hang rather than fail.
+	// holding an idle connection open would make teardown hang rather than fail. The teardown point is
+	// marked first: a connection the service closes as it goes away hid nothing.
+	observed.markTeardown()
+
 	exit, closeErr := service.Close(ctx)
 	if closeErr != nil {
 		closeErr = fmt.Errorf("close the service under test: %w", closeErr)
