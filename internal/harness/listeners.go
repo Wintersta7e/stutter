@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
 	"github.com/Wintersta7e/stutter/internal/relay"
 )
 
@@ -17,9 +18,6 @@ var (
 	// errListenerConfig means the invocation listeners were asked for with something missing or
 	// unusable.
 	errListenerConfig = errors.New("invalid invocation listener configuration")
-	// errSRV means the service looked up an SRV record: it names a service and port Stutter cannot stand
-	// in for, and the connection that follows would go unseen.
-	errSRV = errors.New("the service looked up an SRV record")
 	// errSeedBusOpen means the seed bus was opened twice.
 	errSeedBusOpen = errors.New("the seed bus is already open")
 )
@@ -508,8 +506,10 @@ func (s *ListenerSet) holdSignal(conn *relay.Conn) {
 	}
 }
 
-// signalled records one query. Attached, it counts on the start, and an SRV lookup stops it: the
-// record names a service Stutter cannot stand in for. Between starts it is counted Unattached.
+// signalled records one query. Attached, it counts on the start, and an SRV lookup stops it as an
+// egress stop, the way the stub's own stops end a run: the record names a service and port Stutter
+// cannot stand in for, and the connection that follows would go unseen. Between starts it is counted
+// Unattached.
 func (s *ListenerSet) signalled(query relay.Query) {
 	s.mu.Lock()
 	s.queries = append(s.queries, query)
@@ -525,7 +525,7 @@ func (s *ListenerSet) signalled(query relay.Query) {
 	attached.signalled.Add(1)
 
 	if query.Type == srvQuery {
-		attached.fail(fmt.Errorf("%w: %s", errSRV, query.Name))
+		attached.fail(&httpproxy.EgressStop{Name: query.Name, Class: httpproxy.StopSRV})
 	}
 }
 

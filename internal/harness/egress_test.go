@@ -600,11 +600,13 @@ func (r relayedRig) throughRelay(
 	return response.Body.Close()
 }
 
-// stubbedSandbox is a sandbox on the rig's listener set around a pulling service that, while handling
-// the first message of each start, runs calls. tune, when set, adjusts the configuration.
+// stubbedSandbox is a sandbox on the rig's listener set around a pulling service with behaviour that,
+// while handling the first message of each start, runs calls. tune, when set, adjusts the
+// configuration.
 func (r relayedRig) stubbedSandbox(
 	t *testing.T,
 	calls func(ctx context.Context, start int) error,
+	behaviour quirks,
 	tune func(*harness.Config),
 ) *harness.Sandbox {
 	t.Helper()
@@ -630,7 +632,8 @@ func (r relayedRig) stubbedSandbox(
 
 			var once sync.Once
 
-			handled := func() {
+			started := behaviour
+			started.onHandled = func() {
 				once.Do(func() {
 					if err := calls(ctx, start); err != nil {
 						t.Errorf("start %d: %v", start, err)
@@ -641,7 +644,7 @@ func (r relayedRig) stubbedSandbox(
 			return startPulling(ctx, harness.Addresses{
 				Opaque: map[string]string{opaqueCache: r.cacheAt.String()},
 				NATS:   "nats://" + r.busAt.String(),
-			}, config, quirks{onHandled: handled})
+			}, config, started)
 		},
 	}
 
@@ -723,7 +726,7 @@ func TestTheStubServesTheListenerSetsEntries(t *testing.T) {
 			rig.throughRelay(ctx, harness.KeyCatchAll, 8080, nil,
 				"GET /other HTTP/1.1\r\nHost: api.example.test:8080\r\n\r\n"),
 		)
-	}, nil)
+	}, quirks{}, nil)
 
 	rendered := httpEffects(cleanRun(t, built, "clean"))
 
@@ -750,7 +753,10 @@ func TestEveryConsumerCheckPresentsTheChecksCA(t *testing.T) {
 
 	shared := rig.shared(t)
 
-	checks := []*harness.Sandbox{rig.stubbedSandbox(t, call, shared), rig.stubbedSandbox(t, call, shared)}
+	checks := []*harness.Sandbox{
+		rig.stubbedSandbox(t, call, quirks{}, shared),
+		rig.stubbedSandbox(t, call, quirks{}, shared),
+	}
 
 	for check, built := range checks {
 		result, err := built.Run(t.Context(), "clean", replay.Clean{}, nil)
@@ -779,7 +785,7 @@ func TestAStopClosesOnlyTheRunsStub(t *testing.T) {
 
 		return rig.throughRelay(ctx, harness.KeyHTTP, harness.HTTPPort, nil,
 			"GET /after HTTP/1.1\r\nHost: 172.18.0.5\r\n\r\n")
-	}, nil)
+	}, quirks{}, nil)
 
 	stopped := cleanRun(t, built, "stopped")
 	if !strings.Contains(stopped.Stopped, "egress stop connect") {
@@ -789,5 +795,101 @@ func TestAStopClosesOnlyTheRunsStub(t *testing.T) {
 	after := httpEffects(cleanRun(t, built, "after"))
 	if len(after) != 1 || !strings.HasPrefix(after[0], "GET dependency.invalid/after") {
 		t.Errorf("HTTP effects after the stop = %q, want the one call served", after)
+	}
+}
+
+// owing gives a run a long owed-silence limit: its service stops consuming after one message, so the
+// run waits on the rest, and only something else can end it sooner.
+func owing(settings *harness.Config) {
+	settings.Drain = 20 * time.Second
+}
+
+// held opens a connection to the listener set's key with the check's preamble for port, and holds it
+// open for the rest of the test.
+func (r relayedRig) held(ctx context.Context, t *testing.T, key string, port uint16) (net.Conn, error) {
+	t.Helper()
+
+	listener, open := r.set.Port(key)
+	if !open {
+		return nil, fmt.Errorf("the set has no %s listener", key)
+	}
+
+	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp4",
+		netip.AddrPortFrom(localhost, listener).String())
+	if err != nil {
+		return nil, fmt.Errorf("dial the %s listener: %w", key, err)
+	}
+
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if preambleErr := relay.WritePreamble(conn, r.token, port); preambleErr != nil {
+		return nil, fmt.Errorf("write the preamble: %w", preambleErr)
+	}
+
+	return conn, nil
+}
+
+// TestAnSRVQueryStopsTheRun: an SRV record names a service and port Stutter cannot stand in for, and
+// the connection that follows it would go unseen, so the lookup ends the run at once, as a stop the
+// run reports in its own words.
+func TestAnSRVQueryStopsTheRun(t *testing.T) {
+	t.Parallel()
+
+	const want = `egress stop srv for "_imap._tcp.example.test.": an SRV lookup precedes a connection ` +
+		`Stutter cannot observe`
+
+	rig := startRig(t)
+	built := rig.stubbedSandbox(t, func(ctx context.Context, _ int) error {
+		signal, err := rig.held(ctx, t, harness.KeyDNSSignal, relay.DNSPort)
+		if err != nil {
+			return err
+		}
+
+		return relay.WriteQuery(signal, relay.Query{Name: "_imap._tcp.example.test.", Type: 33})
+	}, quirks{stopAfter: 1}, owing)
+
+	began := time.Now()
+	result := cleanRun(t, built, "srv")
+	elapsed := time.Since(began)
+
+	t.Logf("the run ended %s after it began: %s", elapsed, result.Stopped)
+
+	if result.Stopped != want {
+		t.Errorf("Stopped = %q, want %q", result.Stopped, want)
+	}
+
+	if elapsed >= 20*time.Second {
+		t.Errorf("the run ended after %s, at its drain, want at the lookup", elapsed)
+	}
+}
+
+// TestACatchAllStopEndsTheRunPromptly: a connection to a mail port that never speaks stops the run at
+// the silence bound, while the run is still waiting — not when the run's own wait ends.
+func TestACatchAllStopEndsTheRunPromptly(t *testing.T) {
+	t.Parallel()
+
+	var dialled atomic.Int64
+
+	rig := startRig(t)
+	began := time.Now()
+	built := rig.stubbedSandbox(t, func(ctx context.Context, _ int) error {
+		_, err := rig.held(ctx, t, harness.KeyCatchAll, 25)
+
+		dialled.Store(int64(time.Since(began)))
+
+		return err
+	}, quirks{stopAfter: 1}, owing)
+
+	result := cleanRun(t, built, "silent")
+	elapsed := time.Since(began) - time.Duration(dialled.Load())
+
+	t.Logf("the run ended %s after the dial: %s", elapsed, result.Stopped)
+
+	if !strings.Contains(result.Stopped, "silent on port 25") || !strings.Contains(result.Stopped, "SMTP") {
+		t.Errorf("Stopped = %q, want a silent stop naming port 25 and SMTP", result.Stopped)
+	}
+
+	if elapsed >= 6*time.Second {
+		t.Errorf("the run ended %s after the dial, want within the silence bound and a second", elapsed)
 	}
 }
