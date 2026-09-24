@@ -2,16 +2,21 @@ package harness_test
 
 import (
 	"context"
+	"crypto/rand"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/harness"
 	"github.com/Wintersta7e/stutter/internal/replay"
+	"github.com/Wintersta7e/stutter/internal/toy"
 )
 
 // notHTTPStop is the stop the cleartext stub raises on a request it cannot parse.
@@ -110,4 +115,87 @@ func TestAnEgressStopEndsTheRunAsItsLastEffect(t *testing.T) {
 	if elapsed >= built.Timings().Drain {
 		t.Errorf("the run returned after %s, want before the drain of %s", elapsed, built.Timings().Drain)
 	}
+}
+
+// localIPv4 is the first non-loopback IPv4 address of this host: an address a proxy bound on every
+// interface is reachable at, and one no run can predict.
+func localIPv4(t *testing.T) string {
+	t.Helper()
+
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		t.Fatalf("list the host's addresses: %v", err)
+	}
+
+	for _, address := range addresses {
+		network, isNetwork := address.(*net.IPNet)
+		if isNetwork && !network.IP.IsLoopback() && network.IP.To4() != nil {
+			return network.IP.String()
+		}
+	}
+
+	t.Fatal("precondition: this host has no non-loopback IPv4 address to advertise")
+
+	return ""
+}
+
+// TestAdvertisedAddressRendersLogicalHost: a service told to dial the stub at an advertised address
+// sends that address as its Host. Rendering it would put a bind and advertise choice — and a
+// kernel-assigned port — into the effect, and two runs would never agree.
+func TestAdvertisedAddressRendersLogicalHost(t *testing.T) {
+	t.Parallel()
+
+	store, err := corpus.Start(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("corpus.Start() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	if _, publishErr := store.Publish(
+		t.Context(),
+		toy.SubjectOrderCreated,
+		orderPayload("ORD-HOST", "W"),
+	); publishErr != nil {
+		t.Fatalf("Publish() error = %v", publishErr)
+	}
+
+	key := make([]byte, hashKeyLen)
+	if _, keyErr := rand.Read(key); keyErr != nil {
+		t.Fatalf("generate hash key: %v", keyErr)
+	}
+
+	built, err := harness.New(harness.Config{
+		Corpus:        store,
+		BindHost:      "0.0.0.0",
+		AdvertiseHost: localIPv4(t),
+		HashKey:       key,
+		Policy:        observedConfig(),
+		Quiesce:       toy.DefaultQuiesce,
+		Connect: func(_ context.Context, at harness.Addresses) (harness.Service, error) {
+			return &tlsClient{baseURL: at.HTTP, client: &http.Client{Timeout: time.Second}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	result, err := built.Run(t.Context(), "clean", replay.Clean{}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	const want = "GET dependency.invalid/claimed"
+
+	for _, observed := range result.Effects {
+		if observed.Kind == effect.KindHTTP {
+			if !strings.HasPrefix(observed.Printable, want) {
+				t.Errorf("effect = %q, want it to begin %q", observed.Printable, want)
+			}
+
+			return
+		}
+	}
+
+	t.Fatalf("no HTTP effect among %d", len(result.Effects))
 }

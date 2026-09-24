@@ -14,6 +14,7 @@ import (
 	"log"
 	"net"
 	nethttp "net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strings"
@@ -569,9 +570,9 @@ func (p *Proxy) serveFailure() error {
 
 func (p *Proxy) serveRequest(writer nethttp.ResponseWriter, request *nethttp.Request) {
 	body, readErr := readBody(request.Body)
-	raw := renderRequest(request, p.logicalHost, p.Addr(), body, readErr)
+	raw := renderRequest(request, p.logicalHost, body, readErr)
 	key := p.sink.Canonicalise(raw)
-	response, observation := p.script.reply(key, request, p.logicalHost, p.Addr())
+	response, observation := p.script.reply(key, request, p.logicalHost)
 	observation.Kind = effect.KindHTTP
 	observation.Raw = raw
 	observation.Printable = raw
@@ -587,12 +588,7 @@ func (p *Proxy) serveRequest(writer nethttp.ResponseWriter, request *nethttp.Req
 	writeResponse(writer, response)
 }
 
-func (s *Script) reply(
-	key string,
-	request *nethttp.Request,
-	logicalHost string,
-	listenerAddr string,
-) (Response, effect.Observation) {
+func (s *Script) reply(key string, request *nethttp.Request, logicalHost string) (Response, effect.Observation) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -601,7 +597,7 @@ func (s *Script) reply(
 	}
 
 	if s.active.capture {
-		response := s.routeResponse(request, logicalHost, listenerAddr)
+		response := s.routeResponse(request, logicalHost)
 		s.active.captured[key] = append(s.active.captured[key], cloneResponse(response))
 
 		return response, effect.Observation{}
@@ -619,8 +615,8 @@ func (s *Script) reply(
 	return cloneResponse(queue[occurrence]), effect.Observation{Stubbed: true}
 }
 
-func (s *Script) routeResponse(request *nethttp.Request, logicalHost, listenerAddr string) Response {
-	host := stableHost(request.Host, logicalHost, listenerAddr)
+func (s *Script) routeResponse(request *nethttp.Request, logicalHost string) Response {
+	host := stableHost(request.Host, logicalHost)
 	for _, route := range s.routes {
 		if route.Path != request.URL.Path {
 			continue
@@ -659,13 +655,8 @@ func readBody(body io.ReadCloser) ([]byte, error) {
 //
 // It stays on ONE line, as the Postgres and NATS renderings do. The report indents each effect
 // beneath its finding, so a newline inside an effect breaks the layout of every line after it.
-func renderRequest(
-	request *nethttp.Request,
-	logicalHost, listenerAddr string,
-	body []byte,
-	readErr error,
-) string {
-	target := stableHost(request.Host, logicalHost, listenerAddr) + escapedPath(request.URL)
+func renderRequest(request *nethttp.Request, logicalHost string, body []byte, readErr error) string {
+	target := stableHost(request.Host, logicalHost) + escapedPath(request.URL)
 	if query := sortedQuery(request.URL.Query()); query != "" {
 		target += "?" + query
 	}
@@ -687,8 +678,19 @@ func renderRequest(
 	return strings.Join(fields, " ")
 }
 
-func stableHost(host, logicalHost, listenerAddr string) string {
-	if host == "" || host == listenerAddr {
+// stableHost is the host an effect names: the request's Host, lower-cased, its port kept. A Host that
+// is empty, an IP literal or localhost is where the service was told the stub is — a bind and
+// advertise choice, with a kernel-assigned port — so it renders as the logical host instead, and no
+// run's addresses reach an effect.
+func stableHost(host, logicalHost string) string {
+	name := host
+	if split, _, err := net.SplitHostPort(host); err == nil {
+		name = split
+	}
+
+	name = strings.Trim(name, "[]")
+
+	if _, err := netip.ParseAddr(name); name == "" || err == nil || strings.EqualFold(name, "localhost") {
 		return strings.ToLower(logicalHost)
 	}
 
