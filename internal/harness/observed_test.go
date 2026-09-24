@@ -50,6 +50,14 @@ type pulling struct {
 	replies    *bufio.Reader
 	done       chan struct{}
 	stopped    chan struct{}
+	quirks     quirks
+}
+
+// quirks are the ways a pulling service departs from the plain one, each for the test that needs it.
+type quirks struct {
+	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
+	// Zero never does.
+	nakFor time.Duration
 }
 
 // startPulling connects the service to the proxied bus and lets it start consuming.
@@ -60,6 +68,7 @@ func startPulling(
 	ctx context.Context,
 	at harness.Addresses,
 	config policy.Config,
+	behaviour quirks,
 ) (*pulling, error) {
 	dialer := net.Dialer{Timeout: time.Second}
 
@@ -73,6 +82,7 @@ func startPulling(
 		replies:    bufio.NewReader(dependency),
 		done:       make(chan struct{}),
 		stopped:    make(chan struct{}),
+		quirks:     behaviour,
 	}
 
 	service.connection, err = nats.Connect(at.NATS)
@@ -138,6 +148,13 @@ func (p *pulling) pump() {
 // handle reserves stock once per delivery, which is the planted bug: the bus is permitted to deliver
 // the same message twice, and this service reserves twice when it does.
 func (p *pulling) handle(msg jetstream.Msg) {
+	if p.quirks.nakFor > 0 && firstDelivery(msg) {
+		//nolint:errcheck // as below: a settle that fails is the run ending underneath the service.
+		_ = msg.NakWithDelay(p.quirks.nakFor)
+
+		return
+	}
+
 	settle := msg.Ack
 	if err := p.reserve(msg.Data()); err != nil {
 		settle = msg.Nak
@@ -146,6 +163,13 @@ func (p *pulling) handle(msg jetstream.Msg) {
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+}
+
+// firstDelivery reports whether the bus is handing this message over for the first time.
+func firstDelivery(msg jetstream.Msg) bool {
+	metadata, err := msg.Metadata()
+
+	return err == nil && metadata.NumDelivered == 1
 }
 
 func (p *pulling) reserve(payload []byte) error {
@@ -174,6 +198,20 @@ func (p *pulling) reserve(payload []byte) error {
 func observedSandbox(
 	t *testing.T,
 	config policy.Config,
+	orders ...string,
+) (*harness.Sandbox, []uint64) {
+	t.Helper()
+
+	return quirkySandbox(t, config, quirks{}, nil, orders...)
+}
+
+// quirkySandbox is observedSandbox around a service with quirks, with the harness configuration open to
+// the test through tune.
+func quirkySandbox(
+	t *testing.T,
+	config policy.Config,
+	behaviour quirks,
+	tune func(*harness.Config),
 	orders ...string,
 ) (*harness.Sandbox, []uint64) {
 	t.Helper()
@@ -207,21 +245,27 @@ func observedSandbox(
 
 	upstream := startLineDependency(t)
 
-	built, err := harness.New(harness.Config{
+	settings := harness.Config{
 		Corpus:  store,
 		Opaque:  map[string]string{opaqueCache: upstream},
 		HashKey: key,
 		Policy:  config,
 		Quiesce: toy.DefaultQuiesce,
 		Start: func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
-			service, startErr := startPulling(ctx, at, config)
+			service, startErr := startPulling(ctx, at, config, behaviour)
 			if startErr != nil {
 				return nil, startErr
 			}
 
 			return service, nil
 		},
-	})
+	}
+
+	if tune != nil {
+		tune(&settings)
+	}
+
+	built, err := harness.New(settings)
 	if err != nil {
 		t.Fatalf("harness.New() error = %v", err)
 	}
@@ -368,6 +412,33 @@ func TestAScopedObservedRunFaultsTheRecordedSequence(t *testing.T) {
 		if !strings.Contains(observed.Printable, "ORD-WIRE-2") {
 			t.Errorf("effect %d = %q, want the retained message's order", at, observed.Printable)
 		}
+	}
+}
+
+// TestAnObservedRunCountsADelayedNak: a service asking for redelivery later sends `-NAK {"delay": …}`,
+// which refuses the delivery as surely as a bare NAK. Read as an acknowledgement, the refusal went
+// uncounted and the clean run's health claimed a service that refused nothing.
+func TestAnObservedRunCountsADelayedNak(t *testing.T) {
+	t.Parallel()
+
+	// Well inside the drain the sandbox derives, so the redelivery lands before the run ends.
+	const nakFor = 200 * time.Millisecond
+
+	built, _ := quirkySandbox(t, observedConfig(), quirks{nakFor: nakFor}, nil, "ORD-NAK-1")
+
+	result, err := built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Failed != 1 {
+		t.Errorf("Failed = %d, want 1 — the delayed NAK was read as a settled delivery", result.Failed)
+	}
+
+	// The run went on to the redelivery the NAK asked for, rather than ending on the refused message.
+	if result.Delivered != 2 || len(result.Effects) != 1 {
+		t.Errorf("Delivered = %d, Effects = %d, want 2 deliveries and the one reservation of the second",
+			result.Delivered, len(result.Effects))
 	}
 }
 

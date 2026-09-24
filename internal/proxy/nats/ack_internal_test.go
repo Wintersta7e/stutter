@@ -2,13 +2,15 @@ package nats
 
 import "testing"
 
-// TestAckPayloadsAreClassified pins the two payloads a run acts on differently.
+// TestADelayedNakRefusesTheDelivery classifies acknowledgement payloads the way the server matches
+// them: a NAK by prefix, because a client asking for redelivery later sends `-NAK {"delay": …}` or
+// `-NAK <duration>`, and matching the bare word read that refusal as a settled delivery.
 //
-// Everything else settles the message. A work-in-progress acknowledgement does not: swallowing one
-// injects a redelivery the run never chose, and closing an attribution window on one reports the
-// rest of a handler's own work against the next message. A negative one is the only way a service
-// Stutter does not call can say a delivery failed.
-func TestAckPayloadsAreClassified(t *testing.T) {
+// Everything that is neither settles the message. A work-in-progress acknowledgement does not:
+// swallowing one injects a redelivery the run never chose, and closing an attribution window on one
+// reports the rest of a handler's own work against the next message. A negative one is the only way a
+// service Stutter does not call can say a delivery failed.
+func TestADelayedNakRefusesTheDelivery(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -16,11 +18,25 @@ func TestAckPayloadsAreClassified(t *testing.T) {
 		inProgress bool
 		negative   bool
 	}{
-		{payload: "+ACK"},
 		{payload: ""},
+		{payload: "+ACK"},
+		{payload: "+OK"},
+		{payload: "+NXT"},
+		{payload: `+NXT {"batch":2}`},
 		{payload: "+TERM"},
-		{payload: "+WPI", inProgress: true},
+		{payload: "+TERM no longer wanted"},
 		{payload: "-NAK", negative: true},
+		{payload: `-NAK {"delay": 200000000}`, negative: true},
+		{payload: "-NAK 5s", negative: true},
+		// The server treats an unparseable delay as a plain NAK, so it is still a refusal.
+		{payload: "-NAK soon", negative: true},
+		{payload: "+WPI", inProgress: true},
+	}
+
+	t.Logf("%d acknowledgement payloads classified", len(cases))
+
+	if len(cases) == 0 {
+		t.Fatal("no payloads to classify")
 	}
 
 	for _, testCase := range cases {

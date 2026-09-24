@@ -63,8 +63,11 @@ func (a Ack) InProgress() bool {
 //
 // It is the only way a service Stutter does not call can say a delivery failed: there is no return
 // value to read, so this is what stands in for a handler error on a driven run.
+//
+// Matched by prefix, as the server matches it: a NAK may carry a redelivery delay, as JSON or as a
+// duration, and one with a delay refuses the delivery exactly as a bare one does.
 func (a Ack) Negative() bool {
-	return string(a.Payload) == ackNegative
+	return strings.HasPrefix(string(a.Payload), ackNegative)
 }
 
 // apiResponse is the shape every JetStream API reply shares. Only the presence of the error object
