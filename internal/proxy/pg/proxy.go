@@ -35,8 +35,24 @@ const (
 	lengthWidth = 4
 	// typedHeaderSize is one type byte followed by the length field.
 	typedHeaderSize = lengthWidth + 1
+	// tlsHandshake opens every TLS record a ClientHello travels in. No startup length under
+	// maxMessageSize begins with it, so a first byte of 0x16 is a TLS client, never a large message.
+	tlsHandshake = 0x16
 	// encryptionRefused is Postgres' one-byte answer declining an encryption request.
 	encryptionRefused = 'N'
+)
+
+// A client that will only talk TLS stops the run: the proxy cannot read what such a client sends, and
+// a service whose database connection never opened reads as a handler that did nothing. Both errors
+// are returned from Serve.
+var (
+	// ErrTLSRequired means every connection of a start was refused TLS and none sent a startup
+	// message: the client insists on encryption.
+	ErrTLSRequired = errors.New("a Postgres client requires TLS (sslmode=require or stricter); " +
+		"Postgres TLS termination is not supported, so the service's sslmode must change")
+	// ErrDirectTLS means a client opened with a TLS ClientHello instead of a startup message.
+	ErrDirectTLS = errors.New("a Postgres client opened with direct TLS negotiation; " +
+		"Postgres TLS termination is not supported, so the service's sslmode must change")
 )
 
 // Sink receives the effects the proxy observes, and what the database made of each.
@@ -54,13 +70,18 @@ type Sink interface {
 type Proxy struct {
 	listener net.Listener
 	sink     Sink
-	// dialFailed is the first upstream dial that failed. It stops the proxy, and Serve reports it.
-	dialFailed error
-	upstream   string
-	dialer     net.Dialer
-	wg         sync.WaitGroup
+	// failed is the first error that stops the proxy — an upstream dial that failed, or a client that
+	// opened with TLS. Serve reports it.
+	failed   error
+	upstream string
+	dialer   net.Dialer
+	wg       sync.WaitGroup
 	// sessions numbers connections, so a statement's correlation token is unique across all of them.
 	sessions atomic.Uint64
+	// refusals counts connections that ended after the proxy refused them encryption and before any
+	// startup message; startups counts connections that sent one. Together they decide ErrTLSRequired.
+	refusals atomic.Int64
+	startups atomic.Int64
 	failOnce sync.Once
 	failMu   sync.Mutex
 }
@@ -90,23 +111,24 @@ func (p *Proxy) Addr() string {
 	return p.listener.Addr().String()
 }
 
-// Serve accepts connections until the proxy is closed, or until an upstream dial fails — that failure
-// is what Serve then returns.
+// Serve accepts connections until the proxy is closed, or until something stops it — an upstream dial
+// that failed, a client that opened with TLS — which is what Serve then returns at once. A close waits
+// for every connection, then fails the start with ErrTLSRequired when its clients were only ever
+// refused TLS.
 func (p *Proxy) Serve(ctx context.Context) error {
 	for {
 		client, err := p.listener.Accept()
 		if err != nil {
-			// A dial failure outranks the closure it caused.
-			if failure := p.dialFailure(); failure != nil {
+			// A failure outranks the closure it caused.
+			if failure := p.failure(); failure != nil {
 				return failure
 			}
 
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
-				//nolint:nilerr // a closed listener is how Serve is stopped, not a failure.
-				return nil
+			if ctx.Err() == nil && !errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("accept: %w", err)
 			}
 
-			return fmt.Errorf("accept: %w", err)
+			return p.settled()
 		}
 
 		p.wg.Go(func() { p.handle(ctx, client) })
@@ -124,24 +146,41 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
-// failDial records the first upstream dial that failed and stops accepting. There is no retry: the
+// fail records the first error that stops the proxy and stops accepting. There is no retry: the
 // database's readiness was the caller's to establish, and a run whose database the service cannot
-// reach reports a handler that did nothing.
-func (p *Proxy) failDial(err error) {
+// reach, or cannot reach readably, reports a handler that did nothing.
+func (p *Proxy) fail(err error) {
 	p.failOnce.Do(func() {
 		p.failMu.Lock()
-		p.dialFailed = err
+		p.failed = err
 		p.failMu.Unlock()
 
 		_ = p.listener.Close()
 	})
 }
 
-func (p *Proxy) dialFailure() error {
+func (p *Proxy) failure() error {
 	p.failMu.Lock()
 	defer p.failMu.Unlock()
 
-	return p.dialFailed
+	return p.failed
+}
+
+// settled is how a start ended once its listener closed. Counts decide, never timing: a default
+// client closes once after the proxy's refusal and reconnects in cleartext, so a refusal beside a
+// startup is a client that settled for cleartext, and only refusals alone are a client that never will.
+func (p *Proxy) settled() error {
+	p.wg.Wait()
+
+	if failure := p.failure(); failure != nil {
+		return failure
+	}
+
+	if refused := p.refusals.Load(); refused > 0 && p.startups.Load() == 0 {
+		return fmt.Errorf("%w (connections refused: %d, startups: 0)", ErrTLSRequired, refused)
+	}
+
+	return nil
 }
 
 func (p *Proxy) handle(ctx context.Context, client net.Conn) {
@@ -153,7 +192,7 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 		// A dial abandoned because the run is over is the run ending, not the database failing.
 		if ctx.Err() == nil {
-			p.failDial(fmt.Errorf("dial the upstream %s: %w", p.upstream, err))
+			p.fail(fmt.Errorf("dial the upstream %s: %w", p.upstream, err))
 		}
 
 		return
@@ -173,8 +212,19 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	// A connection that ends inside the negotiation carried no statement; nothing is recorded.
 	if err := current.negotiate(); err != nil {
+		switch {
+		case errors.Is(err, ErrDirectTLS):
+			p.fail(err)
+			abort(client)
+		case current.refused:
+			p.refusals.Add(1)
+		default:
+		}
+
 		return
 	}
+
+	p.startups.Add(1)
 
 	go current.pumpBackend()
 
@@ -197,6 +247,8 @@ type session struct {
 	id     uint64
 	issued uint64
 	mu     sync.Mutex
+	// refused reports that the proxy declined an encryption request on this connection.
+	refused bool
 }
 
 // negotiate settles the untyped exchange that precedes the typed message stream.
@@ -219,6 +271,8 @@ func (s *session) negotiate() error {
 
 			return nil
 		}
+
+		s.refused = true
 
 		if _, err := s.client.Write([]byte{encryptionRefused}); err != nil {
 			return fmt.Errorf("refuse encryption: %w", err)
@@ -409,6 +463,10 @@ func readUntyped(from io.Reader) ([]byte, error) {
 	header := make([]byte, lengthWidth)
 	if _, err := io.ReadFull(from, header); err != nil {
 		return nil, fmt.Errorf("read startup header: %w", err)
+	}
+
+	if header[0] == tlsHandshake {
+		return nil, ErrDirectTLS
 	}
 
 	length := binary.BigEndian.Uint32(header)

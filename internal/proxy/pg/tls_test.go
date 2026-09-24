@@ -3,6 +3,7 @@ package pg_test
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"net/url"
@@ -351,5 +352,158 @@ func TestPreferClientIsNotAFailure(t *testing.T) {
 
 	if count := shim.sslRequests.Load(); count != 0 {
 		t.Errorf("the database received %d SSLRequests, want 0", count)
+	}
+}
+
+// drainingUpstream is a database stand-in that reads whatever reaches it and counts the bytes.
+func drainingUpstream(t *testing.T) (string, *atomic.Int64) {
+	t.Helper()
+
+	var (
+		config net.ListenConfig
+		read   atomic.Int64
+		wg     sync.WaitGroup
+	)
+
+	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen for the upstream: %v", err)
+	}
+
+	wg.Go(func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+
+			wg.Go(func() {
+				defer func() { _ = conn.Close() }()
+
+				n, _ := io.Copy(io.Discard, conn) //nolint:errcheck // the count is what matters.
+				read.Add(n)
+			})
+		}
+	})
+
+	t.Cleanup(func() {
+		_ = listener.Close()
+
+		wg.Wait()
+	})
+
+	return listener.Addr().String(), &read
+}
+
+// TestDirectTLSStopsTheRun stops the run on a client that opens with a TLS ClientHello: its first
+// byte is no startup length, and dropping it silently would read as a handler that did nothing.
+func TestDirectTLSStopsTheRun(t *testing.T) {
+	t.Parallel()
+
+	upstream, read := drainingUpstream(t)
+	sink := &countingSink{}
+	running := serveProxy(t, upstream, sink)
+
+	var dialer net.Dialer
+
+	client, err := dialer.DialContext(t.Context(), "tcp4", running.proxy.Addr())
+	if err != nil {
+		t.Fatalf("dial the proxy: %v", err)
+	}
+
+	defer func() { _ = client.Close() }()
+
+	if _, err := client.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x2f, 0x01, 0x00, 0x00}); err != nil {
+		t.Fatalf("write the ClientHello: %v", err)
+	}
+
+	select {
+	case serveErr := <-running.done:
+		if !errors.Is(serveErr, pg.ErrDirectTLS) {
+			t.Errorf("Serve() = %v, want ErrDirectTLS", serveErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve() = <still running>, want ErrDirectTLS within 2s")
+	}
+
+	if count := sink.records.Load(); count != 0 {
+		t.Errorf("the sink holds %d observations, want 0", count)
+	}
+
+	if count := read.Load(); count != 0 {
+		t.Errorf("the upstream read %d bytes, want 0: nothing of a TLS client is forwarded", count)
+	}
+}
+
+// TestRequireClientFailsTheRun fails a start whose client would only take TLS: every connection it
+// makes is refused, no statement is ever sent, and the handler would read as having done nothing.
+func TestRequireClientFailsTheRun(t *testing.T) {
+	t.Parallel()
+
+	for _, client := range []struct {
+		connect func(t *testing.T, addr string)
+		name    string
+	}{
+		{name: "libpq", connect: func(t *testing.T, addr string) {
+			t.Helper()
+
+			var dialer net.Dialer
+
+			conn, err := dialer.DialContext(t.Context(), "tcp4", addr)
+			if err != nil {
+				t.Fatalf("dial the proxy: %v", err)
+			}
+
+			defer func() { _ = conn.Close() }()
+
+			if _, err := conn.Write(encryptionRequest(sslRequestCode)); err != nil {
+				t.Fatalf("write the SSLRequest: %v", err)
+			}
+
+			if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+				t.Fatal(err)
+			}
+
+			reply := make([]byte, 1)
+			if _, err := io.ReadFull(conn, reply); err != nil || reply[0] != 'N' {
+				t.Fatalf("reply = %q, %v; want N within 1s", reply, err)
+			}
+		}},
+		{name: "pgx", connect: func(t *testing.T, addr string) {
+			t.Helper()
+
+			conn, err := pgx.Connect(t.Context(),
+				"postgres://stutter:stutter@"+addr+"/stutter?sslmode=require&connect_timeout=2")
+			if err == nil {
+				_ = conn.Close(context.Background())
+
+				t.Fatal("pgx connected with sslmode=require through a proxy that refuses TLS")
+			}
+		}},
+	} {
+		t.Run(client.name, func(t *testing.T) {
+			t.Parallel()
+
+			upstream, _ := drainingUpstream(t)
+			sink := &countingSink{}
+			running := serveProxy(t, upstream, sink)
+
+			client.connect(t, running.proxy.Addr())
+
+			serveErr := closeServed(t, running)
+			if !errors.Is(serveErr, pg.ErrTLSRequired) {
+				t.Fatalf("Serve() = %v, want ErrTLSRequired", serveErr)
+			}
+
+			for _, want := range []string{"sslmode=require or stricter", "not supported", "sslmode must change"} {
+				if !strings.Contains(serveErr.Error(), want) {
+					t.Errorf("Serve() = %q, want it to say %q", serveErr, want)
+				}
+			}
+
+			if count := sink.records.Load(); count != 0 {
+				t.Errorf("the sink holds %d observations, want 0", count)
+			}
+		})
 	}
 }
