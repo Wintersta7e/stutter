@@ -101,7 +101,7 @@ func (s *Sandbox) runObserved(
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), s.cfg.HashKey)
-	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, corpus.Numbering(messages), s.quiesce())
+	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, s.quiesce())
 
 	observed, err := s.observe(ctx, recorder, natsproxy.Options{Acks: run, Deliveries: run})
 	if err != nil {
@@ -206,7 +206,17 @@ func (s *Sandbox) begin(
 
 	run.scope(target, s.startupLimit())
 
-	if err := s.cfg.Corpus.Fill(ctx, messages); err != nil {
+	// The stream may already hold messages, so the corpus lands after them. The translation is
+	// installed before the first publish: the proxy notes a delivery as it reads it, and a service
+	// consuming for itself is handed a message before Fill hears back where it landed.
+	first, nextErr := s.cfg.Corpus.Next(ctx)
+	if nextErr != nil {
+		return fmt.Errorf("number the corpus: %w", nextErr)
+	}
+
+	run.stage(corpus.Numbering(messages, first))
+
+	if err := s.cfg.Corpus.Fill(ctx, messages, first); err != nil {
 		return fmt.Errorf("stage the corpus: %w", err)
 	}
 
@@ -368,9 +378,9 @@ type observedRun struct {
 	policy   *replay.WirePolicy
 	windows  *windows
 	recorder *effect.Recorder
-	// recorded translates a sequence the rebuilt stream is using back to the one the message was
-	// recorded under.
-	recorded map[uint64]uint64
+	// recorded translates a sequence the stream is using back to the one the message was recorded
+	// under. Installed by stage before the corpus is published, and read from the proxy's goroutines.
+	recorded atomic.Pointer[map[uint64]uint64]
 	// began anchors activity to the monotonic clock. A wall-clock timestamp will not do: measured on
 	// WSL2, the wall clock steps forward by one to two seconds every thirty, and a step inside the drain
 	// period ends the run before a withheld acknowledgement's redelivery arrives — a clean sequence
@@ -403,19 +413,12 @@ func newObservedRun(
 	stream string,
 	wire *replay.WirePolicy,
 	recorder *effect.Recorder,
-	staged []corpus.Staged,
 	quiesce time.Duration,
 ) *observedRun {
-	recorded := make(map[uint64]uint64, len(staged))
-	for _, message := range staged {
-		recorded[message.Sequence] = message.Recorded
-	}
-
 	run := &observedRun{
 		policy:   wire,
 		windows:  &windows{recorder: recorder, consumer: consumer, quiesce: quiesce},
 		recorder: recorder,
-		recorded: recorded,
 		began:    time.Now(),
 		stream:   stream,
 	}
@@ -489,6 +492,18 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 	r.windows.settle(seq)
 
 	return withheld
+}
+
+// stage installs the translation from the sequences this run's corpus lands at to the ones its
+// messages were recorded under. It runs before the first publish, because the proxy may report a
+// delivery before Fill has heard back where it landed.
+func (r *observedRun) stage(staged []corpus.Staged) {
+	recorded := make(map[uint64]uint64, len(staged))
+	for _, message := range staged {
+		recorded[message.Sequence] = message.Recorded
+	}
+
+	r.recorded.Store(&recorded)
 }
 
 // awaitQuiet blocks until the bus has handed nothing over and settled nothing for the drain period.
@@ -637,12 +652,18 @@ func forMessage(effects []effect.Effect, message uint64) []effect.Effect {
 // sequence translates a stream sequence the bus is using into the one the message was recorded
 // under, or fedBack for a message Stutter did not stage.
 //
-// Staging renumbers the stream from one, so without the translation a fault aimed at a recorded
-// sequence would land on a different message, and every effect would be attributed to one. A
-// sequence staging never used is the service's own output fed back, and passing it off as recorded
-// would attribute that output to a corpus message — or aim that message's fault at it.
+// Staging lands the corpus wherever the stream is up to, so without the translation a fault aimed at
+// a recorded sequence would land on a different message, and every effect would be attributed to
+// one. A sequence staging never used is the service's own output fed back, or a message already in
+// the stream, and passing it off as recorded would attribute it to a corpus message — or aim that
+// message's fault at it.
 func (r *observedRun) sequence(staged uint64) uint64 {
-	if recorded, known := r.recorded[staged]; known {
+	translation := r.recorded.Load()
+	if translation == nil {
+		return fedBack
+	}
+
+	if recorded, known := (*translation)[staged]; known {
 		return recorded
 	}
 
