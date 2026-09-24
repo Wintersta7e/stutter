@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 
@@ -101,7 +102,11 @@ func modelFrom(t *testing.T, jsonText string) *compose.Model {
 	t.Helper()
 
 	run := &fakeRun{whole: func([]string) ([]byte, int, error) { return []byte(jsonText), 0, nil }}
+
 	file := project(t, "compose.yaml")
+	if strings.Contains(jsonText, `"x-stutter"`) {
+		file = declaring(t, filepath.Dir(file), "compose.yaml")
+	}
 
 	model, err := compose.Parse(t.Context(), run.run, compose.Inputs{Service: target, Files: []string{file}})
 	if err != nil {

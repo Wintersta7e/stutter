@@ -27,8 +27,13 @@ func staticRun(model, environ string) ConfigFunc {
 func parseIn(t *testing.T, dir, model, environ string) *Model {
 	t.Helper()
 
+	content := "services: {}\n"
+	if strings.Contains(model, `"x-stutter"`) {
+		content += "x-stutter: {}\n"
+	}
+
 	file := filepath.Join(dir, "compose.yaml")
-	if err := os.WriteFile(file, []byte("services: {}\n"), 0o600); err != nil {
+	if err := os.WriteFile(file, []byte(content), 0o600); err != nil {
 		t.Fatalf("write compose file: %v", err)
 	}
 

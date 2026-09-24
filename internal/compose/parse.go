@@ -36,6 +36,12 @@ func Parse(ctx context.Context, run ConfigFunc, in Inputs) (*Model, error) {
 		}
 	}
 
+	model.service = in.Service
+
+	if model.overrides, err = readOverrides(model, in.Files); err != nil {
+		return nil, err
+	}
+
 	if err = p.environment(ctx, model); err != nil {
 		return nil, err
 	}
@@ -45,7 +51,6 @@ func Parse(ctx context.Context, run ConfigFunc, in Inputs) (*Model, error) {
 		return nil, err
 	}
 
-	model.service = in.Service
 	model.dotEnv = present
 	model.composeVars = composeVars(os.Environ(), keys)
 

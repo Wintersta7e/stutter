@@ -16,6 +16,8 @@ type Model struct {
 	// resolved; a named variable missing here is absent.
 	environ map[string]string
 	typed   composeProject
+	// overrides is the `x-stutter` declaration, read against its grammar.
+	overrides Overrides
 	// service is the service under test.
 	service   string
 	reproduce string
