@@ -38,6 +38,8 @@ var errNoSandboxCA = errors.New("the sandbox produced no CA certificate")
 type counting struct {
 	inner  check.Session
 	faults int
+	// runs counts every run, faulted or not.
+	runs int
 }
 
 func (c *counting) Reset(ctx context.Context) error {
@@ -53,6 +55,8 @@ func (c *counting) Run(
 	if mutation.Fault() != policy.FaultNone {
 		c.faults++
 	}
+
+	c.runs++
 
 	return c.inner.Run(ctx, name, mutation, retain)
 }

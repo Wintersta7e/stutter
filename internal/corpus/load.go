@@ -160,18 +160,19 @@ func read(dir string, messages []corpusFile, headers map[string]map[string][]str
 			return Loaded{}, fmt.Errorf("read corpus file: %w", err)
 		}
 
-		header := headers[file.stem]
-		if size := headerSize(header) + len(payload); size > maxMessage {
+		message := Message{
+			Header:  headers[file.stem],
+			Subject: file.subject,
+			Payload: payload,
+			Seq:     uint64(rank) + 1,
+		}
+
+		if size := message.Size(); size > maxMessage {
 			return Loaded{}, invalid(file.name, fmt.Sprintf(
 				"headers and payload are %d bytes, over the %d the bus accepts", size, maxMessage))
 		}
 
-		loaded.Messages = append(loaded.Messages, Message{
-			Header:  header,
-			Subject: file.subject,
-			Payload: payload,
-			Seq:     uint64(rank) + 1,
-		})
+		loaded.Messages = append(loaded.Messages, message)
 		loaded.Files = append(loaded.Files, file.name)
 	}
 
@@ -363,6 +364,11 @@ func parseSidecar(name string, content []byte) (map[string][]string, error) {
 	}
 
 	return header, nil
+}
+
+// Size is how many bytes the message is on the wire: its payload and its encoded header block.
+func (m Message) Size() int {
+	return headerSize(m.Header) + len(m.Payload)
 }
 
 // headerSize is how many bytes a header block adds to a message on the wire; none without headers.

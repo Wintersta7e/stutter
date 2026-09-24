@@ -39,7 +39,11 @@ const observedAckWait = 500 * time.Millisecond
 
 // fetchWait bounds one pull. It is short so the service stops promptly when the run is over, and it
 // is what makes the service send a pull request per message rather than one for the whole run.
-const fetchWait = 100 * time.Millisecond
+//
+// It is not shorter because a pull's expiry bounds the Fill hold at a tenth of it: at 100 ms every
+// run's hold had 10 ms, against a measured 2.2 to 3.0 ms to publish three messages under the race
+// detector.
+const fetchWait = 500 * time.Millisecond
 
 // pulling is a service Stutter does not dispatch to. It creates its own JetStream consumer, fetches
 // its own messages and acknowledges them on its own connection — the shape a provisioned container
@@ -65,6 +69,8 @@ type pulling struct {
 type quirks struct {
 	// seen is where a starting service notes what it found. Shared by every run of a sandbox.
 	seen *startups
+	// filter is the one subject the service's consumer admits. Empty admits the whole stream.
+	filter string
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
 	// Zero never does.
 	nakFor time.Duration
@@ -88,7 +94,16 @@ type quirks struct {
 	// seededKey makes the service read a job-seeded key at startup, noting its revision, and makes
 	// the handler write that key.
 	seededKey bool
+	// audit makes the handler publish a note of every delivery into the stream it consumes, on a
+	// subject its own filter does not admit.
+	audit bool
+	// pullExpires is how long each pull lives. Zero is fetchWait.
+	pullExpires time.Duration
 }
+
+// auditSubject is where an auditing service notes each delivery: inside the stream it consumes, and
+// outside its own filter, so the note takes a stream sequence without ever being delivered to it.
+const auditSubject = corpus.SubjectPrefix + "order.audited"
 
 // Buckets a quirky service keeps state in.
 const (
@@ -226,6 +241,7 @@ func startPulling(
 
 	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
 		Name:          observedConsumer,
+		FilterSubject: behaviour.filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       config.AckWait,
 		MaxDeliver:    config.MaxDeliver,
@@ -336,7 +352,12 @@ func (p *pulling) pump(ctx context.Context) {
 		default:
 		}
 
-		batch, err := p.consumer.Fetch(1, jetstream.FetchMaxWait(fetchWait))
+		expires := fetchWait
+		if p.quirks.pullExpires > 0 {
+			expires = p.quirks.pullExpires
+		}
+
+		batch, err := p.consumer.Fetch(1, jetstream.FetchMaxWait(expires))
 		if err != nil {
 			return
 		}
@@ -375,6 +396,10 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 			if _, err := p.seeded.Put(ctx, seededKey, msg.Data()); err != nil {
 				settle = msg.Nak
 			}
+		}
+
+		if p.quirks.audit && p.connection.Publish(auditSubject, msg.Data()) != nil {
+			settle = msg.Nak
 		}
 
 		if p.quirks.echo {

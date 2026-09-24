@@ -29,6 +29,10 @@ const (
 	consumerAudit   = "audit_orders_crowded"
 )
 
+// crowdedQuiesce keeps the startup barrier's settle period, five quiesces, past the crowded service's
+// startup pass, which runs when its first pull expires — one fetchWait after it starts.
+const crowdedQuiesce = 3 * toy.DefaultQuiesce
+
 // crowded has the shape of the real service that stopped the first real-target run: two consumers on
 // one stream in one process, sharing a bus connection and a dependency connection, plus a cleanup pass
 // that runs as the service comes up rather than in answer to any message. Each consumer writes its own
@@ -199,7 +203,7 @@ func crowdedSandbox(t *testing.T, consumer string, orders ...string) (*harness.S
 		Consumer: consumer,
 		HashKey:  make([]byte, hashKeyLen),
 		Policy:   config,
-		Quiesce:  toy.DefaultQuiesce,
+		Quiesce:  crowdedQuiesce,
 		Start: func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
 			service, startErr := startCrowded(ctx, at, config)
 			if startErr != nil {

@@ -159,6 +159,8 @@ type Sandbox struct {
 	// checkpoint is the sandbox's own starting point, taken at the first observed run when the
 	// configuration supplies no Baseline.
 	checkpoint *corpus.Checkpoint
+	// holds is every Fill hold an observed run made, in run order.
+	holds []FillHold
 	// recorded is the corpus held outside the stream, taken before the first observed run. A run
 	// stages only what it replays, so the messages a later whole-corpus run needs have to be in hand
 	// before the first subset run.

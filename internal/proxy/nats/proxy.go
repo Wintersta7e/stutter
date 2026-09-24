@@ -87,6 +87,10 @@ type Options struct {
 	Acks Acks
 	// Deliveries is notified of each message the bus hands to the service.
 	Deliveries Deliveries
+	// Pulls is told of each pull request the service makes. Nil is never called.
+	Pulls Pulls
+	// Hold keeps what the bus sends waiting while it is on. Nil never holds.
+	Hold *Hold
 }
 
 // Proxy accepts NATS client connections and forwards them to an upstream server.
@@ -370,6 +374,7 @@ func (s *session) pumpServer() {
 				return
 			}
 
+			s.opts.Hold.wait()
 			s.forwardClient(current.raw)
 
 			if errors.Is(err, errDesynced) {
@@ -380,8 +385,11 @@ func (s *session) pumpServer() {
 			return
 		}
 
+		// Noted as it is read, forwarded once any hold is released: a delivery's window is open before
+		// the service can act on it, however long the hold.
 		s.judge(current)
 		s.noteDelivery(current)
+		s.opts.Hold.wait()
 
 		if !s.forwardClient(current.raw) {
 			return
@@ -479,6 +487,13 @@ func (s *session) inspect(current *frame) {
 	if domain, addressed := jetStreamDomain(current.args.subject); addressed {
 		s.fail(fmt.Errorf("%w: a request to JetStream domain %s, and the embedded bus has none",
 			ErrUnsupportedBus, domain))
+	}
+
+	// A pull request's timers bound how long deliveries may be held; it stays bookkeeping.
+	if s.opts.Pulls != nil {
+		if pull, isPull := parsePull(current.args.subject, current.body[current.args.headerLen:]); isPull {
+			s.opts.Pulls.Pulled(pull)
+		}
 	}
 
 	// An acknowledgement or a pull request is delivery bookkeeping, not the service's own work.

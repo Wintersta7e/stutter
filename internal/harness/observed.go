@@ -106,7 +106,7 @@ func (s *Sandbox) runObserved(
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), s.cfg.HashKey)
 	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, s.quiesce())
 
-	observed, err := s.observe(ctx, recorder, natsproxy.Options{Acks: run, Deliveries: run})
+	observed, err := s.observe(ctx, recorder, run.options())
 	if err != nil {
 		return replay.Result{}, err
 	}
@@ -262,21 +262,7 @@ func (s *Sandbox) begin(
 
 	run.scope(target, s.startupLimit())
 
-	// The stream may already hold messages, so the corpus lands after them. The translation is
-	// installed before the first publish: the proxy notes a delivery as it reads it, and a service
-	// consuming for itself is handed a message before Fill hears back where it landed.
-	first, nextErr := s.cfg.Corpus.Next(ctx)
-	if nextErr != nil {
-		return fmt.Errorf("number the corpus: %w", nextErr)
-	}
-
-	run.stage(corpus.Numbering(messages, first))
-
-	if err := s.cfg.Corpus.Fill(ctx, messages, first); err != nil {
-		return fmt.Errorf("stage the corpus: %w", err)
-	}
-
-	return nil
+	return s.fill(ctx, run, target, messages)
 }
 
 // awaitStartup waits for the service to create a consumer on the corpus stream — the named one, when
@@ -453,6 +439,8 @@ type observedRun struct {
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
 	stream string
+	// hold keeps deliveries waiting while the corpus is published, and times itself.
+	hold fillHold
 	// startup is the limit the service had to create its consumer by, which a consumer that turns up
 	// later is told it missed.
 	startup time.Duration
@@ -513,6 +501,16 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	r.windows.open(seq, delivery.Payload)
 }
 
+// Pulled takes a pull request on the run's stream into account for the Fill hold's bound. A pull on
+// any other stream is the service's own bus work.
+func (r *observedRun) Pulled(pull natsproxy.Pull) {
+	if pull.Stream != r.stream {
+		return
+	}
+
+	r.hold.pulled(pull)
+}
+
 // Withhold decides the fate of one acknowledgement and closes the window of the message it settles.
 func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 	// Another consumer's acknowledgement of the same sequence is not the fault's target: swallowing it
@@ -548,6 +546,11 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 	r.windows.settle(seq)
 
 	return withheld
+}
+
+// options are the hooks the run is watched, faulted and held through on the bus.
+func (r *observedRun) options() natsproxy.Options {
+	return natsproxy.Options{Acks: r, Deliveries: r, Pulls: r, Hold: &r.hold.gate}
 }
 
 // stage installs the translation from the sequences this run's corpus lands at to the ones its
