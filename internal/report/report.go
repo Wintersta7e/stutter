@@ -20,6 +20,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/gate"
 	"github.com/Wintersta7e/stutter/internal/policy"
+	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
 // Exit codes. They are load-bearing and must not be conflated: a gate violation reported as a test
@@ -32,7 +33,9 @@ const (
 	ExitFail = 1
 	// ExitGateViolated means a gate was violated, so no findings were computed. NOT a test failure.
 	ExitGateViolated = 2
-	// ExitSetupError means the run never started: provisioning, the corpus, or the bus.
+	// ExitSetupError means the check could not be carried out: provisioning, the corpus or the bus failed
+	// before any run, or an environment fault — a proxy, a dependency, the service exiting where nothing
+	// could be compared — stopped a run after runs began.
 	ExitSetupError = 3
 )
 
@@ -66,6 +69,9 @@ const (
 		"unless the read calls a function that writes; declare an invariant to promote or silence it"
 	// unclassifiedNote is the fallback when even the protocol is unknown.
 	unclassifiedNote = "may be acceptable — declare an invariant to silence"
+	// stoppedNote follows the egress-policy stop that ended the faulted run: whatever the service did
+	// after it went unobserved.
+	stoppedNote = ": what the service did next is unobservable, so this is not actionable as it stands"
 )
 
 // Sort ranks, so findings order the same way on every run and can be diffed between CI runs.
@@ -163,6 +169,9 @@ type Scan struct {
 type Health struct {
 	// Refusals are the requests the bus declined before the first delivery.
 	Refusals []effect.Refusal
+	// Exit is how the service ended a clean run it exited by itself after every message was done
+	// (E26): recorded beside the verdict, never a verdict of its own. Zero when it did not exit.
+	Exit replay.Exit
 	// Messages is how many recorded messages the run was given.
 	Messages int
 	// Delivered counts deliveries, redeliveries included.
@@ -186,6 +195,15 @@ type Health struct {
 	Elsewhere int
 	// ClosedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
 	ClosedAfterInfo int
+	// Owed counts the messages still owed an acknowledgement when the clean run was cut at the
+	// owed-silence limit (E30).
+	Owed int
+	// Exhausted counts the messages that reached the delivery cap without an acknowledgement, where the
+	// consumer itself allows more deliveries (E31).
+	Exhausted int
+	// DeliveryCap is the most deliveries of one message the clean run allowed: the cap Exhausted counts
+	// against.
+	DeliveryCap int
 }
 
 // Divergence is one mutated run that behaved differently from the reference run.
@@ -211,6 +229,9 @@ type Divergence struct {
 	// Because is the reason a declared invariant gave for classifying this divergence. It is rendered
 	// beside the finding, so a promotion to FAIL is never a verdict without a stated reason.
 	Because string
+	// Stopped is the egress-policy stop that ended the faulted run (E28), empty otherwise. What the
+	// service did after it went unobserved, so the finding is held at WARN.
+	Stopped string
 	// Impact classifies what this divergence costs. Setting it overrides the protocol default.
 	Impact Impact
 	// DivergedKind is the protocol of the first effect that differed, from effect.Effect.Kind at
@@ -223,6 +244,9 @@ type Divergence struct {
 	// OffScript are the ordinals, in the same per-message sequence, of calls absent from the clean
 	// run. Each received the default stub and is rendered as signal without changing the verdict.
 	OffScript []int
+	// Exit is how the service ended the faulted run, when it exited by itself during it (E27). The run
+	// ended at the exit and the comparison stands; the finding carries the exit.
+	Exit replay.Exit
 	// DivergedAt is the ordinal of the first effect that differed from the reference run, which is
 	// gate.Result.Index from the comparison that found it. Negative means the position is unknown.
 	DivergedAt int
@@ -397,6 +421,11 @@ func (d Divergence) notes() []string {
 		declared = append(declared, "declared invariant: "+d.Because)
 	}
 
+	if d.Exit.Exited {
+		declared = append(declared, "the service exited under this fault after message #"+
+			strconv.FormatUint(d.Exit.After, 10)+": "+d.Exit.Describe())
+	}
+
 	if len(d.OffScript) == 0 {
 		return declared
 	}
@@ -435,6 +464,10 @@ func (d Divergence) reservations() []string {
 
 	if d.Clause == "" {
 		notes = append(notes, missingClauseNote)
+	}
+
+	if d.Stopped != "" {
+		notes = append(notes, "the run stopped on "+d.Stopped+stoppedNote)
 	}
 
 	if d.effectiveImpact() != ImpactCorrupting {

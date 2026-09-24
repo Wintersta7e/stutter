@@ -142,7 +142,7 @@ func startTwoConsumers(t *testing.T, store *corpus.Corpus) ([]string, string) {
 		}
 	}
 
-	names, err := store.Consumers(t.Context())
+	names, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}
@@ -224,7 +224,7 @@ func TestAnOrderedSiblingIsPausedLikeAnyOther(t *testing.T) {
 
 	t.Cleanup(consuming.Stop)
 
-	before, err := store.Consumers(t.Context())
+	before, err := corpusConsumers(t.Context(), store)
 	if err != nil || len(before) != 1 {
 		t.Fatalf("Consumers() = %q, %v, want the one ordered consumer", before, err)
 	}
@@ -243,7 +243,7 @@ func TestAnOrderedSiblingIsPausedLikeAnyOther(t *testing.T) {
 		t.Errorf("the paused ordered consumer was handed %d messages, want none", got)
 	}
 
-	after, err := store.Consumers(t.Context())
+	after, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}
@@ -274,7 +274,7 @@ func drain(t *testing.T, consumer jetstream.Consumer, wait time.Duration) int {
 func orderedConsumer(t *testing.T, store *corpus.Corpus, js jetstream.JetStream) string {
 	t.Helper()
 
-	before, err := store.Consumers(t.Context())
+	before, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}
@@ -291,7 +291,7 @@ func orderedConsumer(t *testing.T, store *corpus.Corpus, js jetstream.JetStream)
 
 	drain(t, ordered, emptyPull)
 
-	after, err := store.Consumers(t.Context())
+	after, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}

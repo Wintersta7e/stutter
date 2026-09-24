@@ -247,3 +247,34 @@ func TestReorderAcrossSubjectsNamesTheSubjectCount(t *testing.T) {
 		t.Errorf("clause = %q, want it to mention %q", verdict.Clause, want)
 	}
 }
+
+// TestEffectiveCapCountsUnlimitedAsTheCap: a run caps deliveries so a message refused forever still
+// ends, and the cap never adds a delivery the consumer would not make — so it is the smaller of the
+// two, with no limit counting as the cap.
+func TestEffectiveCapCountsUnlimitedAsTheCap(t *testing.T) {
+	t.Parallel()
+
+	const deliveryCap = 4
+
+	cases := []struct{ maxDeliver, want int }{
+		{maxDeliver: -1, want: 4},
+		{maxDeliver: 0, want: 4},
+		{maxDeliver: 2, want: 2},
+		{maxDeliver: 4, want: 4},
+		{maxDeliver: 100, want: 4},
+	}
+
+	for _, testCase := range cases {
+		got := policy.Config{MaxDeliver: testCase.maxDeliver}.EffectiveCap(deliveryCap)
+		t.Logf("MaxDeliver %d, cap %d: %d", testCase.maxDeliver, deliveryCap, got)
+
+		if got != testCase.want {
+			t.Errorf("EffectiveCap(%d) with MaxDeliver %d = %d, want %d", deliveryCap, testCase.maxDeliver, got,
+				testCase.want)
+		}
+	}
+
+	if len(cases) == 0 {
+		t.Fatal("no rows to check")
+	}
+}

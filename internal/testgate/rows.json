@@ -63,7 +63,13 @@
   {"id": "E40", "reachable": false, "reason": "an internal error has no fixture that provokes it"},
   {"id": "E61", "reachable": true},
   {"id": "E62", "reachable": true},
-  {"id": "E64", "reachable": true}
+  {"id": "E64", "reachable": true},
+  {"id": "E65", "reachable": true},
+  {"id": "E66", "reachable": true},
+  {"id": "E67", "reachable": false, "reason": "needs an engine that drops a create's labels; guarded by the driver's own tests"},
+  {"id": "E68", "reachable": false, "reason": "every volume Stutter creates is labelled, so no fixture yields an unlabelled one; guarded by the driver's own tests"},
+  {"id": "E69", "reachable": true},
+  {"id": "E70", "reachable": true}
  ],
  "refused_keys": [
   {"id": "K1", "reachable": true},

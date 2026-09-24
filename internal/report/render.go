@@ -256,7 +256,38 @@ func (h *Health) noteLines() []string {
 			detailIndent+"closed. Work a handler does not wait for is the likeliest source of instability.")
 	}
 
+	lines = append(lines, h.endNoteLines()...)
+
 	return append(lines, h.busNoteLines()...)
+}
+
+// endNoteLines names how the clean run ended where that qualifies it: messages still owed when it was
+// cut, messages that reached the delivery cap, a service that exited by itself. Each renders only when
+// there is something to say.
+func (h *Health) endNoteLines() []string {
+	var lines []string
+
+	if h.Owed > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+strconv.Itoa(h.Owed)+" of "+plural(h.Messages, "message")+
+				" were still owed an acknowledgement when the bus fell silent:",
+			detailIndent+"the run was cut there, the same way in every run.")
+	}
+
+	if h.Exhausted > 0 {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+plural(h.Exhausted, "message")+" reached the cap of "+
+				strconv.Itoa(h.DeliveryCap)+" deliveries without an acknowledgement;",
+			detailIndent+"the consumer allows more, which were not observed.")
+	}
+
+	if h.Exit.Exited {
+		lines = append(lines, "",
+			pad("NOTE", statusColumn)+"the service exited on its own after message #"+
+				strconv.FormatUint(h.Exit.After, 10)+": "+h.Exit.Describe())
+	}
+
+	return lines
 }
 
 // busNoteLines names what the bus refused and counted on the clean run. Each renders only when there

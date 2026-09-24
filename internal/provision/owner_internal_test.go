@@ -266,6 +266,67 @@ func TestGoneIsReadFromTheEngineNotFromStderr(t *testing.T) {
 	}
 }
 
+// A read whose template fails on an object the engine holds exits non-zero, exactly as a read of a
+// missing object does. It is unreadable, never absent: read as absent, a network just created was
+// reported gone, and a listing's inspect would pass over a network it could not read.
+func TestAnUnreadableObjectIsNeverAbsent(t *testing.T) {
+	t.Parallel()
+
+	engine, fake := openFakeEngine(t)
+	held := fake.add(ResourceNetwork, &fakeObject{name: "held", subnet: "10.231.11.0/24", labels: map[string]string{}})
+	fake.unreadable = map[string]bool{networkTemplate: true}
+
+	inspect := func(ref string) (bool, error) {
+		var report networkReport
+
+		req := request{verb: verbNetworkInspect, args: []arg{{val: networkTemplate}, {val: ref}}}
+
+		return engine.read(t.Context(), req, &report)
+	}
+
+	found, err := inspect(held)
+	if found || !errors.Is(err, ErrEngine) {
+		t.Fatalf("read of a network the engine holds, through a failing template = %v, %v; want ErrEngine", found,
+			err)
+	}
+
+	found, err = inspect("missing")
+	if found || err != nil {
+		t.Errorf("read of a missing network = %v, %v; want absent", found, err)
+	}
+
+	_, err = engine.CreateNetwork(t.Context(), "service", true, netip.MustParsePrefix("10.231.12.0/24"))
+	if err == nil || strings.Contains(err.Error(), "gone") {
+		t.Errorf("CreateNetwork whose read-back fails = %v, want the read's failure", err)
+	}
+}
+
+// Absent needs the presence inspect to have run and found nothing: one that never finished proves
+// nothing, and the read is an error.
+func TestAnUnfinishedPresenceReadIsNeverAbsent(t *testing.T) {
+	t.Parallel()
+
+	engine := &Engine{run: &fakeCaller{answer: func(req request) (result, error) {
+		switch {
+		case req.verb == verbVersion:
+			return result{}, nil
+		case req.args[0].val == presenceTemplate:
+			return result{exit: -1}, ErrDeadline
+		default:
+			return result{exit: 1}, &CallError{Verb: "networkInspect", Code: 1}
+		}
+	}}}
+
+	var report networkReport
+
+	req := request{verb: verbNetworkInspect, args: []arg{{val: networkTemplate}, {val: "held"}}}
+
+	found, err := engine.read(t.Context(), req, &report)
+	if found || !errors.Is(err, ErrDeadline) {
+		t.Errorf("read whose presence inspect never finished = %v, %v; want ErrDeadline", found, err)
+	}
+}
+
 // A subnet that intersects a local interface would black-hole every container's traffic to that
 // address: it is refused before any network create.
 func TestAnOverlappingSubnetIsNeverCreated(t *testing.T) {

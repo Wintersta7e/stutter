@@ -218,7 +218,10 @@ func (r relayedRig) sandbox(t *testing.T, beforeStart func(start int)) *harness.
 		t.Fatalf("generate hash key: %v", err)
 	}
 
+	// The consumer admits orders alone, so the notes it publishes into its own stream are not delivered
+	// back to it.
 	config := observedConfig()
+	config.FilterSubjects = []string{toy.SubjectOrderCreated}
 
 	var starts atomic.Int32
 
@@ -238,7 +241,7 @@ func (r relayedRig) sandbox(t *testing.T, beforeStart func(start int)) *harness.
 			return startPulling(ctx, harness.Addresses{
 				Opaque: map[string]string{opaqueCache: r.cacheAt.String()},
 				NATS:   "nats://" + r.busAt.String(),
-			}, config, quirks{filter: toy.SubjectOrderCreated, audit: true})
+			}, config, quirks{audit: true})
 		},
 	})
 	if err != nil {
@@ -406,11 +409,12 @@ func startCalling(
 	}
 
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
-		Name:          observedConsumer,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       config.AckWait,
-		MaxDeliver:    config.MaxDeliver,
-		MaxAckPending: config.MaxAckPending,
+		Name:           observedConsumer,
+		FilterSubjects: config.FilterSubjects,
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		AckWait:        config.AckWait,
+		MaxDeliver:     config.MaxDeliver,
+		MaxAckPending:  config.MaxAckPending,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create the consumer: %w", err)

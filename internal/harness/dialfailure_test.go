@@ -78,11 +78,12 @@ func startTolerant(ctx context.Context, dependency, bus string, config policy.Co
 	}
 
 	consumer, err := stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
-		Name:          observedConsumer,
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       config.AckWait,
-		MaxDeliver:    config.MaxDeliver,
-		MaxAckPending: config.MaxAckPending,
+		Name:           observedConsumer,
+		FilterSubjects: config.FilterSubjects,
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		AckWait:        config.AckWait,
+		MaxDeliver:     config.MaxDeliver,
+		MaxAckPending:  config.MaxAckPending,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create the consumer: %w", err)

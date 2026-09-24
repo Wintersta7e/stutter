@@ -10,6 +10,8 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+
+	"github.com/Wintersta7e/stutter/internal/policy"
 )
 
 // pauseHorizon is how long Pause holds a consumer. Far longer than any run, because nothing lifts the
@@ -255,43 +257,12 @@ func (c *Corpus) Pending(ctx context.Context, consumer string) (int, []string, e
 		return 0, nil, fmt.Errorf("find consumer %q: %w", consumer, err)
 	}
 
-	var filters []string
-	if info.Config.FilterSubject != "" {
-		filters = append(filters, info.Config.FilterSubject)
-	}
-
-	filters = append(filters, info.Config.FilterSubjects...)
-	slices.Sort(filters)
-
 	if info.NumPending > math.MaxInt32 {
 		return 0, nil, fmt.Errorf("%w: consumer %q has %d messages pending",
 			errTooManyPending, consumer, info.NumPending)
 	}
 
-	return int(info.NumPending) + info.NumAckPending, slices.Compact(filters), nil
-}
-
-// Consumers names every consumer on the corpus stream, in name order.
-func (c *Corpus) Consumers(ctx context.Context) ([]string, error) {
-	stream, err := c.stream.Stream(ctx, c.topic.Stream)
-	if err != nil {
-		return nil, fmt.Errorf("open the corpus stream: %w", err)
-	}
-
-	lister := stream.ConsumerNames(ctx)
-
-	var names []string
-	for name := range lister.Name() {
-		names = append(names, name)
-	}
-
-	if err := lister.Err(); err != nil {
-		return nil, fmt.Errorf("list the corpus stream's consumers: %w", err)
-	}
-
-	slices.Sort(names)
-
-	return names, nil
+	return int(info.NumPending) + info.NumAckPending, filterSubjects(info.Config), nil
 }
 
 // Pause stops the bus delivering to one consumer on the corpus stream for the rest of the run.
@@ -309,7 +280,9 @@ func (c *Corpus) Pause(ctx context.Context, consumer string) error {
 	return nil
 }
 
-// Serialise limits a consumer on the corpus stream to one unacknowledged message at a time.
+// Serialise limits a consumer on the corpus stream to one unacknowledged message at a time and to at
+// most deliveryCap deliveries of each message, and returns the consumer as it was read BEFORE the
+// rewrite.
 //
 // Attribution needs one message in flight, and a service that pulls for itself picks its own batch.
 // With several delivered at once, the order the proxy sees them settle in is not the order the service
@@ -318,28 +291,38 @@ func (c *Corpus) Pause(ctx context.Context, consumer string) error {
 // every effect was attributed one message early. With one in flight the server cannot deliver the next
 // message until the previous acknowledgement has reached it, through the proxy.
 //
-// It changes the run, not the verdict's licence: which faults are legal is still read off the
-// recorded configuration.
-func (c *Corpus) Serialise(ctx context.Context, consumer string) error {
-	stream, err := c.stream.Stream(ctx, c.topic.Stream)
+// The cap is what ends a run whose service refuses a message forever: measured on the pinned server, a
+// message refused under an unlimited MaxDeliver was delivered tens of thousands of times a second. The
+// backoff curve keeps its first entries, as many as the cap allows — the server refuses a curve longer
+// than the delivery limit — so every attempt the cap keeps lands exactly when it would have. A rewrite
+// only ever removes or delays a delivery, never adds or hastens one.
+//
+// It changes the run, not the verdict's licence: legality reads the returned, pre-rewrite
+// configuration.
+func (c *Corpus) Serialise(ctx context.Context, consumer string, deliveryCap int) (policy.Config, error) {
+	info, err := c.consumerInfo(ctx, consumer)
 	if err != nil {
-		return fmt.Errorf("open the corpus stream: %w", err)
+		return policy.Config{}, err
 	}
 
-	info, err := lookup(ctx, stream, consumer)
+	read, err := mapConfig(info.Config)
 	if err != nil {
-		return fmt.Errorf("find consumer %q: %w", consumer, err)
+		return policy.Config{}, fmt.Errorf("consumer %q: %w", consumer, err)
 	}
+
+	capped := read.EffectiveCap(deliveryCap)
 
 	// Every other field is written back as read, a push consumer's deliver subject included.
 	config := info.Config
 	config.MaxAckPending = 1
+	config.MaxDeliver = capped
+	config.BackOff = config.BackOff[:min(len(config.BackOff), capped)]
 
 	if _, err := c.stream.UpdateConsumer(ctx, c.topic.Stream, config); err != nil {
-		return fmt.Errorf("serialise consumer %q: %w", consumer, err)
+		return policy.Config{}, fmt.Errorf("serialise consumer %q: %w", consumer, err)
 	}
 
-	return nil
+	return read, nil
 }
 
 // lookup reads a consumer's configuration whatever its kind. The client hands out pull and push

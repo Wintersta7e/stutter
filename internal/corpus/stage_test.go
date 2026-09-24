@@ -10,6 +10,8 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
+	"github.com/Wintersta7e/stutter/internal/harness"
+	"github.com/Wintersta7e/stutter/internal/policy"
 )
 
 // firstOrder is the message every test here keeps, named once so the assertions and the fixture
@@ -378,7 +380,7 @@ func TestAPausedConsumerIsHandedNothing(t *testing.T) {
 	create("paused")
 	create("scoped")
 
-	names, err := store.Consumers(t.Context())
+	names, err := corpusConsumers(t.Context(), store)
 	if err != nil {
 		t.Fatalf("Consumers() error = %v", err)
 	}
@@ -434,7 +436,7 @@ func TestASerialisedConsumerHasOneMessageInFlight(t *testing.T) {
 		t.Fatalf("CreateOrUpdateConsumer() error = %v", err)
 	}
 
-	if err := store.Serialise(t.Context(), "batching"); err != nil {
+	if _, err := store.Serialise(t.Context(), "batching", harness.DeliveryCap); err != nil {
 		t.Fatalf("Serialise() error = %v", err)
 	}
 
@@ -491,8 +493,14 @@ func TestSerialiseFindsAPushConsumer(t *testing.T) {
 		t.Fatalf("CreateOrUpdatePushConsumer() error = %v", err)
 	}
 
-	if err = store.Serialise(t.Context(), pushedConsumer); err != nil {
+	read, err := store.Serialise(t.Context(), pushedConsumer, harness.DeliveryCap)
+	if err != nil {
 		t.Fatalf("Serialise() error = %v", err)
+	}
+
+	// What it returns is the consumer as it was before the rewrite, push or not.
+	if read.AckMode != policy.AckExplicit || read.MaxAckPending != 100 {
+		t.Errorf("Serialise() read %+v, want the push consumer explicit with MaxAckPending 100", read)
 	}
 
 	pushed, err := stream.PushConsumer(t.Context(), corpus.StreamName, pushedConsumer)
@@ -508,6 +516,138 @@ func TestSerialiseFindsAPushConsumer(t *testing.T) {
 
 	if config.DeliverSubject != deliverTo {
 		t.Errorf("DeliverSubject = %q, want %q unchanged", config.DeliverSubject, deliverTo)
+	}
+}
+
+// TestSerialiseCapsDeliveriesAndReturnsWhatItRead: one call holds the consumer to one message in
+// flight and to the run's delivery cap, trimming the backoff curve to match — the server refuses a
+// curve longer than the delivery limit — and hands back the consumer as it was, which is what
+// legality reads.
+func TestSerialiseCapsDeliveriesAndReturnsWhatItRead(t *testing.T) {
+	t.Parallel()
+
+	store := stocked(t)
+	js := directJetStream(t, store)
+	curve := []time.Duration{
+		200 * time.Millisecond, 500 * time.Millisecond, 900 * time.Millisecond, 2 * time.Second, 5 * time.Second,
+	}
+
+	cases := []struct {
+		created       jetstream.ConsumerConfig
+		maxDeliver    int
+		backOff       int
+		maxAckPending int
+	}{
+		{
+			created: jetstream.ConsumerConfig{
+				Durable:       curvedConsumer,
+				BackOff:       curve,
+				MaxDeliver:    100,
+				MaxAckPending: 1000,
+			},
+			maxDeliver:    4,
+			backOff:       4,
+			maxAckPending: 1,
+		},
+		{
+			created:    jetstream.ConsumerConfig{Durable: "unlimited", AckWait: time.Second},
+			maxDeliver: 4, maxAckPending: 1,
+		},
+		{
+			created:    jetstream.ConsumerConfig{Durable: "short", AckWait: time.Second, MaxDeliver: 2},
+			maxDeliver: 2, maxAckPending: 1,
+		},
+	}
+
+	for _, testCase := range cases {
+		name := testCase.created.Durable
+
+		if _, err := js.CreateOrUpdateConsumer(t.Context(), corpus.StreamName, testCase.created); err != nil {
+			t.Fatalf("CreateOrUpdateConsumer(%s) error = %v", name, err)
+		}
+
+		read, err := store.Serialise(t.Context(), name, harness.DeliveryCap)
+		if err != nil {
+			t.Fatalf("Serialise(%s) error = %v", name, err)
+		}
+
+		consumer, err := js.Consumer(t.Context(), corpus.StreamName, name)
+		if err != nil {
+			t.Fatalf("Consumer(%s) error = %v", name, err)
+		}
+
+		held := consumer.CachedInfo().Config
+		t.Logf("%s: read MaxDeliver %d, %d backoff entries, MaxAckPending %d; now MaxDeliver %d, %d entries, "+
+			"MaxAckPending %d", name, read.MaxDeliver, len(read.BackOff), read.MaxAckPending, held.MaxDeliver,
+			len(held.BackOff), held.MaxAckPending)
+
+		unread := read.MaxDeliver != 100 || len(read.BackOff) != len(curve) || read.MaxAckPending != 1000
+		if name == curvedConsumer && unread {
+			t.Errorf("%s: Serialise() returned %+v, want the configuration as it was before the rewrite", name, read)
+		}
+
+		if held.MaxDeliver != testCase.maxDeliver || len(held.BackOff) != testCase.backOff ||
+			held.MaxAckPending != testCase.maxAckPending {
+			t.Errorf("%s: the server holds MaxDeliver %d, %d entries, MaxAckPending %d; want %d, %d, %d", name,
+				held.MaxDeliver, len(held.BackOff), held.MaxAckPending, testCase.maxDeliver, testCase.backOff,
+				testCase.maxAckPending)
+		}
+	}
+
+	if len(cases) == 0 {
+		t.Fatal("no consumers to serialise")
+	}
+}
+
+// TestDiscoveryReadsTheConfigBeforeSerialise: the configuration legality is decided from is the one
+// the service created, with the server's defaults filled in — not the one Serialise leaves behind for
+// the run, which would license nothing that needs two messages in flight.
+func TestDiscoveryReadsTheConfigBeforeSerialise(t *testing.T) {
+	t.Parallel()
+
+	store := stocked(t)
+	js := directJetStream(t, store)
+
+	create := func(config jetstream.ConsumerConfig) policy.Config {
+		t.Helper()
+
+		if _, err := js.CreateOrUpdateConsumer(t.Context(), corpus.StreamName, config); err != nil {
+			t.Fatalf("CreateOrUpdateConsumer(%s) error = %v", config.Durable, err)
+		}
+
+		read, err := store.Serialise(t.Context(), config.Durable, harness.DeliveryCap)
+		if err != nil {
+			t.Fatalf("Serialise(%s) error = %v", config.Durable, err)
+		}
+
+		return read
+	}
+
+	batching := create(jetstream.ConsumerConfig{Durable: "batching", MaxAckPending: 10})
+	t.Logf("batching: read MaxAckPending %d, first deadline %s", batching.MaxAckPending, batching.Deadline(1))
+
+	if batching.MaxAckPending != 10 || batching.Deadline(1) != 30*time.Second {
+		t.Errorf("Serialise() read MaxAckPending %d and a first deadline of %s, want 10 and the server's 30s",
+			batching.MaxAckPending, batching.Deadline(1))
+	}
+
+	after, err := store.Policy(t.Context(), "batching")
+	if err != nil {
+		t.Fatalf("Policy() error = %v", err)
+	}
+
+	if after.MaxAckPending != 1 {
+		t.Errorf("Policy() after Serialise reads MaxAckPending %d, want the run's 1", after.MaxAckPending)
+	}
+
+	curved := create(jetstream.ConsumerConfig{
+		Durable: curvedConsumer,
+		AckWait: 2 * time.Minute,
+		BackOff: []time.Duration{time.Second, 5 * time.Second},
+	})
+
+	if got := curved.Deadline(1); got != time.Second {
+		t.Errorf("Serialise() read a first deadline of %s, want the curve's first entry 1s", got)
 	}
 }
 
