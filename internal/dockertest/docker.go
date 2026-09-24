@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
 )
 
@@ -147,16 +148,21 @@ func removeVerbs() map[Object]verbID {
 }
 
 // CreateSpec is a container a test creates. Env reaches the container through stdin, never argv.
-// Mounts are --mount values; Publish ports are published on 127.0.0.1 at a port the engine picks.
+// Mounts are --mount values. Publish ports are published on 127.0.0.1 at a host port selected the
+// way the driver selects one, never one the engine picks; a start the engine refuses for it fails the
+// test, naming the port.
 type CreateSpec struct {
-	Env     map[string]string
-	Labels  map[string]string
-	Image   string
-	Name    string
-	Network string
-	Cmd     []string
-	Mounts  []string
-	Publish []uint16
+	Env    map[string]string
+	Labels map[string]string
+	// PublishOn publishes each container port on 127.0.0.1 at exactly the host port given, for a test
+	// that must hold one particular port.
+	PublishOn map[uint16]uint16
+	Image     string
+	Name      string
+	Network   string
+	Cmd       []string
+	Mounts    []string
+	Publish   []uint16
 	// Unlabelled leaves the test label off, for a decoy whose point is carrying none. It is still
 	// tracked and removed by its exact ID.
 	Unlabelled bool
@@ -181,7 +187,9 @@ var (
 
 // owned is one resource a helper in this process created.
 type owned struct {
-	what    Object
+	what Object
+	// ports are the host ports selected for it, released when it is removed.
+	ports   []uint16
 	removed bool
 }
 
@@ -253,24 +261,8 @@ func (d *Docker) Create(tb testing.TB, spec CreateSpec) string {
 		d.fresh(tb, ObjectContainer, spec.Name)
 	}
 
-	image := d.Inspect(tb, ObjectImage, spec.Image)
-	if image == nil {
-		d.must(tb, call{verb: verbPull, args: []string{spec.Image}})
-		image = d.Inspect(tb, ObjectImage, spec.Image)
-	}
-
-	labels := spec.Labels
-	if key, _ := d.engine.TestLabel(); spec.Unlabelled {
-		// An image's labels reach every container made from it, and a create only overrides a key.
-		if _, carried := readLabelled(tb, image).Config.Labels[key]; carried {
-			tb.Fatalf("an unlabelled container cannot come from %s: the image carries %s", spec.Image, key)
-		}
-	} else {
-		labels = d.withTestLabel(labels)
-	}
-
 	args, stdin := envArgs(tb, spec.Env)
-	args = append(args, labelArgs(labels)...)
+	args = append(args, labelArgs(d.containerLabels(tb, spec))...)
 
 	if spec.Name != "" {
 		args = append(args, "--name", spec.Name)
@@ -284,16 +276,61 @@ func (d *Docker) Create(tb testing.TB, spec CreateSpec) string {
 		args = append(args, "--mount", mount)
 	}
 
-	for _, port := range spec.Publish {
-		args = append(args, "--publish", "127.0.0.1::"+strconv.Itoa(int(port)))
+	hostPorts, selected := selectHostPorts(tb, spec)
+
+	created := false
+
+	// A create that fails ends the test here, and the selected ports go back.
+	defer func() {
+		if !created {
+			for _, port := range selected {
+				provision.ReleaseHostPort(port)
+			}
+		}
+	}()
+
+	for _, port := range slices.Sorted(maps.Keys(hostPorts)) {
+		args = append(args, "--publish", "127.0.0.1:"+strconv.Itoa(int(hostPorts[port]))+":"+strconv.Itoa(int(port)))
 	}
 
 	args = append(append(args, spec.Image), spec.Cmd...)
 
 	id := d.must(tb, call{verb: verbCreate, args: args, stdin: stdin})
-	d.own(tb, ObjectContainer, id)
+	d.own(tb, ObjectContainer, id, selected...)
+
+	created = true
 
 	return id
+}
+
+// selectHostPorts is the host port of each container port a spec publishes, and those of them
+// selected here: PublishOn's as given, Publish's through the driver's selection, reserved until the
+// container is removed.
+func selectHostPorts(tb testing.TB, spec CreateSpec) (map[uint16]uint16, []uint16) {
+	tb.Helper()
+
+	hostPorts := maps.Clone(spec.PublishOn)
+	if hostPorts == nil {
+		hostPorts = map[uint16]uint16{}
+	}
+
+	selected := make([]uint16, 0, len(spec.Publish))
+
+	for _, port := range spec.Publish {
+		host, err := provision.ReserveHostPort(tb.Context())
+		if err != nil {
+			for _, reserved := range selected {
+				provision.ReleaseHostPort(reserved)
+			}
+
+			tb.Fatalf("select a host port for container port %d: %v", port, err)
+		}
+
+		hostPorts[port] = host
+		selected = append(selected, host)
+	}
+
+	return hostPorts, selected
 }
 
 // Start starts a container a helper in this process created.
@@ -590,6 +627,31 @@ type answer struct {
 	exit   int
 }
 
+// containerLabels are the labels a container is created with, its image pulled first only when the
+// engine does not hold it: the spec's plus the test label, or the spec's alone for an unlabelled
+// decoy, whose image must not carry the test label either.
+func (d *Docker) containerLabels(tb testing.TB, spec CreateSpec) map[string]string {
+	tb.Helper()
+
+	image := d.Inspect(tb, ObjectImage, spec.Image)
+	if image == nil {
+		d.must(tb, call{verb: verbPull, args: []string{spec.Image}})
+		image = d.Inspect(tb, ObjectImage, spec.Image)
+	}
+
+	key, _ := d.engine.TestLabel()
+	if !spec.Unlabelled {
+		return d.withTestLabel(spec.Labels)
+	}
+
+	// An image's labels reach every container made from it, and a create only overrides a key.
+	if _, carried := readLabelled(tb, image).Config.Labels[key]; carried {
+		tb.Fatalf("an unlabelled container cannot come from %s: the image carries %s", spec.Image, key)
+	}
+
+	return spec.Labels
+}
+
 // run makes one call from the verb table. It is the only place a test spawns anything.
 func (d *Docker) run(tb testing.TB, c call) answer {
 	tb.Helper()
@@ -649,13 +711,14 @@ func (d *Docker) must(tb testing.TB, c call) string {
 	return strings.TrimSpace(string(a.out))
 }
 
-// own records a resource this process created and removes it by exact ID when tb ends. Cleanups run
-// last-in first-out, so a container goes before the image, volume or network it uses.
-func (d *Docker) own(tb testing.TB, what Object, id string) {
+// own records a resource this process created, with the host ports selected for it, and removes it
+// by exact ID when tb ends. Cleanups run last-in first-out, so a container goes before the image,
+// volume or network it uses.
+func (d *Docker) own(tb testing.TB, what Object, id string, ports ...uint16) {
 	tb.Helper()
 
 	ownedMu.Lock()
-	ownedByID[id] = &owned{what: what}
+	ownedByID[id] = &owned{what: what, ports: ports}
 	ownedMu.Unlock()
 
 	tb.Cleanup(func() {
@@ -688,7 +751,12 @@ func (d *Docker) removeOwned(tb testing.TB, id string) error {
 
 	ownedMu.Lock()
 	entry.removed = true
+	ports := entry.ports
 	ownedMu.Unlock()
+
+	for _, port := range ports {
+		provision.ReleaseHostPort(port)
+	}
 
 	return nil
 }

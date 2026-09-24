@@ -21,21 +21,24 @@ type expectation struct {
 	// anonymous are the anonymous volumes found carrying this check's labels.
 	anonymous map[string]bool
 	// networks are this check's networks, by name.
-	networks  map[string]bool
+	networks map[string]bool
+	// ports maps each published container port, as the engine names it ("5432/tcp"), to the host port
+	// selected for it.
+	ports     map[string]string
 	noNetwork bool
 }
 
 // verifyContainer is the post-create verification, over what the engine reports: restart, log
 // driver and removal settings; no privilege, device, borrowed volume, refused capability or shared
 // namespace; only storage the check owns, with every bind recursively read-only; only the check's
-// networks; ports only on loopback with an engine-assigned host port.
+// networks; each port published only on loopback, at the host port selected for it.
 func verifyContainer(r containerReport, x expectation) error {
 	for _, check := range []func() error{
 		func() error { return verifySettings(r) },
 		func() error { return verifyPrivileges(r) },
 		func() error { return verifyMounts(r, x) },
 		func() error { return verifyNetworks(r, x) },
-		func() error { return verifyPorts(r) },
+		func() error { return verifyPorts(r, x) },
 	} {
 		if err := check(); err != nil {
 			return err
@@ -140,15 +143,26 @@ func verifyNetworks(r containerReport, x expectation) error {
 	return nil
 }
 
-func verifyPorts(r containerReport) error {
+func verifyPorts(r containerReport, x expectation) error {
 	if r.PublishAll {
 		return fmt.Errorf("%w: it publishes every port", errNotAsAsked)
 	}
 
+	bound := map[string]bool{}
+
 	for _, b := range r.Bindings {
-		if b.HostIP != "127.0.0.1" || b.HostPort != "" {
-			return fmt.Errorf("%w: port %s is bound on %s:%s, not loopback with an engine-assigned port",
+		selected, asked := x.ports[b.Port]
+		if !asked || b.HostIP != loopbackHost || b.HostPort != selected {
+			return fmt.Errorf("%w: port %s is bound on %s:%s, not loopback at the host port selected for it",
 				errNotAsAsked, b.Port, b.HostIP, b.HostPort)
+		}
+
+		bound[b.Port] = true
+	}
+
+	for port, selected := range x.ports {
+		if !bound[port] {
+			return fmt.Errorf("%w: port %s is not bound at host port %s", errNotAsAsked, port, selected)
 		}
 	}
 

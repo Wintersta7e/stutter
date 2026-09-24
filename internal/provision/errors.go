@@ -22,6 +22,9 @@ var (
 	// ErrSubnetTaken means the engine refused a network create because another network holds an
 	// intersecting subnet; another subnet may succeed.
 	ErrSubnetTaken = errors.New("subnet taken on the engine")
+	// ErrPortTaken means the engine refused to start a container on every host port it was given:
+	// something else held each one when the container started.
+	ErrPortTaken = errors.New("host port taken on the engine")
 	// ErrSubnetOverlap means a requested subnet is not a masked IPv4 prefix, or intersects a prefix
 	// of a local interface; it is refused before any call.
 	ErrSubnetOverlap = errors.New("subnet refused")
