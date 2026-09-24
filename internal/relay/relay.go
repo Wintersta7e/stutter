@@ -58,8 +58,16 @@ func (s system) run(ctx context.Context, args []string, stdout, stderr io.Writer
 		}
 
 		return s.serve(ctx, spec, stdout, stderr)
+	case modeVerify:
+		verify, err := ParseVerify(args)
+		if err != nil {
+			return report(stderr, exitArgv, err)
+		}
+
+		return s.verify(ctx, verify, stdout, stderr)
 	default:
-		return report(stderr, exitArgv, fmt.Errorf("%w: unknown mode %q, want %s", errArgv, mode, modeServe))
+		return report(stderr, exitArgv,
+			fmt.Errorf("%w: unknown mode %q, want %s or %s", errArgv, mode, modeServe, modeVerify))
 	}
 }
 

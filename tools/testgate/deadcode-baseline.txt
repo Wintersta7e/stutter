@@ -41,7 +41,11 @@ github.com/Wintersta7e/stutter/internal/relay.Verify.Args
 github.com/Wintersta7e/stutter/internal/relay.Copy.Args
 github.com/Wintersta7e/stutter/internal/relay.ParseCopy
 github.com/Wintersta7e/stutter/internal/relay.parsePath
-# Verify mode's argv: read by `stutter relay verify` once that mode is dispatched.
-github.com/Wintersta7e/stutter/internal/relay.ParseVerify
-github.com/Wintersta7e/stutter/internal/relay.parseDial
-github.com/Wintersta7e/stutter/internal/relay.parseTarget
+# The static-self check: called by the compose path before it creates any resource.
+github.com/Wintersta7e/stutter/internal/relay.Qualify
+github.com/Wintersta7e/stutter/internal/relay.goArch
+github.com/Wintersta7e/stutter/internal/relay.qualifyFor
+# The relay image's layer and configuration: imported by the compose path once per check.
+github.com/Wintersta7e/stutter/internal/relay.ImageChanges
+github.com/Wintersta7e/stutter/internal/relay.Layer
+github.com/Wintersta7e/stutter/internal/relay.writeLayer

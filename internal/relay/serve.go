@@ -31,6 +31,8 @@ var (
 type system struct {
 	// addresses lists the IP addresses on the relay's own interfaces.
 	addresses func() ([]netip.Addr, error)
+	// lookup resolves a name to IPv4 addresses, for the verifier's host alias.
+	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
 	// portRangeFile holds the kernel's source-port range, which the catch-all leaves free.
 	portRangeFile string
 	// catchAllFirst and catchAllLast bound the ports a catch-all covers before any exclusion: every TCP
@@ -45,6 +47,7 @@ type system struct {
 func hostSystem() system {
 	return system{
 		addresses:     interfaceAddresses,
+		lookup:        lookupIPv4,
 		portRangeFile: localPortRange,
 		catchAllFirst: 1,
 		catchAllLast:  math.MaxUint16,
