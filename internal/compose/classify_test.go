@@ -125,6 +125,7 @@ func TestEveryRoleIsDerivedAndCounted(t *testing.T) {
 		t.Parallel()
 
 		attached := modelFrom(t, `{"name": "shop", "services": {"api": {"networks": {"default": null}},
+			"bus": {"expose": ["4222"], "networks": {"default": null}},
 			"side": {"network_mode": "service:api"}}}`)
 
 		if _, err := compose.Classify(attached, nil, nil); !errors.Is(err, compose.ErrModel) ||
@@ -140,7 +141,8 @@ func TestPgLineageMakesADatastore(t *testing.T) {
 	model := modelFrom(t, `{"name": "shop", "services": {
 		"api": {"volumes": [{"type": "bind", "source": "/project/dsn", "target": "/run/dsn"}],
 			"networks": {"default": null}},
-		"store": {"image": "example.test/store:18", "networks": {"default": null}}
+		"store": {"image": "example.test/store:18", "networks": {"default": null}},
+		"bus": {"expose": ["4222"], "networks": {"default": null}}
 	}}`)
 	images := map[string]compose.Image{storeService: {ID: storeImage, Env: []string{"PG_MAJOR=18"}}}
 
@@ -161,7 +163,8 @@ func TestPgLineageMakesADatastore(t *testing.T) {
 // promotionModel has a Postgres-speaking service with no evidence but its exposed port.
 const promotionModel = `{"name": "shop", "services": {
 	"api": {"networks": {"default": null}},
-	"store": {"image": "example.test/store:1", "expose": ["5433"], "networks": {"default": null}}
+	"store": {"image": "example.test/store:1", "expose": ["5433"], "networks": {"default": null}},
+	"bus": {"expose": ["4222"], "networks": {"default": null}}
 }}`
 
 func TestAHandshakePromotesAnOpaqueEndpoint(t *testing.T) {
@@ -194,7 +197,8 @@ func TestAContradictedPgEndpointIsRefused(t *testing.T) {
 
 	model := modelFrom(t, `{"name": "shop", "services": {
 		"api": {"environment": {"DATABASE_URL": "postgres://db:5432/app"}, "networks": {"default": null}},
-		"db": {"networks": {"default": null}}
+		"db": {"networks": {"default": null}},
+		"bus": {"expose": ["4222"], "networks": {"default": null}}
 	}}`)
 
 	_, err := compose.Classify(model, nil, map[string]map[uint16]pg.Answer{"db": {5432: pg.AnswerOther}})
@@ -212,7 +216,8 @@ func TestADeclaredRoleReplacesTheDerivedOne(t *testing.T) {
 		return []byte(`{"name": "shop", "services": {
 			"api": {"environment": {"CACHE": "cache:6379"}, "networks": {"default": null}},
 			"mock": {"networks": {"default": null}},
-			"cache": {"networks": {"default": null}}
+			"cache": {"networks": {"default": null}},
+			"bus": {"expose": ["4222"], "networks": {"default": null}}
 		}, "x-stutter": {"roles": {"mock": "datastore"}, "endpoints": {"cache": {"6379": "http"}}}}`), 0, nil
 	}}
 
@@ -250,7 +255,8 @@ func TestAnEncryptedDependencyEndpointIsRefused(t *testing.T) {
 		return `{"name": "shop", "services": {
 			"api": {"environment": {"CACHE": "rediss://:pw@cache:6380/0", "MOCK": "https://mock:8443/x"},
 				"networks": {"default": null}},
-			"cache": ` + cacheBody + `, "mock": ` + mockBody + `}}`
+			"cache": ` + cacheBody + `, "mock": ` + mockBody + `,
+			"bus": {"expose": ["4222"], "networks": {"default": null}}}}`
 	}
 
 	_, err := compose.Classify(modelFrom(t, encrypted(`{"networks": {"default": null}}`,
@@ -281,7 +287,8 @@ func TestCandidatesAreStillOpaqueEndpoints(t *testing.T) {
 			"networks": {"default": null}},
 		"db": {"expose": ["9187", "53/udp"], "networks": {"default": null}},
 		"cache": {"networks": {"default": null}},
-		"worker": {"build": {"context": "/p"}, "expose": ["7000"], "networks": {"default": null}}
+		"worker": {"build": {"context": "/p"}, "expose": ["7000"], "networks": {"default": null}},
+		"bus": {"expose": ["4222"], "networks": {"default": null}}
 	}}`)
 
 	want := map[string][]uint16{"cache": {6379}, "db": {9187}}
@@ -297,7 +304,8 @@ func TestPassTwoOnlyPromotesStartedServices(t *testing.T) {
 		"api": {"depends_on": {"db": {"condition": "service_started"}}, "networks": {"default": null}},
 		"db": {"image": "example.test/store:18", "networks": {"default": null}},
 		"worker": {"build": {"context": "/p"}, "networks": {"default": null}},
-		"far": {"image": "example.test/store:18", "networks": {"elsewhere": null}}
+		"far": {"image": "example.test/store:18", "networks": {"elsewhere": null}},
+		"bus": {"expose": ["4222"], "networks": {"default": null}}
 	}}`)
 	lineage := compose.Image{ID: storeImage, Env: []string{"PG_MAJOR=18"}}
 	resolvable := map[string]compose.Image{"db": lineage, "worker": lineage, "far": lineage}
