@@ -40,6 +40,9 @@ type fakeObject struct {
 	tags     []string
 	internal bool
 	ipv6     bool
+	// unlisted is a network whose pool the engine holds while no listing shows it: one being created or
+	// removed.
+	unlisted bool
 }
 
 // fakeCall is one call the fake engine answered: its verb, its argv after the program, and the
@@ -446,6 +449,10 @@ func (f *fakeEngine) list(typ ResourceType, rest []string) (result, error) {
 	var out strings.Builder
 
 	for _, obj := range f.objects[typ] {
+		if obj.unlisted {
+			continue
+		}
+
 		if len(rest) == 3 && rest[1] == "--filter" {
 			key, value, hasValue := strings.Cut(strings.TrimPrefix(rest[2], "label="), "=")
 			if got, ok := obj.labels[key]; !ok || hasValue && got != value {

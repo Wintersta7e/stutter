@@ -37,12 +37,22 @@ func TestAnUpstreamClosedBeforeAnyByteIsADialFailure(t *testing.T) {
 			proxy, done := startProxy(t, startUpstream(t, hangUp.upstream), current)
 			t.Cleanup(func() { _ = proxy.Close() })
 
-			client := dial(t, proxy.Addr())
-			defer func() { _ = client.Close() }()
+			// The proxy may see the dependency hang up, and reset the client, before the request is sent —
+			// or, on a loaded host, before the dial reads back its own connect. Either is the same refusal.
+			dialer := net.Dialer{Timeout: time.Second}
 
-			// The proxy may see the dependency hang up, and reset the client, before the request is sent.
-			if _, err := io.WriteString(client, "GET counter\n"); err != nil && !errors.Is(err, syscall.ECONNRESET) {
+			client, err := dialer.DialContext(t.Context(), "tcp", proxy.Addr())
+			if err != nil && !errors.Is(err, syscall.ECONNRESET) {
 				t.Fatal(err)
+			}
+
+			if client != nil {
+				defer func() { _ = client.Close() }()
+
+				_, err := io.WriteString(client, "GET counter\n")
+				if err != nil && !errors.Is(err, syscall.ECONNRESET) {
+					t.Fatal(err)
+				}
 			}
 
 			select {
@@ -54,12 +64,14 @@ func TestAnUpstreamClosedBeforeAnyByteIsADialFailure(t *testing.T) {
 				t.Fatal("Serve() = <still running>, want ErrUpstreamClosed within 2s")
 			}
 
-			if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
-				t.Fatal(err)
-			}
+			if client != nil {
+				if err := client.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+					t.Fatal(err)
+				}
 
-			if reply, _ := io.ReadAll(client); len(reply) != 0 { //nolint:errcheck // the bytes are the check.
-				t.Errorf("client received %q, want no reply", reply)
+				if reply, _ := io.ReadAll(client); len(reply) != 0 { //nolint:errcheck // the bytes are the check.
+					t.Errorf("client received %q, want no reply", reply)
+				}
 			}
 
 			if texts := current.texts(); len(texts) != 0 {

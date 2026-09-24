@@ -282,8 +282,19 @@ func (e *Engine) networkRefused(ctx context.Context, rec record, subnet netip.Pr
 		}
 	}
 
+	// A network being created or removed holds its pool while no listing shows it, so the engine's own
+	// refusal of the pool is the subnet taken even with no holder to name.
+	if strings.Contains(cause.Error(), poolOverlap) {
+		return errors.Join(fmt.Errorf("%w: %s is held by a network the engine does not list", ErrSubnetTaken,
+			subnet), resolved)
+	}
+
 	return errors.Join(cause, resolved)
 }
+
+// poolOverlap is the engine's refusal of a subnet another network's pool holds. Measured identical on
+// Engine 28.0.4 and 29.6.2.
+const poolOverlap = "Pool overlaps with other one on this address space"
 
 // verifyNetwork proves a created network is this check's and is what was asked for. One without
 // this check's labels is never touched; one that differs otherwise is removed.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -42,20 +43,40 @@ func readNetwork(t *testing.T, docker *dockertest.Docker, network *provision.Net
 	return inspected
 }
 
-// localPrefixes are this host's IPv4 interface prefixes, read by the test itself.
-func localPrefixes(t *testing.T) []netip.Prefix {
+// bridgeOf is the host interface a native engine gives a bridge network: "br-" and the network ID's
+// first twelve characters.
+func bridgeOf(network *provision.Network) string {
+	return "br-" + network.ID()[:12]
+}
+
+// localPrefixes are this host's IPv4 interface prefixes, read by the test itself, leaving out the
+// interfaces named in own. On a native engine every network is a bridge interface of this host, so a
+// network's own bridge carries its subnet; any other network's bridge cannot, the engine refusing an
+// overlapping pool.
+func localPrefixes(t *testing.T, own ...string) []netip.Prefix {
 	t.Helper()
 
-	addrs, err := net.InterfaceAddrs()
+	interfaces, err := net.Interfaces()
 	if err != nil {
-		t.Fatalf("list the interface addresses: %v", err)
+		t.Fatalf("list the interfaces: %v", err)
 	}
 
 	var prefixes []netip.Prefix
 
-	for _, entry := range addrs {
-		if prefix, err := netip.ParsePrefix(entry.String()); err == nil && prefix.Addr().Unmap().Is4() {
-			prefixes = append(prefixes, prefix.Masked())
+	for _, iface := range interfaces {
+		if slices.Contains(own, iface.Name) {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			t.Fatalf("list the addresses of %s: %v", iface.Name, err)
+		}
+
+		for _, entry := range addrs {
+			if prefix, err := netip.ParsePrefix(entry.String()); err == nil && prefix.Addr().Unmap().Is4() {
+				prefixes = append(prefixes, prefix.Masked())
+			}
 		}
 	}
 
@@ -70,7 +91,6 @@ func TestEveryNetworkGetsAVerifiedFreeSubnet(t *testing.T) {
 	t.Parallel()
 
 	candidates := netip.MustParsePrefix("172.16.0.0/12")
-	locals := localPrefixes(t)
 
 	for check := range 4 {
 		t.Run(fmt.Sprintf("check-%d", check+1), func(t *testing.T) {
@@ -89,6 +109,10 @@ func TestEveryNetworkGetsAVerifiedFreeSubnet(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Occupied() error = %v", err)
 			}
+
+			// Read now, not once before the checks: another test's network, present then and removed
+			// since, leaves a subnet the pick may rightly reuse.
+			locals := localPrefixes(t, bridgeOf(networks.Service), bridgeOf(networks.Dependency))
 
 			checked := 0
 

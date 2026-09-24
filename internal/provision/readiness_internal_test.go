@@ -115,9 +115,7 @@ func TestTheProbeWaitsPastAcceptedResets(t *testing.T) {
 			return
 		}
 
-		if _, err := io.ReadFull(conn, make([]byte, 8)); err == nil {
-			_, _ = conn.Write([]byte{'N'}) //nolint:errcheck // the probe's answer is what the test checks.
-		}
+		answerAsPostgres(conn, func() string { return "" })
 	})
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
@@ -129,8 +127,9 @@ func TestTheProbeWaitsPastAcceptedResets(t *testing.T) {
 
 	t.Logf("k=%d accepts=%d", resets, accepted.Load())
 
-	if got := accepted.Load(); got != resets+1 {
-		t.Errorf("the listener accepted %d connections, want %d: the probe stopped before the answer", got, resets+1)
+	// The resets, the handshake that ended them, and the startup that found a session served.
+	if got := accepted.Load(); got != resets+2 {
+		t.Errorf("the listener accepted %d connections, want %d: the probe stopped before the answer", got, resets+2)
 	}
 }
 

@@ -352,8 +352,8 @@ func TestAnOverlappingSubnetIsNeverCreated(t *testing.T) {
 	t.Logf("refused=%d creates=0", len(refused))
 }
 
-// The engine refusing a requested subnet is decided from what the engine holds afterwards, never
-// from its stderr: a network now holding an intersecting subnet makes it ErrSubnetTaken.
+// The engine refusing a requested subnet is decided first from what the engine holds afterwards: a
+// network now holding an intersecting subnet makes it ErrSubnetTaken, and names that network.
 func TestAnEngineRefusalIsSubnetTaken(t *testing.T) {
 	t.Parallel()
 
@@ -368,6 +368,23 @@ func TestAnEngineRefusalIsSubnetTaken(t *testing.T) {
 	seq := engine.book.led.seq
 	if ops := entriesFor(t, engine, seq); ops[len(ops)-1] != opAbsent {
 		t.Errorf("the refused create's intent ends %v, want absent", ops)
+	}
+}
+
+// A network being created or removed holds its pool while no listing shows it. Measured on a native
+// 28.0.4 engine with networks coming and going: the refusal found no holder and was final, so the check
+// failed where another subnet was free. The engine's own refusal of the pool is the subnet taken.
+func TestARefusalByAnUnlistedNetworkIsSubnetTaken(t *testing.T) {
+	t.Parallel()
+
+	engine, fake := openFakeEngine(t)
+	fake.add(ResourceNetwork, &fakeObject{
+		name: "leaving", subnet: "10.231.7.0/24", labels: map[string]string{}, unlisted: true,
+	})
+
+	_, err := engine.CreateNetwork(t.Context(), "service", true, netip.MustParsePrefix("10.231.7.0/24"))
+	if !errors.Is(err, ErrSubnetTaken) {
+		t.Fatalf("CreateNetwork = %v, want ErrSubnetTaken", err)
 	}
 }
 

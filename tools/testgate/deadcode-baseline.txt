@@ -26,6 +26,11 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
 github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
 github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
+# Waiting for a Postgres dependency to accept sessions: called by the compose path's dependency readiness.
+github.com/Wintersta7e/stutter/internal/proxy/pg.Accepting
+github.com/Wintersta7e/stutter/internal/proxy/pg.acceptingOnce
+github.com/Wintersta7e/stutter/internal/proxy/pg.refusesSessions
+github.com/Wintersta7e/stutter/internal/proxy/pg.startupMessage
 # The probe start and discovery: called by the compose path before the first consumer check.
 github.com/Wintersta7e/stutter/internal/harness.Discover
 github.com/Wintersta7e/stutter/internal/harness.Discovery.diagnosis

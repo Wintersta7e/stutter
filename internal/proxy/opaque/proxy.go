@@ -224,8 +224,8 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	var pumps sync.WaitGroup
 
-	pumps.Go(func() { current.ended(pump(upstream, client, current.answered), true) })
-	current.ended(pump(client, upstream, current.session.requested), false)
+	pumps.Go(func() { current.ended(pump(upstream, client, current.answered), fromUpstream) })
+	current.ended(pump(client, upstream, current.session.requested), fromClient)
 
 	// Both directions have ended; the deferred closes finish a connection both peers finished.
 	pumps.Wait()
@@ -266,6 +266,16 @@ type ending struct {
 	write bool
 }
 
+// side is which leg a direction reads from.
+type side uint8
+
+const (
+	// fromClient is the direction that reads the service's leg and writes the dependency's.
+	fromClient side = iota + 1
+	// fromUpstream is the direction that reads the dependency's leg and writes the service's.
+	fromUpstream
+)
+
 // pump forwards src to dst, showing every chunk to observe on the way past, until a read or a write
 // fails.
 func pump(src, dst net.Conn, observe func([]byte)) ending {
@@ -293,8 +303,8 @@ func pump(src, dst net.Conn, observe func([]byte)) ending {
 // to both legs. Turning either ending into the other would hand the service a behaviour its real
 // dependency never had. An upstream that ended before its first byte, within the dial hold, is none of
 // these: it is a dial failure.
-func (l *link) ended(end ending, fromUpstream bool) {
-	if l.refused(end, fromUpstream) {
+func (l *link) ended(end ending, from side) {
+	if l.refused(end, from) {
 		l.failDial(end.err)
 
 		return
@@ -302,7 +312,7 @@ func (l *link) ended(end ending, fromUpstream bool) {
 
 	if !end.write && errors.Is(end.err, io.EOF) {
 		dst := l.client
-		if !fromUpstream {
+		if from == fromClient {
 			// Marked before the upstream can see the half-close: its close in answer is then no refusal.
 			l.clientDone.Store(true)
 
@@ -320,12 +330,14 @@ func (l *link) ended(end ending, fromUpstream bool) {
 // refused reports the upstream leg ending — its read, or a write to it — within DialHold of the dial
 // with no byte from it. A reset or any other error is a refusal; a clean EOF is one unless the client
 // had already finished, when the upstream's close answers the client's. The proxy's own close is not.
-func (l *link) refused(end ending, fromUpstream bool) bool {
+func (l *link) refused(end ending, from side) bool {
 	if l.heard.Load() || time.Since(l.dialled) > DialHold || l.ctx.Err() != nil {
 		return false
 	}
 
-	if fromUpstream == end.write || errors.Is(end.err, net.ErrClosed) {
+	// The upstream leg ended when its read failed, or a write to it did; the client leg otherwise.
+	upstreamLeg := (from == fromUpstream) != end.write
+	if !upstreamLeg || errors.Is(end.err, net.ErrClosed) {
 		return false
 	}
 

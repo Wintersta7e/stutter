@@ -70,8 +70,10 @@ func done(ctx context.Context) error {
 	return nil
 }
 
-// probePostgres waits, within ctx, for a Postgres endpoint to answer the handshake. An endpoint that
-// answers as something else contradicts the classification that made it Postgres.
+// probePostgres waits, within ctx, for a Postgres endpoint to answer the handshake and then to accept
+// a session: a server answers the handshake while it is still starting, and refuses every session
+// until it is done. An endpoint that answers as something else contradicts the classification that
+// made it Postgres.
 func probePostgres(ctx context.Context, addr netip.AddrPort) error {
 	answer, err := pg.Handshake(ctx, addr.String())
 	if err != nil {
@@ -80,6 +82,10 @@ func probePostgres(ctx context.Context, addr netip.AddrPort) error {
 
 	switch answer {
 	case pg.AnswerPostgres:
+		if !pg.Accepting(ctx, addr.String()) {
+			return fmt.Errorf("%w: %s answers as Postgres but refuses sessions", errNotReady, addr)
+		}
+
 		return nil
 	case pg.AnswerOther:
 		return fmt.Errorf("%w: %s answered, but not as Postgres", compose.ErrHandshakeContradiction, addr)
