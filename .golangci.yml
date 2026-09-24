@@ -5,6 +5,8 @@ version: "2"
 run:
   timeout: 5m
   tests: true
+  # Proofs run only by hand, on the engine they need, are still linted.
+  build-tags: [localproof]
 
 linters:
   default: all

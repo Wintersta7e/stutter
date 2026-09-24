@@ -34,14 +34,14 @@ const (
 var schemePorts = map[string]uint16{
 	schemePostgres: postgresPort, schemePostgresql: postgresPort, schemeNATS: natsPort,
 	schemeHTTP: 80, schemeWS: 80, schemeHTTPS: 443, schemeWSS: 443,
-	"redis": 6379, "rediss": 6379, "amqp": 5672, "amqps": 5671, "mqtt": 1883, "mqtts": 8883,
+	"redis": 6379, schemeRediss: 6379, "amqp": 5672, "amqps": 5671, "mqtt": 1883, "mqtts": 8883,
 	"ldap": 389, "ldaps": 636, "smtp": 25, "smtps": 465, "mysql": 3306, "mariadb": 3306, "mongodb": 27017,
 }
 
 // tlsSchemes are the schemes whose connection is encrypted.
 //
 //nolint:gochecknoglobals // a fixed list, not mutable state.
-var tlsSchemes = []string{schemeHTTPS, schemeWSS, "tls", "rediss", "amqps", "mqtts", "ldaps", "smtps"}
+var tlsSchemes = []string{schemeHTTPS, schemeWSS, "tls", schemeRediss, "amqps", "mqtts", "ldaps", "smtps"}
 
 // portKey is one port of a service, TCP or UDP.
 type portKey struct {

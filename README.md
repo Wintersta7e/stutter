@@ -264,15 +264,19 @@ docker run -d --name stutter-pg -e POSTGRES_PASSWORD=stutter \
   -e POSTGRES_USER=stutter -e POSTGRES_DB=stutter -p 55432:5432 postgres:18-alpine
 export STUTTER_TEST_POSTGRES='postgres://stutter:stutter@127.0.0.1:55432/stutter?sslmode=disable'
 
-make ci      # format check, lint, tidy, race tests, vulnerability scan, build
+make ci      # format, lint, one-build scan, deadcode, local-proof list, no testcontainers,
+             # tidy, counted race tests, vulnerability scan, static build
 ```
 
-The replay suite **skips** without `STUTTER_TEST_POSTGRES` and prints the same
-`ok` as a real pass, so set it or you are testing far less than you think.
+The replay suite **skips** without `STUTTER_TEST_POSTGRES`, and a bare `go test`
+prints the same `ok` as a real pass. `make test` and `make ci` count every
+test-level outcome and **fail** on any skip, so set it.
 
 The test suite also needs a reachable Docker engine: a Docker test **fails**
 without one. `STUTTER_TEST_DOCKER=skip` skips the Docker tests instead, and the
-local gate then says so on its last line.
+local gate then says so on its last line. `make test` also installs the oldest
+supported Compose plugin, checksum-verified, and points the tests at it through
+`STUTTER_TEST_COMPOSE_FLOOR`.
 
 Linting is `golangci-lint` with every linter enabled by default; each exception
 is justified inline in `.golangci.yml`.

@@ -44,6 +44,19 @@ jobs:
           args: --max-issues-per-linter=0 --max-same-issues=0
       - name: Formatting is clean
         run: golangci-lint fmt --diff
+      - name: One build definition
+        run: make buildscan
+      - name: Functions unreachable from the CLI
+        # The set must equal the committed baseline: a new name is a function nothing calls, and a
+        # baseline name no longer reported was wired or deleted without the baseline following.
+        run: make deadcode
+      - name: Local-only proofs
+        # Proofs tagged localproof run by hand on the engine they need and are recorded in the guard
+        # ledger; CI never compiles them. It lists them, and fails if a production file hides there.
+        run: make localproofs
+      - name: No testcontainers
+        # Its reaper would be a second remover of resources on the engine the tests share.
+        run: make nocontainers
       - name: Workflows are valid
         run: |
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
@@ -52,7 +65,11 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Twice the measured duration, never guessed: the job's own sequence (engine print, tree snapshot,
+    # make test with the compose floor download and a cold build cache, tree check) took 54.0 s on the
+    # monotonic clock, 2026-09-24, on a WSL2 developer host against Docker Desktop. Set-up steps and
+    # the database service were not timed; reset this from CI's first green run if it runs longer.
+    timeout-minutes: 2
     # The replay suite drives the real Postgres wire protocol against a real
     # server. Without one it SKIPS and still prints "ok", which is a false green.
     services:
@@ -79,19 +96,20 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Test with race detection
-        # -count=1 defeats the test cache: a cached pass proves nothing about this commit.
-        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Prove the database suite actually ran
-        # A skipped integration suite prints the same "ok" as one that ran. Assert
-        # that the tests needing a database really executed.
+      - name: The engine this Docker suite runs against
+        # The Docker tests fail without an engine, so this job is the Docker job. The compose version
+        # is read from docker info's plugin list.
         run: |
-          go test -run 'TestCheckAgainstAReferenceConsumer' -count=1 -v ./internal/cli/ | tee run.log
-          if grep -q -- '--- SKIP' run.log; then
-            echo "::error::the database-backed suite skipped; CI proved nothing"
-            exit 1
-          fi
+          docker version
+          docker info
+
+      - name: Test with race detection
+        # Uncached, and counted: a cached pass proves nothing about this commit, and a skipped test
+        # prints the same "ok" as one that ran. The counter fails on any skip.
+        run: |
+          make tree-snapshot TREE="$RUNNER_TEMP/tree"
+          make test
+          make tree-check TREE="$RUNNER_TEMP/tree"
 
       - name: Coverage floor
         run: |
@@ -119,12 +137,14 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - name: Repeat the database-free suite
+      - name: Repeat every package that needs neither a database nor Docker
+        # The set is derived from the packages themselves, never listed by hand: a package whose tests
+        # read the database variable, or whose test binary links the Docker helper, is left out.
         run: |
-          go test -race -shuffle=on -count=5 \
-            ./internal/effect/... ./internal/gate/... ./internal/policy/... \
-            ./internal/shrink/... ./internal/report/... ./internal/check/... \
-            ./internal/proxy/... ./internal/version/...
+          set -euo pipefail
+          go list -test -json ./... | go run ./tools/testgate flakeset > "$RUNNER_TEMP/flake-packages"
+          mapfile -t pkgs < "$RUNNER_TEMP/flake-packages"
+          go test -race -shuffle=on -count=5 -json "${pkgs[@]}" | go run ./tools/testgate count -docker=excluded
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -168,7 +188,32 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - run: go build -trimpath -o stutter ./cmd/stutter
+      - run: make build BIN=stutter
+      - name: The artifact is static
+        run: make static-check BIN=stutter
+      - name: A shell CGO cannot make the build dynamic
+        # CGO in the environment must not override the Makefile's plain default; only a CGO=1 on
+        # make's own command line may, and nothing in CI passes one.
+        run: CGO=1 make build BIN=stutter-env && make static-check BIN=stutter-env
+      - name: A Docker test fails without an engine and skips only when opted out
+        env:
+          DOCKER_HOST: unix:///nonexistent.sock
+        run: |
+          set -uo pipefail
+          dir="$RUNNER_TEMP/optout"; mkdir -p "$dir"
+          probe() { go test -count=1 -json -run '^TestTheEngineAnswers$' ./internal/dockertest/; }
+          (unset STUTTER_TEST_DOCKER; probe) > "$dir/unset.json"
+          STUTTER_TEST_DOCKER=skip probe > "$dir/skip.json"
+          STUTTER_TEST_DOCKER=bogus probe > "$dir/bogus.json"
+          set -e
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action fail < "$dir/unset.json"
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action skip -reason 'STUTTER_TEST_DOCKER=skip:' < "$dir/skip.json"
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action fail < "$dir/bogus.json"
+          if STUTTER_TEST_DOCKER=skip go run ./tools/testgate count < "$dir/skip.json" > "$dir/count.out"; then
+            cat "$dir/count.out"; echo "::error::the counter accepted an opted-out Docker suite in CI"; exit 1
+          fi
+          cat "$dir/count.out"
+          grep -q '^refused: STUTTER_TEST_DOCKER=skip' "$dir/count.out"
       - name: version and help succeed
         run: |
           ./stutter version

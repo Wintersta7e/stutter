@@ -15,6 +15,7 @@ const (
 	schemePostgresql = "postgresql"
 	schemeHTTP       = "http"
 	schemeHTTPS      = "https"
+	schemeRediss     = "rediss"
 )
 
 // ref is one endpoint a configuration value names. Only the host, the port and the scheme leave

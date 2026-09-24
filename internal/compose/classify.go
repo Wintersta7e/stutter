@@ -73,7 +73,31 @@ func Classify(m *Model, images map[string]Image, answers map[string]map[uint16]p
 		return Classification{}, err
 	}
 
+	if err = c.scan(&cls); err != nil {
+		return Classification{}, err
+	}
+
 	return cls, nil
+}
+
+// scan reads what every started service names: an external datastore and a bus that is not exactly
+// one are refused; setup bus names, disclosures, dangling names and shared mounts are recorded.
+func (c *classifier) scan(cls *Classification) error {
+	viewers := c.viewers(*cls)
+
+	if err := externalDatastores(viewers); err != nil {
+		return err
+	}
+
+	if err := c.busIdentity(*cls); err != nil {
+		return err
+	}
+
+	cls.SetupBusNames = c.setupBusNames(*cls, viewers)
+	c.disclose(cls, viewers)
+	cls.Shared = c.sharedMounts(viewers)
+
+	return nil
 }
 
 // dependencies classifies every service but the target: endpoints for all, then the bus names,
