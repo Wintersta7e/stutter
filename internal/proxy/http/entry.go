@@ -13,13 +13,27 @@ import (
 	"time"
 )
 
-// Entries are the listeners one run's stub serves: cleartext HTTP, TLS, or both. Every connection
-// they accept records into the one sink and replies from the one script.
+// catchAllSilence is how long a connection on a catch-all port may stay silent: before its first byte,
+// or after its TLS handshake before its first request. It is spent in full only on a connection about
+// to stop the run: a client-first client speaks at once, and a server-first one never will.
+const catchAllSilence = 5 * time.Second
+
+// Entries are the listeners one run's stub serves. Every connection they accept records into the one
+// sink and replies from the one script.
 type Entries struct {
 	// Cleartext is the entry a service dials on port 80.
 	Cleartext net.Listener
 	// TLS is the entry a service dials on port 443.
 	TLS net.Listener
+	// CatchAll is the entry every other port a service dials reaches. Its connections must be Tagged
+	// with that port.
+	CatchAll net.Listener
+}
+
+// Tagged is a connection that knows the port its client dialled, which the catch-all entry cannot
+// learn from its own listener.
+type Tagged interface {
+	DestinationPort() uint16
 }
 
 // entryClass is which of the stub's entries a connection arrived on.
@@ -28,11 +42,16 @@ type entryClass uint8
 const (
 	entryCleartext entryClass = iota + 1
 	entryTLS
+	entryCatchAll
 )
 
 var (
 	errNoEntries      = errors.New("HTTP stub requires at least one entry")
 	errNoCertificates = errors.New("HTTP stub serving TLS requires a certificate source")
+	// errUntagged means a connection reached the catch-all with no record of the port it was dialled on:
+	// the relay in front of it is not doing its job, which is the environment's failure, not the
+	// service's.
+	errUntagged = errors.New("a connection reached the HTTP stub's catch-all without its destination port")
 )
 
 // servedKey is what a connection that sent a request was: the entry it arrived on, the port it was
@@ -131,9 +150,112 @@ func (e *entry) judge(conn net.Conn) {
 		e.judgeTLS(conn)
 	case entryCleartext:
 		e.judgeCleartext(conn)
+	case entryCatchAll:
+		e.judgeCatchAll(conn)
 	default:
 		e.proxy.drop(conn)
 	}
+}
+
+// judgeCatchAll applies the catch-all rows. The connection has the silence bound to send its first
+// byte; one that closes or stays silent stops the run, naming its port, unless it is exempt — beside a
+// served connection on the same port it is a Go client's pool, and at the teardown point it is the
+// service going away. A first byte that opens TLS is handed over for a handshake; anything else must be
+// an HTTP/1.x request header, as on 80.
+func (e *entry) judgeCatchAll(conn net.Conn) {
+	tagged, isTagged := conn.(Tagged)
+	if !isTagged {
+		e.proxy.drop(conn)
+		e.proxy.stopOn(errUntagged)
+
+		return
+	}
+
+	port := tagged.DestinationPort()
+	key := servedKey{port: port, class: entryCatchAll}
+
+	first, silence := e.proxy.catchAllFirstByte(conn, key)
+	if first == nil {
+		e.proxy.drop(conn)
+
+		if silence != nil {
+			e.proxy.stopOn(silence)
+		}
+
+		return
+	}
+
+	if first[0] == tlsRecord {
+		e.handOverTLS(conn, first, port)
+
+		return
+	}
+
+	checked, err := checkRequest(conn, first, port)
+	if err != nil {
+		e.proxy.drop(conn)
+		e.proxy.stopOn(asStop(err, port, ""))
+
+		return
+	}
+
+	e.proxy.markServed(key)
+	e.proxy.release(conn)
+	e.handOver(checked)
+}
+
+// catchAllFirstByte waits the silence bound for a catch-all connection's first byte. It returns the
+// byte; or nil and the stop the connection's silence is; or nil and nil for an exempt connection that
+// closed.
+func (p *Proxy) catchAllFirstByte(conn net.Conn, key servedKey) ([]byte, *EgressStop) {
+	if conn.SetReadDeadline(time.Now().Add(catchAllSilence)) != nil {
+		// Only the stub's own close makes this fail, and that says nothing about the client.
+		return nil, nil //nolint:nilerr // see above.
+	}
+
+	first, err := firstByte(conn)
+
+	switch {
+	case err == nil:
+		return first, nil
+	case !p.exempt(key):
+		return nil, silentStop(key.port, err)
+	case isTimeout(err):
+		return heldFirstByte(conn), nil
+	default:
+		return nil, nil
+	}
+}
+
+// heldFirstByte waits with no deadline for an exempt connection's first byte, as on 80: it may yet be
+// used. It returns nil when the connection closes instead.
+func heldFirstByte(conn net.Conn) []byte {
+	if conn.SetReadDeadline(time.Time{}) != nil {
+		return nil
+	}
+
+	first, err := firstByte(conn)
+	if err != nil {
+		return nil
+	}
+
+	return first
+}
+
+// silentStop is the stop a catch-all connection on port is when it sent nothing before err.
+func silentStop(port uint16, err error) *EgressStop {
+	detail := "closed before sending a byte"
+	if isTimeout(err) {
+		detail = "sent nothing within " + catchAllSilence.String()
+	}
+
+	return &EgressStop{Detail: detail, Class: StopSilent, Port: port}
+}
+
+// exempt reports whether a byte-less catch-all connection with key hides nothing: a connection with
+// the same key has been served, or the teardown point has passed.
+func (p *Proxy) exempt(key servedKey) bool {
+	return p.tornDown() || p.wasServed(key)
 }
 
 // judgeCleartext applies the cleartext rows. A connection that sends nothing is held with no deadline
@@ -170,7 +292,6 @@ func (e *entry) judgeCleartext(conn net.Conn) {
 // judgeTLS applies the TLS rows before the handshake. A connection that sends nothing is held and one
 // that closes first is ignored, as in cleartext; a first byte that does not open TLS stops the run.
 // Anything else is handed to net/http for its handshake, which it bounds from about that first byte.
-// The connection stays held until its first request's first byte, so a close still reaches it.
 func (e *entry) judgeTLS(conn net.Conn) {
 	first, err := firstByte(conn)
 	if err != nil {
@@ -186,25 +307,73 @@ func (e *entry) judgeTLS(conn net.Conn) {
 		return
 	}
 
-	replaying := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(first), conn), port: e.port}
+	e.handOverTLS(conn, first, e.port)
+}
+
+// handOverTLS gives net/http a connection whose first byte opened TLS, replaying that byte, for the
+// handshake. The connection stays held until its first request's first byte, so a close still reaches
+// it.
+func (e *entry) handOverTLS(conn net.Conn, first []byte, port uint16) {
+	replaying := &replayConn{Conn: conn, reader: io.MultiReader(bytes.NewReader(first), conn), port: port}
 
 	e.handOver(&tunnel{
 		Conn:  tls.Server(replaying, e.proxy.tlsConfig),
 		raw:   conn,
 		proxy: e.proxy,
-		port:  e.port,
+		port:  port,
 		class: e.class,
 	})
 }
 
-// MarkTeardown marks the teardown point: the harness has begun removing the service under test. A TLS
+// MarkTeardown marks the teardown point: the harness has begun removing the service under test. A
 // connection that closes after it having sent no request is the service going away, not a client that
-// could not talk to the stub. It closes nothing.
+// could not talk to the stub — except a catch-all TLS connection that never spoke, which may be a
+// server-first client that waited to the end: its wait is cut short here and it stops the run. It
+// closes nothing.
 func (p *Proxy) MarkTeardown() {
 	p.heldMu.Lock()
 	defer p.heldMu.Unlock()
 
 	p.teardown = true
+
+	for waiting := range p.watched {
+		//nolint:errcheck // a connection already closed has no wait left to cut short.
+		_ = waiting.raw.SetReadDeadline(time.Now())
+	}
+}
+
+// watch registers a catch-all TLS connection waiting for its first request.
+func (p *Proxy) watch(t *tunnel) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	p.watched[t] = struct{}{}
+}
+
+// unwatch forgets a connection watch registered.
+func (p *Proxy) unwatch(t *tunnel) {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	delete(p.watched, t)
+}
+
+// boundRead sets a watched connection's read deadline: bound, or none while it is held, or at once
+// past the teardown point. It is set under the lock MarkTeardown takes, so the mark never lands
+// between the check and the deadline.
+func (p *Proxy) boundRead(t *tunnel, bound time.Time, held bool) error {
+	p.heldMu.Lock()
+	defer p.heldMu.Unlock()
+
+	switch {
+	case held:
+		bound = time.Time{}
+	case p.teardown:
+		bound = time.Now()
+	default:
+	}
+
+	return t.raw.SetReadDeadline(bound) //nolint:wrapcheck // the caller wraps it.
 }
 
 // tornDown reports whether the teardown point has passed.
@@ -302,6 +471,13 @@ func (p *Proxy) wasServed(key servedKey) bool {
 	_, served := p.served[key]
 
 	return served
+}
+
+// isTimeout reports whether err is a read deadline passing.
+func isTimeout(err error) bool {
+	network, isNetwork := errors.AsType[net.Error](err)
+
+	return isNetwork && network.Timeout()
 }
 
 // firstByte waits for a connection's first byte.

@@ -186,7 +186,10 @@ type Proxy struct {
 	tlsConfig *tls.Config
 	// held are the connections the stub is judging or holding before net/http has them, closed with
 	// the stub so an idle one never presents as a teardown that hangs.
-	held     map[net.Conn]struct{}
+	held map[net.Conn]struct{}
+	// watched are the catch-all TLS connections waiting for their first request, which the teardown
+	// point cuts short.
+	watched  map[*tunnel]struct{}
 	closeErr error
 	// failure is the first error net/http reported while serving. It stops the run rather than
 	// being recorded, so a broken connection can never be mistaken for a side effect.
@@ -202,7 +205,7 @@ type Proxy struct {
 	closeOnce sync.Once
 	failOnce  sync.Once
 	failed    sync.Mutex
-	// heldMu guards held, served, closing and teardown.
+	// heldMu guards held, watched, served, closing and teardown.
 	heldMu sync.Mutex
 	// closing is set once the stub has begun to close, so its own closes are never read as a client's.
 	closing bool
@@ -231,9 +234,9 @@ func New(
 		return nil, errMissingScript
 	case logicalHost == "":
 		return nil, errMissingHost
-	case entries.Cleartext == nil && entries.TLS == nil:
+	case entries.Cleartext == nil && entries.TLS == nil && entries.CatchAll == nil:
 		return nil, errNoEntries
-	case entries.TLS != nil && certificate == nil:
+	case (entries.TLS != nil || entries.CatchAll != nil) && certificate == nil:
 		return nil, errNoCertificates
 	default:
 	}
@@ -243,6 +246,7 @@ func New(
 		script:      script,
 		sink:        sink,
 		held:        make(map[net.Conn]struct{}),
+		watched:     make(map[*tunnel]struct{}),
 		served:      make(map[servedKey]struct{}),
 		tlsConfig: &tls.Config{
 			GetCertificate:     certificate,
@@ -254,13 +258,7 @@ func New(
 		},
 	}
 
-	if entries.Cleartext != nil {
-		proxy.entries = append(proxy.entries, newEntry(entries.Cleartext, proxy, entryCleartext, cleartextPort))
-	}
-
-	if entries.TLS != nil {
-		proxy.entries = append(proxy.entries, newEntry(entries.TLS, proxy, entryTLS, tlsPort))
-	}
+	proxy.addEntries(entries)
 
 	proxy.server = &nethttp.Server{
 		Handler:           nethttp.HandlerFunc(proxy.serveRequest),
@@ -338,23 +336,15 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-// firstRequest waits, with no deadline, for the first byte of the connection's first request — a
-// client may keep a connection it has not used yet, and one it never uses hides nothing — and then
-// requires an HTTP/1.x request header within the header bound of that byte. net/http has already
-// bounded the read from the handshake, so that bound is lifted first.
+// firstRequest waits for the first byte of the connection's first request and then requires an
+// HTTP/1.x request header within the header bound of that byte.
 func (t *tunnel) firstRequest() (net.Conn, error) {
-	if err := t.SetReadDeadline(time.Time{}); err != nil {
-		t.proxy.release(t.raw)
-
-		return nil, fmt.Errorf("lift the first-request deadline: %w", err)
-	}
-
-	first, err := firstByte(t.Conn)
+	first, err := t.firstByte()
 
 	t.proxy.release(t.raw)
 
 	if err != nil {
-		return nil, t.closedUnused()
+		return nil, err
 	}
 
 	checked, err := checkRequest(t.Conn, first, t.port)
@@ -370,14 +360,85 @@ func (t *tunnel) firstRequest() (net.Conn, error) {
 	return checked, nil
 }
 
-// closedUnused judges a connection that completed its handshake and closed without a request. After
-// the teardown point it is the service going away. Beside a served connection to the same server name
-// it is Go's http.Transport, which dials for a waiting request, hands that request a connection that
-// freed first, and pools the fresh one unused; a client that pins certificates never gets a first
-// connection through, so it still stops the run. Otherwise it is a client that cannot talk to the stub.
+// firstByte waits for the first decrypted byte. On 443 it waits with no deadline: a client may keep a
+// connection it has not used yet, and one it never uses hides nothing. net/http has already bounded
+// the read from the handshake, so that bound is lifted first.
+func (t *tunnel) firstByte() ([]byte, error) {
+	if t.class == entryCatchAll {
+		return t.catchAllFirstByte()
+	}
+
+	if err := t.SetReadDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("lift the first-request deadline: %w", err)
+	}
+
+	first, err := firstByte(t.Conn)
+	if err != nil {
+		return nil, t.closedUnused()
+	}
+
+	return first, nil
+}
+
+// catchAllFirstByte waits for the first decrypted byte on a catch-all port for the silence bound from
+// the handshake, or only until the teardown point: a connection there that finished its handshake and
+// never spoke may be a server-first client waiting for a greeting nothing sends. One beside a served
+// connection with the same key is a Go client's pool, and is held.
+func (t *tunnel) catchAllFirstByte() ([]byte, error) {
+	t.proxy.watch(t)
+	defer t.proxy.unwatch(t)
+
+	bound := time.Now().Add(catchAllSilence)
+	held := false
+
+	for {
+		if err := t.proxy.boundRead(t, bound, held); err != nil {
+			return nil, fmt.Errorf("bound the first-request read: %w", err)
+		}
+
+		first, err := firstByte(t.Conn)
+
+		switch {
+		case err == nil:
+			return first, nil
+		case !isTimeout(err):
+			return nil, t.closedUnused()
+		case t.proxy.wasServed(t.key()):
+			held = true
+		default:
+			return nil, t.silent()
+		}
+	}
+}
+
+// silent stops the run on a catch-all TLS connection that sent no request.
+func (t *tunnel) silent() error {
+	detail := "sent no request within " + catchAllSilence.String() + " of its TLS handshake"
+	if t.proxy.tornDown() {
+		detail = detailUnusedAtTeardown
+	}
+
+	stop := &EgressStop{Name: t.serverName, Detail: detail, Class: StopSilent, Port: t.port}
+	t.proxy.stopOn(stop)
+
+	return stop
+}
+
+// closedUnused judges a connection that completed its handshake and closed without a request. Beside a
+// served connection with the same key it is Go's http.Transport, which dials for a waiting request,
+// hands that request a connection that freed first, and pools the fresh one unused; a client that pins
+// certificates never gets a first connection through, so it still stops the run. After the teardown
+// point it is the service going away on 443, and on a catch-all port a connection that stayed silent
+// to the end. Otherwise it is a client that cannot talk to the stub.
 func (t *tunnel) closedUnused() error {
-	if t.proxy.tornDown() || t.proxy.wasServed(t.key()) {
+	switch {
+	case t.proxy.wasServed(t.key()):
 		return io.EOF
+	case t.class == entryCatchAll && t.proxy.tornDown():
+		return t.silent()
+	case t.proxy.tornDown():
+		return io.EOF
+	default:
 	}
 
 	stop := &EgressStop{Name: t.serverName, Class: StopNoRequest, Port: t.port}
@@ -464,7 +525,7 @@ func readRequestHeader(reader *bufio.Reader) ([]byte, error) {
 	return nil, errUnparseable
 }
 
-// Addr is the cleartext entry's address, else the TLS entry's.
+// Addr is the cleartext entry's address, else the TLS entry's, else the catch-all's.
 func (p *Proxy) Addr() string { return p.entries[0].Addr().String() }
 
 // Serve accepts connections on every entry until Close is called or ctx is cancelled, and returns the
@@ -547,6 +608,22 @@ func (p *Proxy) CloseContext(ctx context.Context) error {
 	})
 
 	return p.closeErr
+}
+
+// addEntries wraps each supplied listener as an entry, in the order Addr prefers them.
+func (p *Proxy) addEntries(entries Entries) {
+	if entries.Cleartext != nil {
+		p.entries = append(p.entries, newEntry(entries.Cleartext, p, entryCleartext, cleartextPort))
+	}
+
+	if entries.TLS != nil {
+		p.entries = append(p.entries, newEntry(entries.TLS, p, entryTLS, tlsPort))
+	}
+
+	if entries.CatchAll != nil {
+		// Each connection carries its own port.
+		p.entries = append(p.entries, newEntry(entries.CatchAll, p, entryCatchAll, 0))
+	}
 }
 
 // closeEntries closes every entry, whether or not Serve ever tracked it.

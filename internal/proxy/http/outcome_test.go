@@ -31,6 +31,18 @@ type stubUnderTest struct {
 	sink  *sink
 	trust *x509.CertPool
 	run   *proxyhttp.Run
+	// catchAll is the catch-all entry's address, when the stub has one.
+	catchAll string
+}
+
+// dialled is where a client of the stub connects: its catch-all entry when it has one, else its own
+// address.
+func (s *stubUnderTest) dialled() string {
+	if s.catchAll != "" {
+		return s.catchAll
+	}
+
+	return s.proxy.Addr()
 }
 
 // cleartextStub starts a fresh cleartext stub.
@@ -708,18 +720,20 @@ const (
 // pooledShape is a Go client's traffic against one fresh stub: warm requests, then fan concurrent
 // ones, then idle for settle with the client's pool as the Transport left it.
 type pooledShape struct {
+	stub        func(t *testing.T) *stubUnderTest
 	name        string
+	url         string
 	idleTimeout time.Duration
 	settle      time.Duration
 	warm, fan   int
 }
 
-// stopsOn runs shape against one fresh TLS stub and reports whether the stub stopped the run.
+// stopsOn runs shape against one fresh stub and reports whether the stub stopped the run.
 func (shape pooledShape) stopsOn(t *testing.T) bool {
 	t.Helper()
 
-	under := tlsStub(t)
-	address := under.proxy.Addr()
+	under := shape.stub(t)
+	address := under.dialled()
 	client, transport := goClient(under.trust, func(ctx context.Context, network, _ string) (net.Conn, error) {
 		return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, network, address)
 	})
@@ -728,7 +742,7 @@ func (shape pooledShape) stopsOn(t *testing.T) bool {
 		transport.IdleConnTimeout = shape.idleTimeout
 	}
 
-	fanOut(t, client, "https://"+serverName+"/fan", shape.warm, shape.fan)
+	fanOut(t, client, shape.url, shape.warm, shape.fan)
 	time.Sleep(shape.settle)
 	transport.CloseIdleConnections()
 
@@ -752,24 +766,20 @@ func (shape pooledShape) stopsOn(t *testing.T) bool {
 func TestAGoClientsPooledConnectionsNeverStopTheRun(t *testing.T) {
 	t.Parallel()
 
-	for _, shape := range []pooledShape{
-		{name: "443 warm1 fan2 pooled idle", warm: 1, fan: 2, settle: poolSettle},
-		{name: "443 warm2 fan3 overflow close", warm: 2, fan: 3, settle: poolSettle},
+	tlsURL := "https://" + serverName + "/fan"
+
+	for _, shape := range append([]pooledShape{
+		{name: "443 warm1 fan2 pooled idle", stub: tlsStub, url: tlsURL, warm: 1, fan: 2, settle: poolSettle},
+		{name: "443 warm2 fan3 overflow close", stub: tlsStub, url: tlsURL, warm: 2, fan: 3, settle: poolSettle},
 		{
-			name: "443 idle timeout mid-run", warm: 1, fan: 2,
+			name: "443 idle timeout mid-run", stub: tlsStub, url: tlsURL, warm: 1, fan: 2,
 			idleTimeout: 200 * time.Millisecond, settle: 500 * time.Millisecond,
 		},
-	} {
+	}, catchAllPooledShapes()...) {
 		t.Run(shape.name, func(t *testing.T) {
 			t.Parallel()
 
-			stopped := 0
-
-			for range pooledRuns {
-				if shape.stopsOn(t) {
-					stopped++
-				}
-			}
+			stopped := runPooled(t, shape)
 
 			t.Logf("shape=%s stopped=%d/%d", shape.name, stopped, pooledRuns)
 

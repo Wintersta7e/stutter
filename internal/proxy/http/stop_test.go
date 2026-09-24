@@ -159,10 +159,17 @@ func stopRows() []stopRow {
 			class: proxyhttp.StopSilent,
 			want: "egress stop silent on port 587: closed before sending a byte; SMTP is server-first and " +
 				"Stutter has no SMTP stub",
-			construct: &proxyhttp.EgressStop{
-				Class:  proxyhttp.StopSilent,
-				Port:   587,
-				Detail: "closed before sending a byte",
+			drive: func(t *testing.T) error {
+				t.Helper()
+
+				under := catchAllStub(t, 587)
+
+				_ = dialRaw(t, under.catchAll).conn.Close()
+
+				err := awaitServe(t, under.done)
+				under.abort(t)
+
+				return err
 			},
 		},
 		{

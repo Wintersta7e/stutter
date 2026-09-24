@@ -52,6 +52,9 @@ const (
 	detailSRV     = "an SRV lookup precedes a connection Stutter cannot observe"
 	// smtpNote follows a silent stop on a mail port: the client is waiting for a greeting nothing sends.
 	smtpNote = "; SMTP is server-first and Stutter has no SMTP stub"
+	// detailUnusedAtTeardown is a catch-all connection that never sent a request, still open or closed
+	// when the service went away.
+	detailUnusedAtTeardown = "sent no request before the end of the run"
 	// alertOp is the operation crypto/tls names a TLS alert the client sent.
 	alertOp = "remote error"
 )
