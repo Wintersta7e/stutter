@@ -214,6 +214,27 @@ func New(cfg Config) (*Sandbox, error) {
 	}, nil
 }
 
+// Timings are the waits a sandbox's observed runs use, as the values in force: a default where nothing
+// was set, never a zero.
+type Timings struct {
+	// Startup is how long a service may take to create its consumer.
+	Startup time.Duration
+	// Quiesce is how long an attribution window stays open after a handler's last word.
+	Quiesce time.Duration
+	// Drain is the owed-silence limit's static part: Config.Drain, or the floor Policy derives.
+	Drain time.Duration
+}
+
+// Timings reports the waits this sandbox's observed runs use.
+func (s *Sandbox) Timings() Timings {
+	drain := s.cfg.Drain
+	if drain <= 0 {
+		drain = DrainFloor(s.cfg.Policy, s.cfg.Quiesce)
+	}
+
+	return Timings{Startup: s.startupLimit(), Quiesce: s.quiesce(), Drain: drain}
+}
+
 // Reset returns the service's dependencies to the starting position.
 func (s *Sandbox) Reset(ctx context.Context) error {
 	if s.cfg.Reset == nil {

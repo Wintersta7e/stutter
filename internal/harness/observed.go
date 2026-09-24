@@ -646,8 +646,10 @@ type observedRun struct {
 	startup time.Duration
 	// activity is when the bus was last active, as an offset from began.
 	activity atomic.Int64
-	// endedAt is when the run's wait ended, as an offset from began.
-	endedAt time.Duration
+	// published is when the corpus began to be published, and endedAt when the run's wait ended, as
+	// offsets from began. Between them is the run's span on the bus.
+	published time.Duration
+	endedAt   time.Duration
 	// lastDelivered is the recorded sequence of the last staged message delivered to the consumer
 	// under test, 0 before the first.
 	lastDelivered atomic.Uint64
@@ -839,9 +841,14 @@ func (r *observedRun) settledOrOwed(settle, static, quiesce time.Duration) func(
 	}
 }
 
-// end notes when the run's wait ended: what is owed is counted as of then.
+// end notes when the run's wait ended: what is owed is counted as of then, and the span ends there.
 func (r *observedRun) end() {
 	r.endedAt = r.offset()
+}
+
+// publishing notes when the corpus began to be published: the span starts there.
+func (r *observedRun) publishing() {
+	r.published = r.offset()
 }
 
 // ended reads what the service stopping by itself means for the run, completing its exit with the
@@ -982,6 +989,11 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		owed, exhausted = ledger.owed(r.endedAt), ledger.exhausted(r.endedAt)
 	}
 
+	var span time.Duration
+	if r.published > 0 && r.endedAt > r.published {
+		span = r.endedAt - r.published
+	}
+
 	return replay.Result{
 		Clause:          clause,
 		Effects:         effects,
@@ -996,6 +1008,7 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		Refusals:        r.recorder.Refusals(),
 		NoResponders:    r.recorder.NoResponders(),
 		ClosedAfterInfo: r.recorder.ClosedAfterInfoCount(),
+		Span:            span,
 	}, nil
 }
 

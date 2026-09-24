@@ -263,6 +263,10 @@ type Result struct {
 	NoResponders int
 	// ClosedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
 	ClosedAfterInfo int
+	// Span is how long an observed run spent on the bus, on the monotonic clock: from the corpus being
+	// published to the run's end. Whatever of a run's elapsed time lies outside it is Stutter's own
+	// overhead. Zero on a driven run, and on a run that never published.
+	Span time.Duration
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.

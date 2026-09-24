@@ -81,6 +81,7 @@ func (s *Sandbox) fill(
 	defer cancel(nil)
 
 	run.hold.begin(target, s.cfg.Policy.Deadline(1), cancel)
+	run.publishing()
 
 	err := s.publish(held, run, target, messages, admitted)
 
