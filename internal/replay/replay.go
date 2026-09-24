@@ -238,6 +238,10 @@ type Result struct {
 	// Setup counts effects observed before the first delivery. When a run saw nothing else, it is
 	// what tells a service that never connected from one that connected and never consumed.
 	Setup int
+	// FedBack counts messages Stutter did not publish that reached the consumer under test and whose
+	// handling did nothing observable — the service's own output fed back through the stream it
+	// consumes. They belong to no corpus message and are left out of the comparison.
+	FedBack int
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.

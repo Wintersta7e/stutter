@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,7 +31,17 @@ var (
 	// it created afterwards took deliveries. Nothing held it to one message in flight, so its effects
 	// cannot be attributed to messages.
 	errLateConsumer = errors.New("a consumer created after the corpus was published took deliveries")
+	// errFedBack means the service was handed a message Stutter did not publish — its own output, fed
+	// back through the stream it consumes — and did work while handling it. That work belongs to no
+	// corpus message, so there is nothing honest to compare it against.
+	errFedBack = errors.New("a message Stutter did not publish reached the consumer under test, " +
+		"and handling it did work")
 )
+
+// fedBack is the identity a delivery takes when Stutter did not publish its message. No corpus
+// message has it, because stream sequences start at one, so its window is never mistaken for one's and
+// no fault is ever aimed at it: its acknowledgement always goes through.
+const fedBack uint64 = 0
 
 const (
 	// settleMargin multiplies the quiesce to get how long a starting service must stay quiet before
@@ -370,6 +381,9 @@ type observedRun struct {
 	target atomic.Pointer[string]
 	// strangers names the consumers that took deliveries without being under test.
 	strangers sync.Map
+	// unstaged holds the stream sequences of fed-back deliveries: messages the consumer under test
+	// was handed that Stutter never staged.
+	unstaged sync.Map
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
 	stream string
@@ -431,7 +445,13 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 
 	r.touch()
 	r.delivered.Add(1)
-	r.windows.open(r.sequence(delivery.Ack.StreamSeq), delivery.Payload)
+
+	seq := r.sequence(delivery.Ack.StreamSeq)
+	if seq == fedBack {
+		r.unstaged.Store(delivery.Ack.StreamSeq, struct{}{})
+	}
+
+	r.windows.open(seq, delivery.Payload)
 }
 
 // Withhold decides the fate of one acknowledgement and closes the window of the message it settles.
@@ -456,7 +476,8 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 	seq := r.sequence(ack.StreamSeq)
 
 	// The mutation was built against recorded sequences, so the wire's own numbering is translated
-	// before the fault is decided rather than after.
+	// before the fault is decided rather than after. A message Stutter never staged translates to
+	// fedBack, which no fault targets, whatever sequence it landed at.
 	withheld := r.policy.Withhold(natsproxy.Ack{
 		Stream:     ack.Stream,
 		Consumer:   ack.Consumer,
@@ -559,27 +580,73 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		return replay.Result{}, err
 	}
 
+	effects := r.recorder.Effects()
+	unstaged := r.unstagedSequences()
+
+	if worked := len(forMessage(effect.Compared(effects), fedBack)); worked > 0 {
+		return replay.Result{}, fmt.Errorf("%w (stream sequence %s; effects recorded: %d)",
+			errFedBack, strings.Join(unstaged, ", "), worked)
+	}
+
 	return replay.Result{
 		Clause:    clause,
-		Effects:   r.recorder.Effects(),
+		Effects:   effects,
 		Delivered: int(r.delivered.Load()),
 		Failed:    int(r.failed.Load()),
 		Late:      r.recorder.LateCount(),
 		Setup:     r.recorder.SetupCount(),
+		FedBack:   len(unstaged),
 	}, nil
 }
 
+// unstagedSequences lists the stream sequences of fed-back deliveries, in order.
+func (r *observedRun) unstagedSequences() []string {
+	var sequences []uint64
+
+	r.unstaged.Range(func(seq, _ any) bool {
+		if number, isNumber := seq.(uint64); isNumber {
+			sequences = append(sequences, number)
+		}
+
+		return true
+	})
+
+	slices.Sort(sequences)
+
+	listed := make([]string, 0, len(sequences))
+	for _, seq := range sequences {
+		listed = append(listed, strconv.FormatUint(seq, 10))
+	}
+
+	return listed
+}
+
+// forMessage narrows effects to those attributed to one message.
+func forMessage(effects []effect.Effect, message uint64) []effect.Effect {
+	var narrowed []effect.Effect
+
+	for _, item := range effects {
+		if item.MessageSeq == message {
+			narrowed = append(narrowed, item)
+		}
+	}
+
+	return narrowed
+}
+
 // sequence translates a stream sequence the bus is using into the one the message was recorded
-// under.
+// under, or fedBack for a message Stutter did not stage.
 //
 // Staging renumbers the stream from one, so without the translation a fault aimed at a recorded
-// sequence would land on a different message, and every effect would be attributed to one.
+// sequence would land on a different message, and every effect would be attributed to one. A
+// sequence staging never used is the service's own output fed back, and passing it off as recorded
+// would attribute that output to a corpus message — or aim that message's fault at it.
 func (r *observedRun) sequence(staged uint64) uint64 {
 	if recorded, known := r.recorded[staged]; known {
 		return recorded
 	}
 
-	return staged
+	return fedBack
 }
 
 func (r *observedRun) touch() {

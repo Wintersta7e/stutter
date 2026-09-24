@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -64,6 +65,20 @@ type quirks struct {
 	// idempotent reserves only on a message's first delivery, so no fault makes it diverge and a
 	// check spends no runs shrinking.
 	idempotent bool
+	// echo publishes a note of every order it reserves into the stream it consumes, so the bus hands
+	// the service its own output at a sequence Stutter never staged.
+	echo bool
+	// echoWrites makes the service write to its dependency while handling its own note, too.
+	echoWrites bool
+}
+
+// echoSubject is where an echoing service notes each order: inside the corpus subjects, so its own
+// consumer is handed the note.
+const echoSubject = corpus.SubjectPrefix + "order.echoed"
+
+// echoNote is the note an echoing service publishes for an order.
+type echoNote struct {
+	EchoOf string `json:"echo_of"`
 }
 
 // latecomer is a service that comes up only after a delay: it connects and creates its consumer once
@@ -202,15 +217,43 @@ func (p *pulling) handle(msg jetstream.Msg) {
 
 	settle := msg.Ack
 
-	if !p.quirks.idempotent || firstDelivery(msg) {
+	var note echoNote
+
+	switch {
+	case msg.Subject() == echoSubject:
+		if json.Unmarshal(msg.Data(), &note) != nil || (p.quirks.echoWrites && p.call("ECHO "+note.EchoOf) != nil) {
+			settle = msg.Nak
+		}
+	case !p.quirks.idempotent || firstDelivery(msg):
 		if err := p.reserve(msg.Data()); err != nil {
 			settle = msg.Nak
 		}
+
+		if p.quirks.echo {
+			published, err := json.Marshal(echoNote{EchoOf: string(msg.Data())})
+			if err != nil || p.connection.Publish(echoSubject, published) != nil {
+				settle = msg.Nak
+			}
+		}
+	default:
 	}
 
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+}
+
+// call sends one line to the dependency and waits for its answer.
+func (p *pulling) call(line string) error {
+	if _, err := fmt.Fprintln(p.dependency, line); err != nil {
+		return fmt.Errorf("write %q: %w", line, err)
+	}
+
+	if _, err := p.replies.ReadString('\n'); err != nil {
+		return fmt.Errorf("read the answer to %q: %w", line, err)
+	}
+
+	return nil
 }
 
 // firstDelivery reports whether the bus is handing this message over for the first time.
@@ -491,6 +534,93 @@ func TestAnObservedRunCountsADelayedNak(t *testing.T) {
 	if result.Delivered != 2 || len(result.Effects) != 1 {
 		t.Errorf("Delivered = %d, Effects = %d, want 2 deliveries and the one reservation of the second",
 			result.Delivered, len(result.Effects))
+	}
+}
+
+// TestAFedBackDeliveryIsKeptOutOfTheComparison: a service that publishes into the stream it consumes is
+// handed its own output at sequences Stutter never staged. Handled without doing anything, it is
+// counted and left out. Handled with work, the run stops: that work belongs to no corpus message, and
+// the fallback that attributed it to one compared the service's echo as if it were the recording.
+func TestAFedBackDeliveryIsKeptOutOfTheComparison(t *testing.T) {
+	t.Parallel()
+
+	const echoed = "ORD-ECHO-1"
+
+	cases := []struct {
+		mutation func(recorded []uint64) replay.Mutation
+		name     string
+		stops    string
+		orders   []string
+		// retain picks the recorded messages the run keeps, by position; nil keeps them all.
+		retain    []int
+		behaviour quirks
+		delivered int
+		fedBack   int
+	}{
+		{
+			name:      "handled without work",
+			mutation:  func([]uint64) replay.Mutation { return replay.Clean{} },
+			orders:    []string{echoed},
+			behaviour: quirks{echo: true},
+			delivered: 2,
+			fedBack:   1,
+		},
+		{
+			name:      "handled with work",
+			mutation:  func([]uint64) replay.Mutation { return replay.Clean{} },
+			orders:    []string{echoed},
+			behaviour: quirks{echo: true, echoWrites: true},
+			stops:     "stream sequence 2",
+		},
+		{
+			// Recorded message 2 is staged alone, at sequence 1, so the echo lands at sequence 2 — the
+			// recorded sequence the duplicate is aimed at. Its acknowledgement must still go through.
+			name:      "numbered like the faulted message",
+			mutation:  func(recorded []uint64) replay.Mutation { return replay.Duplicate{Seq: recorded[1]} },
+			orders:    []string{echoed, "ORD-ECHO-2"},
+			retain:    []int{1},
+			behaviour: quirks{echo: true},
+			delivered: 4,
+			fedBack:   2,
+		},
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			built, recorded := quirkySandbox(t, observedConfig(), testCase.behaviour, nil, testCase.orders...)
+
+			var retain []uint64
+			for _, at := range testCase.retain {
+				retain = append(retain, recorded[at])
+			}
+
+			result, err := built.Run(t.Context(), "fed-back", testCase.mutation(recorded), retain)
+
+			if testCase.stops != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.stops) {
+					t.Fatalf("Run() error = %v, want the run stopped naming %q", err, testCase.stops)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+
+			if result.Delivered != testCase.delivered || result.FedBack != testCase.fedBack {
+				t.Errorf("Delivered = %d, FedBack = %d, want %d and %d",
+					result.Delivered, result.FedBack, testCase.delivered, testCase.fedBack)
+			}
+
+			for at, observed := range result.Effects {
+				if !slices.Contains(recorded, observed.MessageSeq) {
+					t.Errorf("effect %d attributed to message %d, which is no corpus message", at, observed.MessageSeq)
+				}
+			}
+		})
 	}
 }
 
