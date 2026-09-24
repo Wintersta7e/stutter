@@ -83,6 +83,10 @@ const (
 	sslCertFile      = "SSL_CERT_FILE"
 	dataTarget       = "/data"
 	hostnameKey      = "hostname"
+	// busService, mockService and workerService are services several models share.
+	busService    = "bus"
+	mockService   = "mock"
+	workerService = "worker"
 	// absentService is a service no model has.
 	absentService = "ghost"
 	// pidKey, ipcKey and utsKey are namespace keys several tests name.

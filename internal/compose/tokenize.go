@@ -8,6 +8,15 @@ import (
 	"strings"
 )
 
+// URL schemes the classification reads by name.
+const (
+	schemeNATS       = "nats"
+	schemePostgres   = "postgres"
+	schemePostgresql = "postgresql"
+	schemeHTTP       = "http"
+	schemeHTTPS      = "https"
+)
+
 // ref is one endpoint a configuration value names. Only the host, the port and the scheme leave
 // the tokenizer — never userinfo, a path, a query or the rest of the value.
 type ref struct {
@@ -356,7 +365,7 @@ func queryValue(tail, name string) string {
 }
 
 func pgScheme(scheme string) bool {
-	return scheme == "postgres" || scheme == "postgresql"
+	return scheme == schemePostgres || scheme == schemePostgresql
 }
 
 // sslRequired reports an sslmode under which the client refuses a cleartext connection.

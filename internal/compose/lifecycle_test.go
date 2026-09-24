@@ -30,7 +30,7 @@ func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 				set:     true,
 				want:    compose.Healthcheck{Test: []string{"CMD-SHELL", "redis-cli ping"}},
 			},
-			{service: "worker", set: true, want: compose.Healthcheck{Disabled: true}},
+			{service: workerService, set: true, want: compose.Healthcheck{Disabled: true}},
 			{service: jobService, set: true, want: compose.Healthcheck{Test: []string{"NONE"}, Disabled: true}},
 			{service: toolsService},
 			{service: target},
@@ -82,7 +82,7 @@ func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 				Signal: "SIGINT", Grace: 90 * time.Second, SignalSet: true, GraceSet: true,
 			}},
 			{service: cacheService, want: compose.Stop{Signal: "SIGTERM", SignalSet: true}},
-			{service: "worker"},
+			{service: workerService},
 		}
 
 		for _, tc := range cases {

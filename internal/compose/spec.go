@@ -128,7 +128,7 @@ func (m *Model) nameTaken(service string, svc *composeService) bool {
 	}
 
 	return slices.ContainsFunc(serviceReferences(svc), func(found ref) bool {
-		return found.Scheme == "nats" && found.Host == service
+		return found.Scheme == schemeNATS && found.Host == service
 	})
 }
 

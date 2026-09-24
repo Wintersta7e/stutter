@@ -255,9 +255,9 @@ func TestDependsOnReadsConditions(t *testing.T) {
 	model := modelFrom(t, string(golden(t, "5.5.1")))
 
 	got := model.DependsOn(target)
-	want := map[string]string{"db": "service_healthy", "migrate": "service_completed_successfully"}
+	want := map[string]string{"db": "service_healthy", jobService: "service_completed_successfully"}
 
-	if len(got) != len(want) || got["db"] != want["db"] || got["migrate"] != want["migrate"] {
+	if len(got) != len(want) || got["db"] != want["db"] || got[jobService] != want[jobService] {
 		t.Errorf("DependsOn(api) = %v, want %v", got, want)
 	}
 

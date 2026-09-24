@@ -86,13 +86,13 @@ func TestXStutterGrammar(t *testing.T) {
 
 	want := compose.Overrides{
 		Roles: map[string]compose.Role{
-			"db": compose.RoleDatastore, "bus": compose.RoleBus, "twin": compose.RoleSibling,
-			"mock": compose.RoleOther, "idle": compose.RoleUnused,
+			"db": compose.RoleDatastore, busService: compose.RoleBus, "twin": compose.RoleSibling,
+			mockService: compose.RoleOther, "idle": compose.RoleUnused,
 		},
 		Endpoints: map[string]map[uint16]compose.Protocol{
-			"db":   {5432: compose.ProtocolPG},
-			"bus":  {4222: compose.ProtocolNATS},
-			"mock": {80: compose.ProtocolHTTP, 9000: compose.ProtocolOpaque},
+			"db":        {5432: compose.ProtocolPG},
+			busService:  {4222: compose.ProtocolNATS},
+			mockService: {80: compose.ProtocolHTTP, 9000: compose.ProtocolOpaque},
 		},
 		File: file,
 	}

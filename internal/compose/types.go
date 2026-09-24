@@ -496,6 +496,8 @@ type Classification struct {
 	// DependencyNames maps each started dependency to the names jobs and other dependencies dial it
 	// by.
 	DependencyNames map[string][]string
+	// target is the service under test, which Started includes.
+	target string
 	// Deps are every service other than the target, by service name.
 	Deps []Dependency
 	// SelfAliases are the names the target answers to itself.
