@@ -8,8 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"testing"
+
+	"github.com/Wintersta7e/stutter/internal/testexec"
 )
 
 // Answers a healthy engine gives to the three precondition templates, in the shapes the templates
@@ -51,20 +52,11 @@ func (a engineAnswers) script() string {
 		"esac\n"
 }
 
-// writeShim writes an executable `docker` script into dir. It holds the fork lock while the file is
-// open for writing: a child another parallel test forks meanwhile would inherit the descriptor until
-// it execs, and executing the shim then fails with "text file busy".
+// writeShim writes an executable `docker` script into dir.
 func writeShim(t *testing.T, dir, script string) {
 	t.Helper()
 
-	syscall.ForkLock.Lock()
-	//nolint:gosec // a test shim must be executable to stand in for the docker CLI.
-	err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755)
-	syscall.ForkLock.Unlock()
-
-	if err != nil {
-		t.Fatalf("write shim: %v", err)
-	}
+	testexec.WriteScript(t, filepath.Join(dir, "docker"), script)
 }
 
 // Every precondition refuses by name, and none of them ever reaches past the three read-only calls.

@@ -94,7 +94,8 @@ linters:
             - pkg: io/ioutil
               desc: Deprecated since Go 1.16; use io and os.
         # The Docker test helpers spawn the docker CLI themselves. The product reaches Docker only
-        # through its own runner, so nothing but a test may import them.
+        # through its own runner, so nothing but a test may import them, nor the script writer tests
+        # run in place of programs.
         test-only:
           files:
             - $all
@@ -103,6 +104,8 @@ linters:
           deny:
             - pkg: github.com/Wintersta7e/stutter/internal/dockertest
               desc: test-only; it reaches Docker outside the product's one runner.
+            - pkg: github.com/Wintersta7e/stutter/internal/testexec
+              desc: test-only; it writes scripts a test runs in place of a program.
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print.*$

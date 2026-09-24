@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Wintersta7e/stutter/internal/dockertest"
+	"github.com/Wintersta7e/stutter/internal/testexec"
 )
 
 // pluginLimit bounds the wait for the compose plugin to start.
@@ -232,7 +233,7 @@ func TestNoComposeChildOutlivesStutter(t *testing.T) {
 					t.Fatal(err)
 				}
 
-				writeExecutable(t, filepath.Join(plugins, "docker-compose"), deafPlugin)
+				testexec.WriteScript(t, filepath.Join(plugins, "docker-compose"), deafPlugin)
 			}
 
 			h := launch(t, "compose", helperSpec{StateDir: newStateDir(t), TempDir: t.TempDir(), Dir: dir, FIFO: fifo},

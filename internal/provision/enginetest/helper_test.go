@@ -28,6 +28,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/dockertest"
 	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
+	"github.com/Wintersta7e/stutter/internal/testexec"
 )
 
 const (
@@ -64,27 +65,11 @@ func TestMain(m *testing.M) {
 	dockertest.Main(m)
 }
 
-// writeShim writes an executable `docker` script into dir. It holds the fork lock while the file is
-// open for writing: a child another parallel test forks meanwhile would inherit the descriptor until
-// it execs, and executing the shim then fails with "text file busy".
+// writeShim writes an executable `docker` script into dir.
 func writeShim(t *testing.T, dir, script string) {
 	t.Helper()
 
-	writeExecutable(t, filepath.Join(dir, "docker"), script)
-}
-
-// writeExecutable writes an executable script at path, under the fork lock as writeShim says.
-func writeExecutable(t *testing.T, path, script string) {
-	t.Helper()
-
-	syscall.ForkLock.Lock()
-	//nolint:gosec // a test shim must be executable to stand in for a program.
-	err := os.WriteFile(path, []byte(script), 0o755)
-	syscall.ForkLock.Unlock()
-
-	if err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
+	testexec.WriteScript(t, filepath.Join(dir, "docker"), script)
 }
 
 // startProcess re-executes this test binary as a helper in mode, with exactly env as its
