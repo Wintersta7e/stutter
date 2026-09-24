@@ -225,6 +225,44 @@ func field(value any, keys ...string) any {
 	return value
 }
 
+// text is a decoded inspect value as a string, "" when it is not one.
+func text(value any) string {
+	s, ok := value.(string)
+	if !ok {
+		return ""
+	}
+
+	return s
+}
+
+// values is a decoded inspect value as an array, nil when it is not one.
+func values(value any) []any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+
+	return items
+}
+
+// list is a decoded inspect's array, each element an object.
+func list(value any) []map[string]any {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+
+	out := make([]map[string]any, 0, len(items))
+
+	for _, item := range items {
+		if m, isMap := item.(map[string]any); isMap {
+			out = append(out, m)
+		}
+	}
+
+	return out
+}
+
 // containersOfKind are the containers the engine holds for this fixture's check with kind, read from
 // the engine itself.
 func (f *fixture) containersOfKind(t *testing.T, kind rules.Kind) []string {
@@ -252,3 +290,74 @@ type stopwatch struct {
 func startStopwatch() stopwatch { return stopwatch{started: time.Now()} }
 
 func (s stopwatch) elapsed() time.Duration { return time.Since(s.started) }
+
+// waitsForTests are the dependency waits every test uses: long enough for a Postgres cluster's initdb
+// on a loaded engine.
+func waitsForTests() provision.Waits {
+	return provision.Waits{DependencyReady: time.Minute, Job: time.Minute, PostgresRestore: time.Minute}
+}
+
+// dependencies derives the fixture's started dependencies.
+func (f *fixture) dependencies(t *testing.T, waits provision.Waits) *provision.Dependencies {
+	t.Helper()
+
+	deps, err := provision.NewDependencies(provision.DependencyConfig{
+		Engine: f.eng, Model: f.model, Classification: f.cls, Images: f.images, Network: f.network,
+		Helper: f.helper, Waits: waits,
+	})
+	if err != nil {
+		t.Fatalf("NewDependencies() error = %v", err)
+	}
+
+	return deps
+}
+
+// volumesOfKind are the volumes the engine holds for this fixture's check with kind.
+func (f *fixture) volumesOfKind(t *testing.T, kind rules.Kind) map[string]bool {
+	t.Helper()
+
+	out := map[string]bool{}
+
+	for _, name := range f.docker.Listing(t, rules.LabelCheck+"="+f.eng.CheckID()).Volumes {
+		got := inspected(t, f.docker.Inspect(t, dockertest.ObjectVolume, name))
+		if field(got, "Labels", rules.LabelKind) == string(kind) {
+			out[name] = true
+		}
+	}
+
+	return out
+}
+
+// serviceContainer is the one container of kind the engine holds for service in this check.
+//
+//nolint:unparam // the restore tests ask for the restore kind.
+func (f *fixture) serviceContainer(t *testing.T, kind rules.Kind, service string) map[string]any {
+	t.Helper()
+
+	var found []map[string]any
+
+	for _, id := range f.containersOfKind(t, kind) {
+		got := inspected(t, f.docker.Inspect(t, dockertest.ObjectContainer, id))
+		if field(got, "Config", "Labels", rules.LabelService) == service {
+			found = append(found, got)
+		}
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("the engine holds %d %s containers of %s, want 1", len(found), kind, service)
+	}
+
+	return found[0]
+}
+
+// writeCompose writes a generated compose project into a directory of its own and returns its file.
+func writeCompose(t *testing.T, content string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "compose.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	return path
+}

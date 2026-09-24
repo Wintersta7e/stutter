@@ -136,7 +136,8 @@ func otherPlan(in storageInput, writable map[int]bool) (storagePlan, error) {
 				continue
 			}
 
-			plan.templates = append(plan.templates, templateMount{target: m.Target, copyFrom: m.Source})
+			// The copy is the volume's only content: an empty directory stays empty, as its bind would.
+			plan.templates = append(plan.templates, templateMount{target: m.Target, copyFrom: m.Source, noCopy: true})
 			plan.verdicts = append(plan.verdicts, m.Target+" copied")
 		default:
 			plan.keep(m)
@@ -297,11 +298,12 @@ func healthcheckOf(check compose.Healthcheck, set bool) *Healthcheck {
 	}
 }
 
-// isHostDir reports whether a host path is a directory, without following a final symlink.
+// isHostDir reports whether a host path is a directory, without following a final symlink. A source
+// that is not there is refused, as the bind itself would be.
 func isHostDir(p string) (bool, error) {
 	info, err := os.Lstat(p)
 	if err != nil {
-		return false, fmt.Errorf("%w: %w", errStorage, err)
+		return false, fmt.Errorf("%w: bind source: %w", ErrRefused, err)
 	}
 
 	return info.IsDir(), nil

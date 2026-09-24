@@ -2,6 +2,7 @@ package provision
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"maps"
@@ -40,6 +41,9 @@ var (
 
 // errDependencyConfig means NewDependencies was given a configuration it cannot provision from.
 var errDependencyConfig = errors.New("invalid dependency configuration")
+
+// errOrder means a dependency step was called out of order: an orchestrator's defect, never the user's.
+var errOrder = errors.New("dependency step called out of order")
 
 // SeedRecord is how one started dependency was seeded: the report's only account of what every start
 // began from. Mounts entries are `<target> <verdict>`, never a source path or a value.
@@ -94,11 +98,37 @@ type DependencyConfig struct {
 	Waits Waits
 }
 
+// step is how far a check's dependencies have come. Each call requires its predecessor.
+type step uint8
+
+const (
+	stepNew step = iota
+	stepSeeded
+	stepJobsRun
+	stepSnapshotted
+)
+
 // dependency is one started dependency and everything provisioned for it.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type dependency struct {
-	dep    compose.Dependency
-	image  compose.Image
-	record SeedRecord
+	// health is the service's healthcheck as the seed runs it.
+	health *Healthcheck
+	// seed is the seed container, until the snapshot removes it.
+	seed *Container
+	// templates back plan.templates, one each, in order.
+	templates []*Volume
+	// seedStarted is when the seed started, on the monotonic clock.
+	seedStarted time.Time
+	image       compose.Image
+	dep         compose.Dependency
+	record      SeedRecord
+	// plan is where the seed's writable paths land.
+	plan storagePlan
+	// spec is the service's container spec, with only the mounts compose declared.
+	spec compose.Spec
+	// healthy reports a service_healthy condition naming the service.
+	healthy bool
 }
 
 // Dependencies are the dependencies a check starts: each seeded once, snapshotted, and restored before
@@ -115,6 +145,7 @@ type Dependencies struct {
 	jobs []string
 	cfg  DependencyConfig
 	mu   sync.Mutex
+	step step
 }
 
 // NewDependencies derives a check's started dependencies from its final classification.
@@ -375,4 +406,62 @@ func (d *Dependencies) Records() []SeedRecord {
 	}
 
 	return records
+}
+
+// at requires the dependencies to have reached a step.
+func (d *Dependencies) at(call string, want step) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.step != want {
+		return fmt.Errorf("%w: %s needs %s first", errOrder, call, stepNames()[want])
+	}
+
+	return nil
+}
+
+// reach records that the dependencies reached a step.
+func (d *Dependencies) reach(to step) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.step = to
+}
+
+// stepNames names the call that reaches each step.
+func stepNames() map[step]string {
+	return map[step]string{
+		stepNew: "NewDependencies", stepSeeded: "Seed", stepJobsRun: "Jobs", stepSnapshotted: "Snapshot",
+	}
+}
+
+// inOrder are the started dependencies, level by level: each level after the ones it depends on.
+func (d *Dependencies) inOrder() [][]*dependency {
+	out := make([][]*dependency, 0, len(d.levels))
+
+	for _, level := range d.levels {
+		deps := make([]*dependency, 0, len(level))
+		for _, name := range level {
+			deps = append(deps, d.started[name])
+		}
+
+		out = append(out, deps)
+	}
+
+	return out
+}
+
+// eachIn runs fn for every dependency of one level concurrently, and joins what failed.
+func eachIn(ctx context.Context, level []*dependency, fn func(context.Context, *dependency) error) error {
+	errs := make([]error, len(level))
+
+	var wg sync.WaitGroup
+
+	for index, dep := range level {
+		wg.Go(func() { errs[index] = fn(ctx, dep) })
+	}
+
+	wg.Wait()
+
+	return errors.Join(errs...)
 }
