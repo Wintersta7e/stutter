@@ -49,7 +49,7 @@ func TestUnescapeAppliesOnce(t *testing.T) {
 		{name: "entrypoint", got: spec.Entrypoint[2], want: "echo $HOME"},
 		{name: "command", got: spec.Cmd[1], want: "$1"},
 		{name: "working_dir", got: spec.WorkingDir, want: "/srv/$x"},
-		{name: "hostname", got: spec.Hostname, want: "h$"},
+		{name: hostnameKey, got: spec.Hostname, want: "h$"},
 	}
 
 	for _, check := range checks {
@@ -65,7 +65,7 @@ func TestProxyVariablesAreRemovedAndUnset(t *testing.T) {
 	spec := specOf(t, `{"name": "shop", "services": {"api": {
 		"environment": {"HTTPS_PROXY": "http://proxy.test:3128", "no_proxy": "x", "KEEP": "1"}
 	}}}`, compose.Image{
-		ID: imageID, Env: []string{httpProxy + "=http://proxy.test:3128", lowerHTTPS + "=", "PATH=/bin"},
+		ID: imageID, Env: []string{httpProxy + "=http://proxy.test:3128", lowerHTTPS + "=", pathEntry},
 	})
 
 	for _, name := range []string{"HTTPS_PROXY", "no_proxy", httpProxy, lowerHTTPS} {
@@ -226,7 +226,7 @@ func TestSpecIsIdenticalForEveryStart(t *testing.T) {
 	t.Parallel()
 
 	model := modelFrom(t, string(golden(t, "5.5.1")))
-	img := compose.Image{ID: imageID, Env: []string{"HTTP_PROXY=x", "PATH=/bin"}, Volumes: []string{"/data"}}
+	img := compose.Image{ID: imageID, Env: []string{"HTTP_PROXY=x", pathEntry}, Volumes: []string{"/data"}}
 
 	first, err := model.Spec(target, img, compose.CAEnvironment())
 	if err != nil {
@@ -253,10 +253,10 @@ func TestEnvironmentIsImageOverlaidByCompose(t *testing.T) {
 	model := modelFrom(t, `{"name": "shop", "services": {"api": {"environment": {
 		"NATS_URL": "tls://bus:4222", "P": "pa$$word", "KEPT": null
 	}}}}`)
-	img := compose.Image{ID: imageID, Env: []string{"NATS_URL=nats://a:4222", "KEPT=image", "ONLY=image"}}
+	img := compose.Image{ID: imageID, Env: []string{"NATS_URL=nats://a:4222", "KEPT=from-image", "ONLY=from-image"}}
 
 	env := model.Environment(target, img)
-	want := map[string]string{"NATS_URL": "tls://bus:4222", "P": "pa$word", "KEPT": "image", "ONLY": "image"}
+	want := map[string]string{"NATS_URL": "tls://bus:4222", "P": "pa$word", "KEPT": "from-image", "ONLY": "from-image"}
 
 	if !maps.Equal(env, want) {
 		t.Errorf("Environment = %v, want %v", env, want)

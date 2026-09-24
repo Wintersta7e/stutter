@@ -77,6 +77,12 @@ const (
 	// cacheService and jobService are dependencies several models share.
 	cacheService = "cache"
 	jobService   = "migrate"
+	// Values several tests share.
+	privateNamespace = "private"
+	pathEntry        = "PATH=/bin"
+	sslCertFile      = "SSL_CERT_FILE"
+	dataTarget       = "/data"
+	hostnameKey      = "hostname"
 	// absentService is a service no model has.
 	absentService = "ghost"
 	// pidKey, ipcKey and utsKey are namespace keys several tests name.

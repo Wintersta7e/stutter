@@ -35,7 +35,7 @@ func TestEveryNameKindIsInTheTargetView(t *testing.T) {
 			want: []string{"db", firstReplica, "shop-db-2"},
 		},
 		{
-			name: "hostname",
+			name: hostnameKey,
 			model: `{"name": "shop", "services": {"api": {"networks": {"default": null}},
 				"db": {"hostname": "pghost", "networks": {"default": null}}}}`,
 			want: []string{"db", "pghost", firstReplica},

@@ -39,7 +39,7 @@ func TestASharedNamespaceIsNamed(t *testing.T) {
 		shared                        bool
 	}{
 		{name: "defaults"},
-		{name: "private ipc and cgroup", ipc: "private", cgroup: "private"},
+		{name: "private ipc and cgroup", ipc: privateNamespace, cgroup: privateNamespace},
 		{name: "shareable ipc", ipc: "shareable"},
 		{name: "pid host", pid: host, key: pidKey, shared: true},
 		{name: "pid of a service", pid: "service:db", key: pidKey, shared: true},

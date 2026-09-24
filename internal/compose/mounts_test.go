@@ -44,7 +44,7 @@ func TestEveryBindIsReadOnly(t *testing.T) {
 
 	want := []compose.Mount{
 		{Kind: compose.MountBind, Source: "/project/conf", Target: "/etc/app", ReadOnly: true},
-		{Kind: compose.MountBind, Source: "/project/data", Target: "/data", ReadOnly: true},
+		{Kind: compose.MountBind, Source: "/project/data", Target: dataTarget, ReadOnly: true},
 		{Kind: compose.MountBind, Source: "/project/src", Target: "/src$", ReadOnly: true},
 		{Kind: compose.MountBind, Source: "/project/c.conf", Target: "/etc/app.conf", ReadOnly: true},
 		{Kind: compose.MountBind, Source: "/project/s.txt", Target: "/run/secrets/s_file", ReadOnly: true},
