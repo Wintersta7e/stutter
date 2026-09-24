@@ -339,12 +339,14 @@ func (s *Sandbox) discoverySettled(start *bare, listing *corpus.Listing) func(co
 }
 
 // startWatch is the bus hooks of a start that publishes nothing. It opens no attribution window, so
-// everything the service does stays a setup count; it only counts what the bus handed over and what
-// the service asked JetStream for.
+// everything the service does stays a setup count; it counts what the bus handed over, and notes when
+// the service first asked JetStream for anything.
 type startWatch struct {
+	// requested is when the first JetStream API request went through the bus proxy, on the monotonic
+	// clock; nil before it.
+	requested atomic.Pointer[time.Time]
 	delivered atomic.Int64
 	core      atomic.Int64
-	requests  atomic.Int64
 }
 
 // Delivered counts a consumer delivery. The start publishes nothing, but a stream a job filled can
@@ -356,9 +358,4 @@ func (w *startWatch) Delivered(natsproxy.Delivery) {
 // CoreDelivered counts a message handed to a core subscription.
 func (w *startWatch) CoreDelivered(string) {
 	w.core.Add(1)
-}
-
-// Requested counts a JetStream API request.
-func (w *startWatch) Requested(string) {
-	w.requests.Add(1)
 }

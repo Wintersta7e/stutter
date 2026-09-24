@@ -83,10 +83,10 @@ func (idleService) Close(context.Context) (replay.Exit, error) { return replay.E
 
 func (idleService) Exited() <-chan struct{} { return nil }
 
-// TestDiscoveryRefusesAConfigItCannotRun: discovery watches a service that consumes for itself, from a
-// checkpoint, on a bound stream; a configuration missing any of the three is refused before a service
-// starts.
-func TestDiscoveryRefusesAConfigItCannotRun(t *testing.T) {
+// TestAStartThatPublishesNothingRefusesAConfigItCannotRun: the probe start and discovery watch a
+// service that consumes for itself, from a checkpoint, on a bound stream; a configuration missing any
+// of the three is refused before a service starts.
+func TestAStartThatPublishesNothingRefusesAConfigItCannotRun(t *testing.T) {
 	t.Parallel()
 
 	store, checkpoint := startOnlyBus(t, "ORDERS")
@@ -113,31 +113,46 @@ func TestDiscoveryRefusesAConfigItCannotRun(t *testing.T) {
 		}},
 	}
 
-	for name, current := range cases {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+	entries := map[string]func(ctx context.Context, cfg Config) error{
+		"discovery": func(ctx context.Context, cfg Config) error {
+			_, err := Discover(ctx, cfg)
 
-			var starts atomic.Int32
+			return err
+		},
+		"probe": func(ctx context.Context, cfg Config) error {
+			_, err := ProbeStart(ctx, cfg)
 
-			start := func(context.Context, Addresses) (Consumer, error) {
-				starts.Add(1)
+			return err
+		},
+	}
 
-				return idleService{}, nil
-			}
-			connect := func(context.Context, Addresses) (Service, error) {
-				starts.Add(1)
+	for entry, run := range entries {
+		for name, current := range cases {
+			t.Run(entry+"/"+name, func(t *testing.T) {
+				t.Parallel()
 
-				return nil, errNoService
-			}
+				var starts atomic.Int32
 
-			if _, err := Discover(t.Context(), current.cfg(start, connect)); !errors.Is(err, current.want) {
-				t.Errorf("Discover() error = %v, want %v", err, current.want)
-			}
+				start := func(context.Context, Addresses) (Consumer, error) {
+					starts.Add(1)
 
-			if got := starts.Load(); got != 0 {
-				t.Errorf("a service was started %d times, want 0", got)
-			}
-		})
+					return idleService{}, nil
+				}
+				connect := func(context.Context, Addresses) (Service, error) {
+					starts.Add(1)
+
+					return nil, errNoService
+				}
+
+				if err := run(t.Context(), current.cfg(start, connect)); !errors.Is(err, current.want) {
+					t.Errorf("error = %v, want %v", err, current.want)
+				}
+
+				if got := starts.Load(); got != 0 {
+					t.Errorf("a service was started %d times, want 0", got)
+				}
+			})
+		}
 	}
 }
 
@@ -145,6 +160,41 @@ func TestDiscoveryRefusesAConfigItCannotRun(t *testing.T) {
 // it made is never frozen into the replies every run is answered with.
 func TestDiscoveryNeverFreezesItsScript(t *testing.T) {
 	t.Parallel()
+
+	sandbox, caller := stubCallingSandbox(t)
+
+	if _, err := sandbox.discover(stubContext(t)); err != nil {
+		t.Fatalf("discover() error = %v", err)
+	}
+
+	if got := caller.status.Load(); got != http.StatusOK {
+		t.Fatalf("the stub answered %d, want 200", got)
+	}
+
+	assertNeverFrozen(t, sandbox)
+}
+
+// TestAProbeStartNeverFreezesItsScript: the probe start aborts its HTTP script too.
+func TestAProbeStartNeverFreezesItsScript(t *testing.T) {
+	t.Parallel()
+
+	sandbox, caller := stubCallingSandbox(t)
+
+	if _, err := sandbox.probe(stubContext(t)); err != nil {
+		t.Fatalf("probe() error = %v", err)
+	}
+
+	if got := caller.status.Load(); got != http.StatusOK {
+		t.Fatalf("the stub answered %d, want 200", got)
+	}
+
+	assertNeverFrozen(t, sandbox)
+}
+
+// stubCallingSandbox is the sandbox a start that publishes nothing builds, around a service that calls
+// the stub once as it starts and creates nothing, so the start ends at a short startup limit.
+func stubCallingSandbox(t *testing.T) (*Sandbox, *stubCaller) {
+	t.Helper()
 
 	store, checkpoint := startOnlyBus(t, "ORDERS")
 	caller := &stubCaller{}
@@ -160,18 +210,17 @@ func TestDiscoveryNeverFreezesItsScript(t *testing.T) {
 		t.Fatalf("New() error = %v", err)
 	}
 
+	return sandbox, caller
+}
+
+// stubContext bounds one start, so a broken end rule fails at its own deadline instead of hanging.
+func stubContext(t *testing.T) context.Context {
+	t.Helper()
+
 	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
-	defer cancel()
+	t.Cleanup(cancel)
 
-	if _, err := sandbox.discover(ctx); err != nil {
-		t.Fatalf("discover() error = %v", err)
-	}
-
-	if got := caller.status.Load(); got != http.StatusOK {
-		t.Fatalf("the stub answered %d, want 200", got)
-	}
-
-	assertNeverFrozen(t, sandbox)
+	return ctx
 }
 
 // assertNeverFrozen fails when the sandbox's next run would be answered from frozen replies: the same
