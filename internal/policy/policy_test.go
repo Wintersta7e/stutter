@@ -134,6 +134,45 @@ func TestPermitsDerivesFaultsFromConfig(t *testing.T) {
 	}
 }
 
+// TestAZeroDeadlineLicensesNoRedelivery: a redelivery fault rests on the bus redelivering when the
+// acknowledgement deadline passes, and a zero deadline is no deadline. A zero configuration — one
+// nobody read back from the bus — licensed every redelivery fault, and the drain derived from its
+// zero deadline ended each run before any redelivery could land: a clean sequence reported for a fault
+// that never happened.
+func TestAZeroDeadlineLicensesNoRedelivery(t *testing.T) {
+	t.Parallel()
+
+	zeroFirstEntry := sendingConsumer()
+	zeroFirstEntry.BackOff = []time.Duration{0, time.Second}
+
+	cases := []struct {
+		name   string
+		config policy.Config
+	}{
+		{name: "a zero configuration", config: policy.Config{}},
+		{name: "explicit ack with no wait", config: policy.Config{AckMode: policy.AckExplicit, MaxDeliver: 5}},
+		{name: "a backoff curve opening at zero", config: zeroFirstEntry},
+	}
+
+	for _, testCase := range cases {
+		for _, fault := range []policy.Fault{policy.FaultDuplicate, policy.FaultCrashBeforeAck, policy.FaultDelay} {
+			t.Run(testCase.name+"/"+string(fault), func(t *testing.T) {
+				t.Parallel()
+
+				verdict := testCase.config.Permits(fault)
+				if verdict.Permitted {
+					t.Errorf("Permits(%s) = permitted (clause: %s), want refused: nothing is ever redelivered",
+						fault, verdict.Clause)
+				}
+
+				if !strings.Contains(verdict.Clause, "deadline") {
+					t.Errorf("clause = %q, want it to name the zero acknowledgement deadline", verdict.Clause)
+				}
+			})
+		}
+	}
+}
+
 // TestDuplicateIgnoresThePublishDedupeWindow guards a correction the design needed. A stream's
 // duplicate window deduplicates ingestion of the same message id, not delivery: every redelivery of
 // an already-stored message carries the same stream sequence and arrives regardless. Treating that

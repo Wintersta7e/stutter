@@ -116,6 +116,11 @@ func (c Config) Permits(fault Fault) Verdict {
 // The stream's publish-side duplicate window is deliberately not consulted. It deduplicates
 // ingestion of the same message id, not delivery: every redelivery of an already-stored message
 // carries the same stream sequence and arrives regardless of that window.
+//
+// A zero first deadline is refused because redelivery happens when the deadline passes, and a zero
+// one is no deadline at all. It is what a configuration nobody read back from the bus looks like, and
+// a run waiting on it ends before any redelivery could land — a clean sequence for a fault that never
+// happened.
 func (c Config) redelivery() Verdict {
 	if c.AckMode == AckNone {
 		return Verdict{
@@ -128,6 +133,13 @@ func (c Config) redelivery() Verdict {
 		return Verdict{
 			Permitted: false,
 			Clause:    "MaxDeliver: 1 — the bus delivers each message at most once",
+		}
+	}
+
+	if c.Deadline(1) <= 0 {
+		return Verdict{
+			Permitted: false,
+			Clause:    "acknowledgement deadline: 0 — an unacknowledged delivery is never redelivered",
 		}
 	}
 
