@@ -15,6 +15,7 @@ package harness
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"maps"
@@ -591,25 +592,24 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 }
 
 func (s *Sandbox) listenStub(ctx context.Context, sink *effect.Recorder) (*httpproxy.Proxy, error) {
-	if s.certificates == nil {
-		proxy, err := httpproxy.Listen(ctx, s.bind(), s.cfg.HTTPHost, sink, s.httpScript)
-		if err != nil {
-			return nil, fmt.Errorf("bind the cleartext stub: %w", err)
-		}
+	var config net.ListenConfig
 
-		return proxy, nil
+	listener, err := config.Listen(ctx, "tcp", s.bind())
+	if err != nil {
+		return nil, fmt.Errorf("bind the HTTP stub: %w", err)
 	}
 
-	proxy, err := httpproxy.ListenTLS(
-		ctx,
-		s.bind(),
-		s.cfg.HTTPHost,
-		sink,
-		s.httpScript,
-		s.certificates.certificate,
-	)
+	entries := httpproxy.Entries{Cleartext: listener}
+
+	var certificate func(*tls.ClientHelloInfo) (*tls.Certificate, error)
+
+	if s.certificates != nil {
+		entries, certificate = httpproxy.Entries{TLS: listener}, s.certificates.certificate
+	}
+
+	proxy, err := httpproxy.New(entries, s.cfg.HTTPHost, sink, s.httpScript, certificate)
 	if err != nil {
-		return nil, fmt.Errorf("bind the TLS stub: %w", err)
+		return nil, errors.Join(fmt.Errorf("build the HTTP stub: %w", err), listener.Close())
 	}
 
 	return proxy, nil

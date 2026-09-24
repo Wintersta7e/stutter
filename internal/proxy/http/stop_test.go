@@ -142,7 +142,7 @@ func stopRows() []stopRow {
 			class: proxyhttp.StopConnect,
 			want: `egress stop connect on port 80 for "api.example.test:443": a CONNECT tunnel hides the ` +
 				`request inside it, which cannot be observed`,
-			construct: &proxyhttp.EgressStop{Class: proxyhttp.StopConnect, Port: 80, Name: "api.example.test:443"},
+			drive: cleartextStop([]byte(connectRequest)),
 		},
 		{
 			name:      "cleartext-on-tls",
