@@ -33,6 +33,10 @@ const (
 // startup pass, which runs when its first pull expires — one fetchWait after it starts.
 const crowdedQuiesce = 3 * toy.DefaultQuiesce
 
+// crowdedStartup bounds the wait for a named consumer the crowded service never creates. The service
+// creates both of its own within a second, so the default limit would only lengthen that one case.
+const crowdedStartup = 10 * time.Second
+
 // crowded has the shape of the real service that stopped the first real-target run: two consumers on
 // one stream in one process, sharing a bus connection and a dependency connection, plus a cleanup pass
 // that runs as the service comes up rather than in answer to any message. Each consumer writes its own
@@ -204,6 +208,7 @@ func crowdedSandbox(t *testing.T, consumer string, orders ...string) (*harness.S
 		HashKey:  make([]byte, hashKeyLen),
 		Policy:   config,
 		Quiesce:  crowdedQuiesce,
+		Startup:  crowdedStartup,
 		Start: func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
 			service, startErr := startCrowded(ctx, at, config)
 			if startErr != nil {

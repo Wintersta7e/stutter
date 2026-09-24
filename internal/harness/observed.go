@@ -45,14 +45,17 @@ var (
 // no fault is ever aimed at it: its acknowledgement always goes through.
 const fedBack uint64 = 0
 
+// DefaultStartup is how long a service may take to create a consumer, from the moment its Start
+// returns: the one statement of the startup limit, which Config.Startup overrides. Generous, because it
+// is spent in full only on a failure path — a service that never creates its consumer, whose run has
+// already failed.
+const DefaultStartup = 60 * time.Second
+
 const (
 	// settleMargin multiplies the quiesce to get how long a starting service must stay quiet before
 	// the corpus is published. Startup work is the same scale of thing as a handler's trailing writes,
 	// and a few of them in a row is what separates a finished startup from a pause inside one.
 	settleMargin = 5
-	// defaultStartup is how long a service may take to create a consumer. Generous, because it is only
-	// ever spent in full on a service that never does, and that run is already a failed one.
-	defaultStartup = 10 * time.Second
 	// drainMargin multiplies the longest redelivery deadline to get a default drain wait. A
 	// redelivery lands at the deadline, not before it, so the margin is what stops a run that is
 	// merely waiting from being called finished.
@@ -354,7 +357,7 @@ func (s *Sandbox) startupLimit() time.Duration {
 		return s.cfg.Startup
 	}
 
-	return defaultStartup
+	return DefaultStartup
 }
 
 // scope narrows a snapshot to the retained sequences, keeping recorded order. An empty retain set is

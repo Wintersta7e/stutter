@@ -141,7 +141,7 @@ type Config struct {
 	// when Stutter dispatches, because there the driver knows when it has stopped delivering.
 	Drain time.Duration
 	// Startup is how long a service that consumes for itself may take to create a consumer on the
-	// corpus stream before the corpus is published regardless. Zero is ten seconds.
+	// corpus stream before the corpus is published regardless. Zero uses DefaultStartup.
 	Startup time.Duration
 	// HTTPTLS serves the stub over TLS instead of cleartext, for a service that will not talk to a
 	// dependency any other way. Addresses.HTTPCACert is then what the service must trust.
