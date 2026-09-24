@@ -1,6 +1,7 @@
 package policy_test
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -129,6 +130,51 @@ func TestPermitsDerivesFaultsFromConfig(t *testing.T) {
 
 			if verdict.Clause == "" {
 				t.Error("verdict carries no clause; a finding could not say why the fault was legal")
+			}
+		})
+	}
+}
+
+// TestCrashLoopNeedsThreeDeliveries: a crash loop withholds the first two acknowledgements and lets
+// the third through, so it is only something the bus can do to a consumer allowed three deliveries.
+// Under MaxDeliver 2 the bus gives up after the second crash, and a finding would describe a loop that
+// cannot happen. A duplicate needs only two.
+func TestCrashLoopNeedsThreeDeliveries(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		maxDeliver int
+		crash      bool
+	}{
+		{maxDeliver: 2, crash: false},
+		{maxDeliver: 3, crash: true},
+		{maxDeliver: -1, crash: true},
+	}
+
+	for _, testCase := range cases {
+		t.Run("MaxDeliver "+strconv.Itoa(testCase.maxDeliver), func(t *testing.T) {
+			t.Parallel()
+
+			config := sendingConsumer()
+			config.MaxDeliver = testCase.maxDeliver
+
+			if verdict := config.Permits(policy.FaultDuplicate); !verdict.Permitted {
+				t.Errorf("duplicate refused: %s", verdict.Clause)
+			}
+
+			crash := config.Permits(policy.FaultCrashBeforeAck)
+			if crash.Permitted != testCase.crash {
+				t.Errorf("Permits(crash_before_ack) = %v, want %v (clause: %s)",
+					crash.Permitted, testCase.crash, crash.Clause)
+			}
+
+			// Refusing or licensing, the clause states the three-delivery condition it rests on.
+			if !strings.Contains(crash.Clause, "3 deliveries") {
+				t.Errorf("clause = %q, want it to state the 3 deliveries a crash loop needs", crash.Clause)
+			}
+
+			if !crash.Permitted && !strings.Contains(crash.Clause, "MaxDeliver: 2") {
+				t.Errorf("clause = %q, want it to name MaxDeliver 2", crash.Clause)
 			}
 		})
 	}

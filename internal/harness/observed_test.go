@@ -61,6 +61,9 @@ type quirks struct {
 	// lateBy holds the whole service back this long after it is started, so its consumer appears
 	// after the startup limit. Zero starts it at once.
 	lateBy time.Duration
+	// idempotent reserves only on a message's first delivery, so no fault makes it diverge and a
+	// check spends no runs shrinking.
+	idempotent bool
 }
 
 // latecomer is a service that comes up only after a delay: it connects and creates its consumer once
@@ -198,8 +201,11 @@ func (p *pulling) handle(msg jetstream.Msg) {
 	}
 
 	settle := msg.Ack
-	if err := p.reserve(msg.Data()); err != nil {
-		settle = msg.Nak
+
+	if !p.quirks.idempotent || firstDelivery(msg) {
+		if err := p.reserve(msg.Data()); err != nil {
+			settle = msg.Nak
+		}
 	}
 
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
@@ -485,6 +491,69 @@ func TestAnObservedRunCountsADelayedNak(t *testing.T) {
 	if result.Delivered != 2 || len(result.Effects) != 1 {
 		t.Errorf("Delivered = %d, Effects = %d, want 2 deliveries and the one reservation of the second",
 			result.Delivered, len(result.Effects))
+	}
+}
+
+// ledger wraps a session and keeps the deliveries of every faulted run, by fault.
+type ledger struct {
+	inner      check.Session
+	deliveries map[policy.Fault][]int
+}
+
+func (l *ledger) Reset(ctx context.Context) error {
+	return l.inner.Reset(ctx)
+}
+
+func (l *ledger) Run(
+	ctx context.Context,
+	name string,
+	mutation replay.Mutation,
+	retain []uint64,
+) (replay.Result, error) {
+	result, err := l.inner.Run(ctx, name, mutation, retain)
+	if err == nil && mutation.Fault() != policy.FaultNone {
+		l.deliveries[mutation.Fault()] = append(l.deliveries[mutation.Fault()], result.Delivered)
+	}
+
+	return result, err
+}
+
+// TestCrashBeforeAckIsACrashLoop: crash_before_ack withheld one acknowledgement, exactly as duplicate
+// does, so every finding under it was duplicate's reported twice. As a crash loop it withholds two and
+// lets the third delivery through — repeated partial work, a different experiment — and each fault is
+// still run once per message.
+func TestCrashBeforeAckIsACrashLoop(t *testing.T) {
+	t.Parallel()
+
+	config := observedConfig()
+	built, recorded := quirkySandbox(t, config, quirks{idempotent: true}, nil, "ORD-LOOP-1", "ORD-LOOP-2")
+
+	session := &ledger{inner: built, deliveries: make(map[policy.Fault][]int)}
+
+	if _, err := check.Run(t.Context(), session, check.Options{
+		Messages: recorded,
+		Consumer: observedConsumer,
+		Config:   config,
+	}); err != nil {
+		t.Fatalf("check.Run() error = %v", err)
+	}
+
+	// Every other message is delivered once, so the faulted message's own count is the excess.
+	want := map[policy.Fault]int{policy.FaultDuplicate: 2, policy.FaultCrashBeforeAck: 3}
+
+	for fault, times := range want {
+		runs := session.deliveries[fault]
+		t.Logf("%s: %d runs over %d messages, deliveries per run %v", fault, len(runs), len(recorded), runs)
+
+		if len(runs) != len(recorded) {
+			t.Errorf("%s ran %d times, want once per message (%d)", fault, len(runs), len(recorded))
+		}
+
+		for _, delivered := range runs {
+			if got := delivered - (len(recorded) - 1); got != times {
+				t.Errorf("%s delivered its message %d times, want %d", fault, got, times)
+			}
+		}
 	}
 }
 

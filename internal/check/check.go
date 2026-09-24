@@ -477,7 +477,8 @@ func (c *check) mutationFor(fault policy.Fault, seq uint64) (replay.Mutation, bo
 	case policy.FaultDuplicate:
 		return replay.Duplicate{Seq: seq}, true
 	case policy.FaultCrashBeforeAck:
-		return replay.CrashBeforeAck{Seq: seq, Times: 1}, true
+		// A loop, not one withheld acknowledgement: withholding once is a duplicate by another name.
+		return replay.CrashBeforeAck{Seq: seq, Times: policy.CrashLoopWithheld}, true
 	case policy.FaultDelay:
 		// Sized against the deadline governing the first attempt, which is the backoff curve's
 		// first entry wherever one is set — never the declared ack wait.

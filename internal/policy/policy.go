@@ -20,8 +20,10 @@ const (
 	FaultNone Fault = ""
 	// FaultDuplicate delivers one stored message twice, modelling a lost acknowledgement.
 	FaultDuplicate Fault = "duplicate"
-	// FaultCrashBeforeAck withholds the acknowledgement after the side effect, modelling a consumer
-	// that died between doing the work and reporting it.
+	// FaultCrashBeforeAck is a crash loop: the acknowledgement is withheld after the side effect on the
+	// first CrashLoopWithheld deliveries and the next one succeeds, modelling a consumer that dies
+	// between doing the work and reporting it, restarts, and dies again. Withholding once would be
+	// FaultDuplicate under another name.
 	FaultCrashBeforeAck Fault = "crash_before_ack"
 	// FaultReorder delivers two messages in the opposite order to the one recorded.
 	FaultReorder Fault = "reorder"
@@ -33,6 +35,10 @@ const (
 	// FaultDrop never delivers a message, modelling an at-most-once path.
 	FaultDrop Fault = "drop"
 )
+
+// CrashLoopWithheld is how many deliveries a crash loop withholds the acknowledgement of before one
+// succeeds, so it needs a consumer allowed one delivery more.
+const CrashLoopWithheld = 2
 
 // AckMode mirrors the consumer's acknowledgement policy.
 type AckMode string
@@ -99,8 +105,10 @@ func (c Config) Permits(fault Fault) Verdict {
 	switch fault {
 	case FaultNone:
 		return Verdict{Permitted: true, Clause: "no fault injected — this is the reference run"}
-	case FaultDuplicate, FaultCrashBeforeAck, FaultDelay:
+	case FaultDuplicate, FaultDelay:
 		return c.redelivery()
+	case FaultCrashBeforeAck:
+		return c.crashLoop()
 	case FaultReorder, FaultConcurrent:
 		return c.concurrency()
 	case FaultDrop:
@@ -149,6 +157,30 @@ func (c Config) redelivery() Verdict {
 			" with MaxDeliver " + describeLimit(c.MaxDeliver) +
 			" — an unacknowledged message is redelivered",
 	}
+}
+
+// crashLoop decides crash_before_ack: every redelivery condition, and room for the whole loop — the
+// deliveries it withholds and the one that succeeds. Below that the bus gives up part way through,
+// and a finding would describe a loop that cannot happen.
+func (c Config) crashLoop() Verdict {
+	verdict := c.redelivery()
+	if !verdict.Permitted {
+		return verdict
+	}
+
+	needed := strconv.Itoa(CrashLoopWithheld + 1)
+
+	if c.MaxDeliver > 0 && c.MaxDeliver <= CrashLoopWithheld {
+		return Verdict{
+			Permitted: false,
+			Clause: "MaxDeliver: " + strconv.Itoa(c.MaxDeliver) + " — a crash loop needs " + needed +
+				" deliveries: " + strconv.Itoa(CrashLoopWithheld) + " that crash and one that succeeds",
+		}
+	}
+
+	verdict.Clause += ", allowing the " + needed + " deliveries a crash loop needs"
+
+	return verdict
 }
 
 func (c Config) concurrency() Verdict {

@@ -101,12 +101,14 @@ func (s *session) Run(
 
 		effects = append(effects, write(seq))
 
-		if s.readGuard[seq] && redelivers(mutation, seq) {
-			effects = append(effects, claimLookup(seq))
-		}
+		for range redeliveries(mutation, seq) {
+			if s.readGuard[seq] {
+				effects = append(effects, claimLookup(seq))
+			}
 
-		if s.repeats(mutation, seq) && (!s.flaky || !strings.HasPrefix(name, "shrink")) {
-			effects = append(effects, write(seq))
+			if s.nonIdempotent[seq] && (!s.flaky || !strings.HasPrefix(name, "shrink")) {
+				effects = append(effects, write(seq))
+			}
 		}
 	}
 
@@ -128,20 +130,22 @@ func (s *session) Run(
 	return replay.Result{Effects: effects, Clause: "AckPolicy: explicit", Delivered: len(s.scope(retain))}, nil
 }
 
-func (s *session) repeats(mutation replay.Mutation, seq uint64) bool {
-	return s.nonIdempotent[seq] && redelivers(mutation, seq)
-}
-
-// redelivers reports whether a mutation hands this message to the handler a second time.
-func redelivers(mutation replay.Mutation, seq uint64) bool {
+// redeliveries counts how many more times a mutation hands this message to the handler: once for a
+// duplicate, once per crash for a crash loop.
+func redeliveries(mutation replay.Mutation, seq uint64) uint64 {
 	switch fault := mutation.(type) {
 	case replay.Duplicate:
-		return fault.Seq == seq
+		if fault.Seq == seq {
+			return 1
+		}
 	case replay.CrashBeforeAck:
-		return fault.Seq == seq
+		if fault.Seq == seq {
+			return max(fault.Times, 1)
+		}
 	default:
-		return false
 	}
+
+	return 0
 }
 
 // claimLookup is a read-based dedupe guard looking its claim up.
