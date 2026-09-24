@@ -1,12 +1,16 @@
 package nats
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestADelayedNakRefusesTheDelivery classifies acknowledgement payloads the way the server matches
 // them: a NAK by prefix, because a client asking for redelivery later sends `-NAK {"delay": …}` or
 // `-NAK <duration>`, and matching the bare word read that refusal as a settled delivery.
 //
-// Everything that is neither settles the message. A work-in-progress acknowledgement does not:
+// Anything that is not a settle, a NAK or a work-in-progress acknowledgement is ignored, as the server
+// ignores it. A work-in-progress acknowledgement settles nothing:
 // swallowing one injects a redelivery the run never chose, and closing an attribution window on one
 // reports the rest of a handler's own work against the next message. A negative one is the only way a
 // service Stutter does not call can say a delivery failed.
@@ -51,6 +55,70 @@ func TestADelayedNakRefusesTheDelivery(t *testing.T) {
 
 			if got := ack.Negative(); got != testCase.negative {
 				t.Errorf("Negative() = %v, want %v", got, testCase.negative)
+			}
+		})
+	}
+}
+
+// TestAcknowledgementsAreClassifiedAsTheServerDoes: a run ends when every message is settled, so what
+// settles a message has to be exactly what the server settles on. Anything the server ignores — a
+// trailing space, an unknown verb — leaves the message owed, and a NAK's delay is when its redelivery
+// will land.
+func TestAcknowledgementsAreClassifiedAsTheServerDoes(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		payload    string
+		nakDelay   time.Duration
+		settles    bool
+		negative   bool
+		inProgress bool
+	}{
+		{payload: "", settles: true},
+		{payload: "+ACK", settles: true},
+		{payload: "+OK", settles: true},
+		{payload: "+NXT", settles: true},
+		{payload: `+NXT {"batch":2}`, settles: true},
+		{payload: "+TERM", settles: true},
+		{payload: "+TERM gone", settles: true},
+		{payload: "-NAK", negative: true},
+		{payload: `-NAK {"delay":200000000}`, negative: true, nakDelay: 200 * time.Millisecond},
+		{payload: "-NAK 5s", negative: true, nakDelay: 5 * time.Second},
+		// The server treats an unparseable delay as a plain NAK.
+		{payload: "-NAK soon", negative: true},
+		{payload: "+WPI", inProgress: true},
+		// The server matches these exactly or not at all, and ignores what it does not match.
+		{payload: "+ACK "},
+		{payload: "+WPIX"},
+		{payload: "hello"},
+	}
+
+	t.Logf("%d acknowledgement payloads classified", len(cases))
+
+	if len(cases) == 0 {
+		t.Fatal("no payloads to classify")
+	}
+
+	for _, testCase := range cases {
+		t.Run(testCase.payload, func(t *testing.T) {
+			t.Parallel()
+
+			ack := Ack{Payload: []byte(testCase.payload)}
+
+			if got := ack.Settles(); got != testCase.settles {
+				t.Errorf("Settles() = %v, want %v", got, testCase.settles)
+			}
+
+			if got := ack.Negative(); got != testCase.negative {
+				t.Errorf("Negative() = %v, want %v", got, testCase.negative)
+			}
+
+			if got := ack.InProgress(); got != testCase.inProgress {
+				t.Errorf("InProgress() = %v, want %v", got, testCase.inProgress)
+			}
+
+			if got := ack.NakDelay(); got != testCase.nakDelay {
+				t.Errorf("NakDelay() = %s, want %s", got, testCase.nakDelay)
 			}
 		})
 	}

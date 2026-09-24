@@ -226,6 +226,10 @@ func (Concurrent) Fault() policy.Fault { return policy.FaultConcurrent }
 type Result struct {
 	// Clause is the configuration that licensed this run's fault, quoted into any finding.
 	Clause string
+	// Stopped is the egress-policy stop that ended the run, in the stub's own words; empty otherwise.
+	// The harness sets it when the stub stops the run on the service's egress. What the service did
+	// after the stop went unobserved.
+	Stopped string
 	// Effects is the sequence the run produced, in observation order.
 	Effects []effect.Effect
 	// Refusals are the requests the bus declined before the first delivery, with its own code and
@@ -239,6 +243,14 @@ type Result struct {
 	// Failed counts handler invocations that returned an error. A high count on a clean run means
 	// the corpus is being rejected, which must be seen before any divergence is believed.
 	Failed int
+	// Owed counts the messages the consumer under test admitted that were not done when the run ended,
+	// for whatever reason it ended: never settled, and still able to be delivered again. Zero on a
+	// driven run.
+	Owed int
+	// Exhausted counts messages that reached the run's delivery cap without a positive acknowledgement
+	// where the consumer itself allows more deliveries: what the service did with the ones the cap cut
+	// off was not observed. Zero on a driven run.
+	Exhausted int
 	// Late counts effects that arrived after their attribution window closed.
 	Late int
 	// Setup counts effects observed before the first delivery. When a run saw nothing else, it is
@@ -255,6 +267,10 @@ type Result struct {
 	NoResponders int
 	// ClosedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
 	ClosedAfterInfo int
+	// Span is how long an observed run spent on the bus, on the monotonic clock: from the corpus being
+	// published to the run's end. Whatever of a run's elapsed time lies outside it is Stutter's own
+	// overhead. Zero on a driven run, and on a run that never published.
+	Span time.Duration
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.

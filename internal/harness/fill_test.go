@@ -98,7 +98,7 @@ func TestFillIsHeldAgainstASelfPublishingHandler(t *testing.T) {
 			config.AckWait = 5 * time.Second
 			config.FilterSubjects = []string{toy.SubjectOrderCreated}
 
-			behaviour := quirks{filter: toy.SubjectOrderCreated, audit: true, pullExpires: 5 * time.Second}
+			behaviour := quirks{audit: true, pullExpires: 5 * time.Second}
 
 			built, _ := quirkySandbox(t, config, behaviour, func(settings *harness.Config) {
 				settings.Recorded = orders("ORD-AUDIT", corpusSize, 0)

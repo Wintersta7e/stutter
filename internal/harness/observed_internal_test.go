@@ -1,11 +1,13 @@
 package harness
 
 import (
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/effect"
+	"github.com/Wintersta7e/stutter/internal/policy"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
@@ -80,5 +82,45 @@ func TestAFedBackDeliveryIsNeverAttributedToACorpusMessage(t *testing.T) {
 	if run.Withhold(fedBack) {
 		t.Error("Withhold() swallowed a fed-back message's acknowledgement: the fault aimed at recorded " +
 			"message 2 landed on the service's own output")
+	}
+}
+
+// TestDriftComparesFilterSubjectsAsASet: the consumer the service created has to be the one legality
+// was read from, field by field — but only up to what the delivery contract itself equates. The order
+// filters were written in, or an unlimited MaxDeliver spelled 0 rather than -1, is no difference at all.
+func TestDriftComparesFilterSubjectsAsASet(t *testing.T) {
+	t.Parallel()
+
+	curve := []time.Duration{time.Second, 5 * time.Second}
+
+	cases := []struct {
+		name      string
+		differs   []string
+		want, got policy.Config
+	}{
+		{
+			name: "filters in another order",
+			want: policy.Config{FilterSubjects: []string{"b", "a"}},
+			got:  policy.Config{FilterSubjects: []string{"a", "b"}},
+		},
+		{
+			name: "unlimited spelled two ways",
+			want: policy.Config{MaxDeliver: 0},
+			got:  policy.Config{MaxDeliver: -1},
+		},
+		{
+			name:    "a changed curve and delivery limit",
+			want:    policy.Config{BackOff: curve, MaxDeliver: 3},
+			got:     policy.Config{BackOff: curve[:1], MaxDeliver: 5},
+			differs: []string{"BackOff", "MaxDeliver"},
+		},
+	}
+
+	t.Logf("%d comparisons", len(cases))
+
+	for _, testCase := range cases {
+		if got := drift(testCase.want, testCase.got); !slices.Equal(got, testCase.differs) {
+			t.Errorf("%s: drift() = %q, want %q", testCase.name, got, testCase.differs)
+		}
 	}
 }
