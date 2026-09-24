@@ -45,5 +45,3 @@ github.com/Wintersta7e/stutter/internal/relay.parsePath
 github.com/Wintersta7e/stutter/internal/relay.ParseVerify
 github.com/Wintersta7e/stutter/internal/relay.parseDial
 github.com/Wintersta7e/stutter/internal/relay.parseTarget
-# The DNS signal record: written by the stub relay's responder once it answers.
-github.com/Wintersta7e/stutter/internal/relay.WriteQuery

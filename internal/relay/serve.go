@@ -20,8 +20,6 @@ const localPortRange = "/proc/sys/net/ipv4/ip_local_port_range"
 var (
 	// errBind means the relay could not find exactly one of its own addresses to listen on.
 	errBind = errors.New("cannot choose an address to listen on")
-	// errUnserved means the spec asks for a listener this build cannot serve.
-	errUnserved = errors.New("listener not served")
 	// errPortRange means the kernel's source-port range could not be read.
 	errPortRange = errors.New("unreadable local port range")
 )
@@ -39,6 +37,8 @@ type system struct {
 	// port, in production. A test process cannot bind the privileged ones.
 	catchAllFirst uint16
 	catchAllLast  uint16
+	// dnsPort is where the responder listens: DNSPort in production. A test process cannot bind it.
+	dnsPort uint16
 }
 
 // hostSystem reads the machine the relay runs on.
@@ -48,6 +48,7 @@ func hostSystem() system {
 		portRangeFile: localPortRange,
 		catchAllFirst: 1,
 		catchAllLast:  math.MaxUint16,
+		dnsPort:       DNSPort,
 	}
 }
 
@@ -221,8 +222,13 @@ type server struct {
 	conns map[net.Conn]struct{}
 	// catchAll is nil unless the spec has a catch-all listener.
 	catchAll *catchAll
-	pipes    []pipeListener
-	self     netip.Addr
+	// dnsUDP, dnsTCP, signalConn and signal are nil unless the relay answers DNS.
+	dnsUDP     net.PacketConn
+	dnsTCP     net.Listener
+	signalConn net.Conn
+	signal     *signalWriter
+	pipes      []pipeListener
+	self       netip.Addr
 	// catchAllUpstream is where every catch-all connection is piped.
 	catchAllUpstream netip.AddrPort
 	spec             Spec
@@ -233,12 +239,22 @@ type server struct {
 	closed bool
 }
 
-// bind opens every socket the spec asks for, on the relay's own address and nowhere else.
+// bind opens every socket the spec asks for, on the relay's own address and nowhere else, and the
+// signal connection last.
 func (s *server) bind(ctx context.Context, sys system) error {
-	if s.spec.Signal.IsValid() {
-		return fmt.Errorf("%w: the DNS responder", errUnserved)
+	if err := s.bindListeners(ctx, sys); err != nil {
+		return err
 	}
 
+	if !s.spec.Signal.IsValid() {
+		return nil
+	}
+
+	return s.bindDNS(ctx, sys.dnsPort)
+}
+
+// bindListeners opens the pipe listeners and the catch-all.
+func (s *server) bindListeners(ctx context.Context, sys system) error {
 	var config net.ListenConfig
 
 	for _, wanted := range s.spec.Listeners {
@@ -276,6 +292,11 @@ func (s *server) bind(ctx context.Context, sys system) error {
 func (s *server) start(ctx context.Context) {
 	for _, pipe := range s.pipes {
 		s.wg.Go(func() { s.accept(ctx, pipe) })
+	}
+
+	if s.dnsUDP != nil {
+		s.wg.Go(func() { s.serveUDP(ctx) })
+		s.wg.Go(func() { s.serveTCP(ctx) })
 	}
 
 	if s.catchAll == nil {
@@ -419,6 +440,8 @@ func (s *server) shutdown() {
 	for _, conn := range open {
 		_ = conn.Close()
 	}
+
+	s.closeDNS()
 
 	if s.catchAll != nil {
 		s.catchAll.wake()
