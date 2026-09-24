@@ -59,16 +59,17 @@ const fedBack uint64 = 0
 const DefaultStartup = 60 * time.Second
 
 const (
-	// settleMargin multiplies the quiesce to get how long a starting service must stay quiet before
-	// the corpus is published. Startup work is the same scale of thing as a handler's trailing writes,
+	// settleMargin multiplies the quiesce to get the settle period: how long a starting service must
+	// stay quiet before the corpus is published, and how long a run whose messages are all done must
+	// stay quiet before it ends. Startup work is the same scale of thing as a handler's trailing writes,
 	// and a few of them in a row is what separates a finished startup from a pause inside one.
 	settleMargin = 5
-	// drainMargin multiplies the longest redelivery deadline to get a default drain wait. A
+	// drainMargin multiplies the longest redelivery deadline to get the owed-silence limit's floor. A
 	// redelivery lands at the deadline, not before it, so the margin is what stops a run that is
 	// merely waiting from being called finished.
 	drainMargin = 2
-	// drainPoll is how often an observed run checks whether the bus has gone quiet. Well below any
-	// redelivery deadline a consumer would be configured with, so it costs the run no accuracy.
+	// drainPoll is how often a wait checks its condition. Well below any redelivery deadline a consumer
+	// would be configured with, so it costs the run no accuracy.
 	drainPoll = 25 * time.Millisecond
 	// ownCheckpoint names the sandbox's own bus checkpoint, beside the store.
 	ownCheckpoint = "observed"
@@ -96,8 +97,9 @@ type Start func(ctx context.Context, at Addresses) (Consumer, error)
 //
 // The shape is the driven run's, with three substitutions: the bus is restored to its starting point
 // and only the run's messages are published, because the service cannot be told to skip a message;
-// the fault is injected by swallowing acknowledgements on the wire; and the run ends when the bus goes
-// quiet rather than when the driver stops delivering.
+// the fault is injected by swallowing acknowledgements on the wire; and the run ends by settlement,
+// not silence — every admitted message done, or nothing moving for the owed-silence limit — rather than
+// when the driver stops delivering.
 func (s *Sandbox) runObserved(
 	ctx context.Context,
 	name string,
@@ -311,9 +313,33 @@ func (s *Sandbox) begin(
 		}
 	}
 
+	admitted := s.openLedger(run, target, messages)
+
 	run.scope(target, s.startupLimit())
 
-	return finished, s.fill(ctx, run, target, messages)
+	return finished, s.fill(ctx, run, target, messages, admitted)
+}
+
+// openLedger opens the run's settlement ledger over the messages the consumer under test admits, and
+// reports how many that is. It opens before the first publish, because the service is handed a message
+// the moment it lands.
+//
+// With no consumer named, the run's deliveries follow the configuration the caller declared.
+func (s *Sandbox) openLedger(run *observedRun, target string, messages []corpus.Message) int {
+	if target == "" {
+		run.contract = s.cfg.Policy
+	}
+
+	admitted := corpus.Admitted(messages, run.contract.FilterSubjects)
+
+	seqs := make([]uint64, 0, len(admitted))
+	for _, message := range admitted {
+		seqs = append(seqs, message.Seq)
+	}
+
+	run.ledger.Store(newSettlement(run.contract, seqs))
+
+	return len(admitted)
 }
 
 // serialise holds the consumer under test to one message in flight and to the delivery cap, and
@@ -328,7 +354,7 @@ func (s *Sandbox) serialise(ctx context.Context, run *observedRun, target string
 		return fmt.Errorf("%w: %s", errDrifted, strings.Join(differs, ", "))
 	}
 
-	run.discovered = discovered
+	run.contract = discovered
 
 	return nil
 }
@@ -352,7 +378,7 @@ func (s *Sandbox) stillSerialised(ctx context.Context, run *observedRun, ended i
 		return fmt.Errorf("%w: read it back after the run: %w", errDrifted, err)
 	}
 
-	capped := run.discovered.EffectiveCap(DeliveryCap)
+	capped := run.contract.EffectiveCap(DeliveryCap)
 
 	var changed []string
 	if after.MaxAckPending != 1 {
@@ -537,43 +563,34 @@ func scope(messages []corpus.Message, retain []uint64) []corpus.Message {
 	return scoped
 }
 
-// drain waits for an observed run to end: the bus quiet for the drain period, or the service gone.
+// drain waits for an observed run to end by settlement: every admitted message done and the service
+// quiet for the settle period, or the owed-silence limit reached with messages still owed, or the
+// service gone.
+//
+// The limit's static part is Config.Drain when set, and otherwise the floor derived from the run's
+// delivery configuration: long enough for any redelivery the cap allows. A withheld acknowledgement
+// produces nothing at all until its deadline passes, so a run that gave up first would report the
+// fault as a service that simply stopped.
 func (s *Sandbox) drain(
 	ctx context.Context,
 	observed *egress,
 	exited <-chan struct{},
 	run *observedRun,
 ) (interruption, error) {
-	ended, err := observed.await(ctx, exited, run.quietFor(s.drainWait()))
+	static := s.cfg.Drain
+	if static <= 0 {
+		static = floor(run.contract, s.quiesce())
+	}
+
+	ended, err := observed.await(ctx, exited, run.settledOrOwed(s.settle(), static, s.quiesce()))
+
+	run.end()
+
 	if err != nil {
 		return ended, fmt.Errorf("wait for the run to end: %w", err)
 	}
 
 	return ended, nil
-}
-
-// drainWait is how long the bus must stay silent before an observed run is called finished.
-//
-// It has to outlast the longest redelivery the recorded configuration permits. A withheld
-// acknowledgement produces nothing at all until the deadline passes, so a run that gave up first
-// would report the fault as a service that simply stopped — a clean sequence where the fault's whole
-// effect was still to come.
-func (s *Sandbox) drainWait() time.Duration {
-	if s.cfg.Drain > 0 {
-		return s.cfg.Drain
-	}
-
-	longest := s.cfg.Policy.Deadline(1)
-
-	// The last backoff entry governs every attempt after it, so the curve's own length bounds the
-	// search however high MaxDeliver is set.
-	for attempt := 2; attempt <= len(s.cfg.Policy.BackOff); attempt++ {
-		if deadline := s.cfg.Policy.Deadline(attempt); deadline > longest {
-			longest = deadline
-		}
-	}
-
-	return longest*drainMargin + s.quiesce()
 }
 
 func (s *Sandbox) quiesce() time.Duration {
@@ -597,9 +614,12 @@ type observedRun struct {
 	staged atomic.Pointer[map[string]struct{}]
 	// core counts, by subject, staged messages handed to a core subscription.
 	core map[string]int
-	// discovered is the consumer under test as Serialise read it, before the rewrite: the configuration
-	// the service created, with the server's defaults filled in. Zero when no consumer was named.
-	discovered policy.Config
+	// ledger is the run's settlement ledger, opened before the corpus is published.
+	ledger atomic.Pointer[settlement]
+	// contract is the configuration the run's deliveries follow: the consumer under test as Serialise
+	// read it, before the rewrite — what the service created, with the server's defaults filled in — or,
+	// with no consumer named, the configuration the caller declared.
+	contract policy.Config
 	// recorded translates a sequence the stream is using back to the one the message was recorded
 	// under. Installed by stage before the corpus is published, and read from the proxy's goroutines.
 	recorded atomic.Pointer[map[uint64]uint64]
@@ -626,6 +646,8 @@ type observedRun struct {
 	startup time.Duration
 	// activity is when the bus was last active, as an offset from began.
 	activity atomic.Int64
+	// endedAt is when the run's wait ended, as an offset from began.
+	endedAt time.Duration
 	// lastDelivered is the recorded sequence of the last staged message delivered to the consumer
 	// under test, 0 before the first.
 	lastDelivered atomic.Uint64
@@ -691,6 +713,10 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 		r.lastDelivered.Store(seq)
 	}
 
+	if ledger := r.ledger.Load(); ledger != nil {
+		ledger.delivered(seq, delivery.Ack.Deliveries, r.offset())
+	}
+
 	r.windows.open(seq, delivery.Payload)
 }
 
@@ -737,16 +763,22 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 
 	r.touch()
 
-	// Asking for more time settles nothing, so it neither closes a window nor may be swallowed.
+	seq := r.sequence(ack.StreamSeq)
+	ledger := r.ledger.Load()
+
+	// Asking for more time settles nothing, so it neither closes a window nor may be swallowed; it
+	// restarts the clock on the delivery's deadline.
 	if ack.InProgress() {
+		if ledger != nil {
+			ledger.acknowledged(seq, ack, false, r.offset())
+		}
+
 		return false
 	}
 
 	if ack.Negative() {
 		r.failed.Add(1)
 	}
-
-	seq := r.sequence(ack.StreamSeq)
 
 	// The mutation was built against recorded sequences, so the wire's own numbering is translated
 	// before the fault is decided rather than after. A message Stutter never staged translates to
@@ -758,6 +790,10 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 		StreamSeq:  seq,
 		Deliveries: ack.Deliveries,
 	})
+
+	if ledger != nil {
+		ledger.acknowledged(seq, ack, withheld, r.offset())
+	}
 
 	r.windows.settle(seq)
 
@@ -787,15 +823,25 @@ func (r *observedRun) stage(messages []corpus.Message, first uint64) {
 	r.staged.Store(&subjects)
 }
 
-// quietFor is the wait's condition for the run's end: the bus has handed nothing over and settled
-// nothing for the drain period.
-//
-// Silence is the only honest signal an observed run has that it is over: Stutter no longer decides
-// when to stop delivering.
-func (r *observedRun) quietFor(drain time.Duration) func(context.Context) (bool, error) {
+// settledOrOwed is the wait's condition for the run's end: every admitted message done and the
+// consumer under test's deliveries and acknowledgements quiet for the settle period; or, with messages
+// still owed, quiet for the owed-silence limit. Reaching the limit means nothing is moving, so the cut
+// falls in the same place in every run.
+func (r *observedRun) settledOrOwed(settle, static, quiesce time.Duration) func(context.Context) (bool, error) {
 	return func(context.Context) (bool, error) {
-		return r.silence() >= drain, nil
+		ledger, silence := r.ledger.Load(), r.silence()
+
+		if silence >= settle && ledger.settled(r.offset()) {
+			return true, nil
+		}
+
+		return silence >= ledger.limit(static, quiesce), nil
 	}
+}
+
+// end notes when the run's wait ended: what is owed is counted as of then.
+func (r *observedRun) end() {
+	r.endedAt = r.offset()
 }
 
 // ended reads what the service stopping by itself means for the run, completing its exit with the
@@ -931,11 +977,18 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 			errFedBack, strings.Join(unstaged, ", "), worked)
 	}
 
+	var owed, exhausted int
+	if ledger := r.ledger.Load(); ledger != nil {
+		owed, exhausted = ledger.owed(r.endedAt), ledger.exhausted(r.endedAt)
+	}
+
 	return replay.Result{
 		Clause:          clause,
 		Effects:         effects,
 		Delivered:       int(r.delivered.Load()),
 		Failed:          int(r.failed.Load()),
+		Owed:            owed,
+		Exhausted:       exhausted,
 		Late:            r.recorder.LateCount(),
 		Setup:           r.recorder.SetupCount(),
 		FedBack:         len(unstaged),
@@ -1003,7 +1056,12 @@ func (r *observedRun) sequence(staged uint64) uint64 {
 }
 
 func (r *observedRun) touch() {
-	r.activity.Store(int64(time.Since(r.began)))
+	r.activity.Store(int64(r.offset()))
+}
+
+// offset is how long the run has been going, on the monotonic clock.
+func (r *observedRun) offset() time.Duration {
+	return time.Since(r.began)
 }
 
 // silence is how long the bus has been quiet, measured on the monotonic clock.

@@ -239,6 +239,14 @@ type Result struct {
 	// Failed counts handler invocations that returned an error. A high count on a clean run means
 	// the corpus is being rejected, which must be seen before any divergence is believed.
 	Failed int
+	// Owed counts the messages the consumer under test admitted that were not done when the run ended,
+	// for whatever reason it ended: never settled, and still able to be delivered again. Zero on a
+	// driven run.
+	Owed int
+	// Exhausted counts messages that reached the run's delivery cap without a positive acknowledgement
+	// where the consumer itself allows more deliveries: what the service did with the ones the cap cut
+	// off was not observed. Zero on a driven run.
+	Exhausted int
 	// Late counts effects that arrived after their attribution window closed.
 	Late int
 	// Setup counts effects observed before the first delivery. When a run saw nothing else, it is

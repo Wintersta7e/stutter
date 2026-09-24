@@ -79,6 +79,9 @@ type quirks struct {
 	seen *startups
 	// onStop is called when the service stops consuming under stopAfter.
 	onStop func()
+	// timeline is where the service notes each delivery, its last acknowledgement and when it was
+	// closed. Nil notes nothing.
+	timeline *timeline
 	// stream is the stream the service consumes from. Empty is the corpus stream's default name.
 	stream string
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
@@ -111,6 +114,9 @@ type quirks struct {
 	pullExpires time.Duration
 	// stopAfter stops the service consuming once it has handled this many deliveries. Zero never does.
 	stopAfter int
+	// pause is how long the service sleeps after each delivery before it fetches again. Zero fetches at
+	// once.
+	pause time.Duration
 	// coreSubscribe makes the service also subscribe to the order subject with a core subscription,
 	// beside its consumer.
 	coreSubscribe bool
@@ -129,6 +135,54 @@ type quirks struct {
 	// recreate makes the service create its consumer again, with its own configuration, once it has
 	// handled its first delivery — as a service that reconnects mid-run does.
 	recreate bool
+	// nakAll refuses every delivery with a plain NAK, as a handler that can never process a message does.
+	nakAll bool
+}
+
+// timeline records, on the monotonic clock, what a service did and when.
+type timeline struct {
+	noted noted
+	mu    sync.Mutex
+}
+
+// noted is what a timeline recorded: how many deliveries the service was handed, when it last
+// acknowledged one, and when it was closed.
+type noted struct {
+	lastAck    time.Time
+	closed     time.Time
+	deliveries int
+}
+
+// delivered notes a delivery.
+func (l *timeline) delivered() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.noted.deliveries++
+}
+
+// acked notes an acknowledgement.
+func (l *timeline) acked() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.noted.lastAck = time.Now()
+}
+
+// closing notes that the service is being closed.
+func (l *timeline) closing() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.noted.closed = time.Now()
+}
+
+// read reports what was noted.
+func (l *timeline) read() noted {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	return l.noted
 }
 
 // idempotencyKey is the header a header-keyed dedupe guard reads.
@@ -384,6 +438,10 @@ func handshake(ctx context.Context, address string) error {
 // Close stops pulling and waits for the pump before the connections go, so the proxies are not torn
 // down underneath a delivery still being worked on.
 func (p *pulling) Close(context.Context) (replay.Exit, error) {
+	if p.quirks.timeline != nil {
+		p.quirks.timeline.closing()
+	}
+
 	close(p.done)
 	<-p.stopped
 
@@ -490,10 +548,13 @@ func (p *pulling) pump(ctx context.Context) {
 			return
 		}
 
+		fetched := false
+
 		for msg := range batch.Messages() {
 			p.handle(ctx, msg)
 
 			handled++
+			fetched = true
 
 			if p.quirks.recreate && handled == 1 {
 				//nolint:errcheck // a re-creation that fails leaves the rewrite in force, which the test's
@@ -509,12 +570,31 @@ func (p *pulling) pump(ctx context.Context) {
 
 			return
 		}
+
+		if fetched && p.quirks.pause > 0 {
+			select {
+			case <-p.done:
+				return
+			case <-time.After(p.quirks.pause):
+			}
+		}
 	}
 }
 
 // handle reserves stock once per delivery, which is the planted bug: the bus is permitted to deliver
 // the same message twice, and this service reserves twice when it does.
 func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
+	if p.quirks.timeline != nil {
+		p.quirks.timeline.delivered()
+	}
+
+	if p.quirks.nakAll {
+		//nolint:errcheck // as below: a settle that fails is the run ending underneath the service.
+		_ = msg.Nak()
+
+		return
+	}
+
 	if p.quirks.nakFor > 0 && firstDelivery(msg) {
 		//nolint:errcheck // as below: a settle that fails is the run ending underneath the service.
 		_ = msg.NakWithDelay(p.quirks.nakFor)
@@ -563,6 +643,10 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+
+	if p.quirks.timeline != nil {
+		p.quirks.timeline.acked()
+	}
 }
 
 // seenKey reports whether the header guard has already handled this message's idempotency key, and
