@@ -148,10 +148,18 @@ type Topology struct {
 	set *harness.ListenerSet
 	// verifier is the verification container, kept until teardown.
 	verifier *provision.Container
-	cfg      Config
-	mu       sync.Mutex
-	token    relay.Token
-	mode     harness.Mode
+	// seedRelay is the seed bus relay, during the seed phase only.
+	seedRelay *relayContainer
+	// relays are the per-check relays, the stub relay last.
+	relays []*relayContainer
+	// advertise is where containers reach the listeners, once verified.
+	advertise netip.Addr
+	// stub is the stub relay's service-network address: the target's resolver.
+	stub  netip.Addr
+	cfg   Config
+	mu    sync.Mutex
+	token relay.Token
+	mode  harness.Mode
 }
 
 // Open mints the check's relay token, detects how containers reach this host, and opens the listener
@@ -294,6 +302,7 @@ func (t *Topology) Verify(ctx context.Context) error {
 		return &VerifyError{Mode: t.mode, Address: target, Cause: "the verifier reached " + verified.String()}
 	}
 
+	t.advertise = verified
 	t.set.SetAdvertise(verified)
 
 	if err := t.set.CloseVerify(); err != nil {
