@@ -26,6 +26,21 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
 github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
 github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
+# The invocation listener set and its endpoint keys: opened by the compose path once per check.
+github.com/Wintersta7e/stutter/internal/harness.EndpointKey
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.accept
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.acceptance
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.admit
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.advertised
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.open
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.release
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.track
+github.com/Wintersta7e/stutter/internal/harness.OpenListeners
+github.com/Wintersta7e/stutter/internal/harness.ParseEndpointKey
+github.com/Wintersta7e/stutter/internal/harness.catchAllPort
+github.com/Wintersta7e/stutter/internal/harness.validateBus
+github.com/Wintersta7e/stutter/internal/harness.validateKeys
+github.com/Wintersta7e/stutter/internal/harness.validateListeners
 # The host side of the relay framing: called by the invocation listener set the compose path opens.
 github.com/Wintersta7e/stutter/internal/relay.Accept
 github.com/Wintersta7e/stutter/internal/relay.Conn.Abort

@@ -7,8 +7,10 @@
 // $KV.<bucket>.<key> — while omitting HTTP hides API-backed guards and omitting the rest hides a
 // whole datastore. A handler judged on partial evidence gets the right verdict only by luck.
 //
-// Container provisioning does not exist yet, so the service is supplied as a connect function. When
-// a provisioner lands it implements the same shape and nothing above this package changes.
+// A Go caller supplies the service as a function that connects it or starts it. A provisioned
+// container is started the same way, but its connections do not reach proxies of the sandbox's own:
+// they arrive through relays onto a listener set that outlives every sandbox of the check
+// (Config.Listeners), and each run attaches its proxies to that set.
 package harness
 
 import (
@@ -35,6 +37,9 @@ import (
 // once — a service that consumes for itself AND is dispatched to would see every message twice.
 var errNoService = errors.New("exactly one of Connect and Start must be set: " +
 	"Connect dispatches to the service, Start lets it consume for itself")
+
+// errListenersBeside means a sandbox on the invocation listeners was also given an endpoint of its own.
+var errListenersBeside = errors.New("the listener set owns every endpoint of a relayed service")
 
 // defaultHTTPHost is stable across runs while the listener's kernel-assigned port is not. The
 // reserved .invalid suffix makes it impossible to mistake this local stub identity for a real host.
@@ -84,6 +89,10 @@ type Connect func(ctx context.Context, at Addresses) (Service, error)
 type Config struct {
 	// Corpus is the recorded traffic and the bus the service talks to.
 	Corpus *corpus.Corpus
+	// Listeners is the check's invocation listener set, for a service reached through relays. Set, it
+	// is where every endpoint, the HTTP host and the certificate authority come from, so none of
+	// PostgresDSN, Opaque, BindHost, AdvertiseHost, HTTPHost or Connect may be set beside it.
+	Listeners *ListenerSet
 	// Connect builds a service Stutter dispatches to. Exactly one of Connect and Start is set.
 	Connect Connect
 	// Start builds a service that pulls from the bus for itself, as a provisioned container does.
@@ -175,6 +184,10 @@ func New(cfg Config) (*Sandbox, error) {
 		return nil, errNoService
 	}
 
+	if cfg.Listeners != nil {
+		return onListeners(cfg)
+	}
+
 	var upstream string
 
 	if cfg.PostgresDSN != "" {
@@ -206,6 +219,36 @@ func New(cfg Config) (*Sandbox, error) {
 		httpScript:   httpproxy.NewScript(cfg.HTTPDefault, cfg.HTTPRoutes),
 		certificates: certificates,
 		upstream:     upstream,
+	}, nil
+}
+
+// onListeners builds a sandbox whose endpoints are the invocation listener set's. Its HTTP host and
+// its certificate authority are the set's, so every consumer check presents the service one CA.
+func onListeners(cfg Config) (*Sandbox, error) {
+	beside := map[string]bool{
+		"PostgresDSN":   cfg.PostgresDSN != "",
+		"Opaque":        len(cfg.Opaque) > 0,
+		"BindHost":      cfg.BindHost != "",
+		"AdvertiseHost": cfg.AdvertiseHost != "",
+		"HTTPHost":      cfg.HTTPHost != "",
+		"Connect":       cfg.Connect != nil,
+	}
+
+	for _, field := range slices.Sorted(maps.Keys(beside)) {
+		if beside[field] {
+			return nil, fmt.Errorf("%w: Listeners is set beside %s", errListenersBeside, field)
+		}
+	}
+
+	cfg.HTTPHost = cfg.Listeners.cfg.HTTPHost
+	if cfg.HTTPHost == "" {
+		cfg.HTTPHost = defaultHTTPHost
+	}
+
+	return &Sandbox{
+		cfg:          cfg,
+		httpScript:   httpproxy.NewScript(cfg.HTTPDefault, cfg.HTTPRoutes),
+		certificates: cfg.Listeners.authority,
 	}, nil
 }
 
