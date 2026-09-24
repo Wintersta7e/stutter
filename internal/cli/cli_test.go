@@ -2,7 +2,9 @@ package cli_test
 
 import (
 	"bytes"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -108,6 +110,58 @@ func TestUsageIsHonestAboutProvisioning(t *testing.T) {
 
 	if got := run(t, "help"); !strings.Contains(got.stdout, "not built yet") {
 		t.Errorf("usage does not disclose that compose provisioning is missing:\n%s", got.stdout)
+	}
+}
+
+// TestRelayIsAHiddenCommand keeps the relay out of the user's view while the binary still runs it: a
+// relay container's entrypoint is this binary, so the command must dispatch, and a user has no use
+// for it, so the usage must not offer it.
+func TestRelayIsAHiddenCommand(t *testing.T) {
+	t.Parallel()
+
+	if help := run(t, "help"); strings.Contains(help.stdout, "relay") {
+		t.Errorf("the usage mentions relay:\n%s", help.stdout)
+	}
+
+	got := run(t, "relay")
+	if got.code != 2 {
+		t.Errorf("relay with no mode: exit = %d, want 2 (stderr: %s)", got.code, got.stderr)
+	}
+
+	if strings.Contains(got.stderr, "unknown command") {
+		t.Errorf("relay was not dispatched: %s", got.stderr)
+	}
+}
+
+// TestAClosedDatabasePortIsASetupError keeps an unreachable database a setup error that names where it
+// was looked for, never a verdict.
+func TestAClosedDatabasePortIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	var config net.ListenConfig
+
+	// Above the kernel's source-port range, so no socket another test opens takes it meanwhile.
+	closed := ""
+
+	for port := 65500; port < 65600 && closed == ""; port++ {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+
+		listener, err := config.Listen(t.Context(), "tcp4", addr)
+		if err == nil {
+			_ = listener.Close()
+			closed = addr
+		}
+	}
+
+	got := run(t, "check", "--postgres", "postgres://u:p@"+closed+"/db")
+
+	if got.code != 3 {
+		t.Errorf("exit = %d, want 3 (stderr: %s)", got.code, got.stderr)
+	}
+
+	// A setup failure is rendered in the report, on stdout, like any other outcome.
+	if !strings.Contains(got.stdout+got.stderr, closed) {
+		t.Errorf("the output does not name %s:\nstdout: %s\nstderr: %s", closed, got.stdout, got.stderr)
 	}
 }
 

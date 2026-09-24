@@ -26,3 +26,29 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
 github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
 github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
+# The invocation listener set and its endpoint keys: opened by the compose path once per check.
+github.com/Wintersta7e/stutter/internal/harness.EndpointKey
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.acceptance
+github.com/Wintersta7e/stutter/internal/harness.ListenerSet.advertised
+github.com/Wintersta7e/stutter/internal/harness.OpenListeners
+github.com/Wintersta7e/stutter/internal/harness.ParseEndpointKey
+github.com/Wintersta7e/stutter/internal/harness.catchAllPort
+github.com/Wintersta7e/stutter/internal/harness.validateBus
+github.com/Wintersta7e/stutter/internal/harness.validateKeys
+github.com/Wintersta7e/stutter/internal/harness.validateListeners
+# The relay token and argv: written by the compose path when it creates the relay containers.
+github.com/Wintersta7e/stutter/internal/relay.NewToken
+github.com/Wintersta7e/stutter/internal/relay.Spec.Args
+github.com/Wintersta7e/stutter/internal/relay.Verify.Args
+# The copy helper's argv: written and read by the compose path's volume restore.
+github.com/Wintersta7e/stutter/internal/relay.Copy.Args
+github.com/Wintersta7e/stutter/internal/relay.ParseCopy
+github.com/Wintersta7e/stutter/internal/relay.parsePath
+# The static-self check: called by the compose path before it creates any resource.
+github.com/Wintersta7e/stutter/internal/relay.Qualify
+github.com/Wintersta7e/stutter/internal/relay.goArch
+github.com/Wintersta7e/stutter/internal/relay.qualifyFor
+# The relay image's layer and configuration: imported by the compose path once per check.
+github.com/Wintersta7e/stutter/internal/relay.ImageChanges
+github.com/Wintersta7e/stutter/internal/relay.Layer
+github.com/Wintersta7e/stutter/internal/relay.writeLayer

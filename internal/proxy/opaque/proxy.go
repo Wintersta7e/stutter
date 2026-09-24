@@ -53,30 +53,38 @@ type Sink interface {
 }
 
 // Proxy accepts connections for one unparsed dependency and forwards them to it.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type Proxy struct {
 	listener net.Listener
 	sink     Sink
-	name     string
-	upstream string
-	dialer   net.Dialer
-	wg       sync.WaitGroup
+	// dialFailed is the first upstream dial that failed. It stops the proxy, and Serve reports it.
+	dialFailed error
+	name       string
+	upstream   string
+	dialer     net.Dialer
+	wg         sync.WaitGroup
+	failOnce   sync.Once
+	failMu     sync.Mutex
 }
 
-// Listen binds a proxy on addr, forwarding to the dependency at upstream.
+// New serves a proxy on a listener the caller supplies, forwarding to the dependency at upstream. The
+// proxy binds no socket of its own: the caller's listener is where connections come from.
 //
 // name is the logical dependency name written into every effect. The listener's port is assigned by
 // the kernel and differs between runs, so the name is what makes two runs comparable.
+func New(listener net.Listener, name, upstream string, sink Sink) (*Proxy, error) {
+	if err := validate(name, upstream, sink); err != nil {
+		return nil, err
+	}
+
+	return &Proxy{listener: listener, name: name, upstream: upstream, sink: sink}, nil
+}
+
+// Listen binds a proxy on addr, forwarding to the dependency at upstream, as New does.
 func Listen(ctx context.Context, addr, name, upstream string, sink Sink) (*Proxy, error) {
-	if sink == nil {
-		return nil, errMissingSink
-	}
-
-	if name == "" {
-		return nil, errMissingName
-	}
-
-	if upstream == "" {
-		return nil, errMissingUpstream
+	if err := validate(name, upstream, sink); err != nil {
+		return nil, err
 	}
 
 	var config net.ListenConfig
@@ -86,7 +94,21 @@ func Listen(ctx context.Context, addr, name, upstream string, sink Sink) (*Proxy
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	return &Proxy{listener: listener, name: name, upstream: upstream, sink: sink}, nil
+	return New(listener, name, upstream, sink)
+}
+
+// validate refuses a proxy that could not attribute or forward anything.
+func validate(name, upstream string, sink Sink) error {
+	switch {
+	case sink == nil:
+		return errMissingSink
+	case name == "":
+		return errMissingName
+	case upstream == "":
+		return errMissingUpstream
+	default:
+		return nil
+	}
 }
 
 // Addr is the address the proxy is listening on.
@@ -94,11 +116,17 @@ func (p *Proxy) Addr() string {
 	return p.listener.Addr().String()
 }
 
-// Serve accepts connections until the proxy is closed.
+// Serve accepts connections until the proxy is closed, or until an upstream dial fails — that failure
+// is what Serve then returns.
 func (p *Proxy) Serve(ctx context.Context) error {
 	for {
 		client, err := p.listener.Accept()
 		if err != nil {
+			// A dial failure outranks the closure it caused.
+			if failure := p.dialFailure(); failure != nil {
+				return failure
+			}
+
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				//nolint:nilerr // a closed listener is how Serve is stopped, not a failure.
 				return nil
@@ -122,11 +150,55 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
+// failDial records the first upstream dial that failed and stops accepting. There is no retry: the
+// dependency's readiness was the caller's to establish, and a run whose dependency the service cannot
+// reach reports a handler that did nothing.
+func (p *Proxy) failDial(err error) {
+	p.failOnce.Do(func() {
+		p.failMu.Lock()
+		p.dialFailed = err
+		p.failMu.Unlock()
+
+		_ = p.listener.Close()
+	})
+}
+
+func (p *Proxy) dialFailure() error {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+
+	return p.dialFailed
+}
+
+// abort closes a client so it reads a reset, never EOF: the upstream could not be reached, and a clean
+// close would tell the client the dependency hung up on it. A relayed connection aborts itself, which
+// carries the reset back through the relay.
+func abort(conn net.Conn) {
+	if aborter, ok := conn.(interface{ Abort() error }); ok {
+		_ = aborter.Abort() //nolint:errcheck // the connection is being refused either way.
+
+		return
+	}
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0) //nolint:errcheck // a failed linger leaves a clean close, still a refusal.
+	}
+
+	_ = conn.Close()
+}
+
 func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	defer func() { _ = client.Close() }()
 
 	upstream, err := p.dialer.DialContext(ctx, "tcp", p.upstream)
 	if err != nil {
+		abort(client)
+
+		// A dial abandoned because the run is over is the run ending, not the dependency failing.
+		if ctx.Err() == nil {
+			p.failDial(fmt.Errorf("dial the upstream %s: %w", p.upstream, err))
+		}
+
 		return
 	}
 

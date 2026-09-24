@@ -106,6 +106,17 @@ linters:
               desc: test-only; it reaches Docker outside the product's one runner.
             - pkg: github.com/Wintersta7e/stutter/internal/testexec
               desc: test-only; it writes scripts a test runs in place of a program.
+        # The relay runs alone in a container holding nothing but the binary, and reaches the product's
+        # proxies only over its own framing. It carries the standard library and the DNS codec, never
+        # a package of the product, so nothing it relays can be observed or rewritten on the way.
+        relay:
+          files:
+            - "**/internal/relay/**"
+            - "!$test"
+          list-mode: strict
+          allow:
+            - $gostd
+            - golang.org/x/net/dns/dnsmessage
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print.*$

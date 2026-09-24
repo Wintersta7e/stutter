@@ -7,8 +7,10 @@
 // $KV.<bucket>.<key> — while omitting HTTP hides API-backed guards and omitting the rest hides a
 // whole datastore. A handler judged on partial evidence gets the right verdict only by luck.
 //
-// Container provisioning does not exist yet, so the service is supplied as a connect function. When
-// a provisioner lands it implements the same shape and nothing above this package changes.
+// A Go caller supplies the service as a function that connects it or starts it. A provisioned
+// container is started the same way, but its connections do not reach proxies of the sandbox's own:
+// they arrive through relays onto a listener set that outlives every sandbox of the check
+// (Config.Listeners), and each run attaches its proxies to that set.
 package harness
 
 import (
@@ -35,6 +37,9 @@ import (
 // once — a service that consumes for itself AND is dispatched to would see every message twice.
 var errNoService = errors.New("exactly one of Connect and Start must be set: " +
 	"Connect dispatches to the service, Start lets it consume for itself")
+
+// errListenersBeside means a sandbox on the invocation listeners was also given an endpoint of its own.
+var errListenersBeside = errors.New("the listener set owns every endpoint of a relayed service")
 
 // defaultHTTPHost is stable across runs while the listener's kernel-assigned port is not. The
 // reserved .invalid suffix makes it impossible to mistake this local stub identity for a real host.
@@ -84,6 +89,10 @@ type Connect func(ctx context.Context, at Addresses) (Service, error)
 type Config struct {
 	// Corpus is the recorded traffic and the bus the service talks to.
 	Corpus *corpus.Corpus
+	// Listeners is the check's invocation listener set, for a service reached through relays. Set, it
+	// is where every endpoint, the HTTP host and the certificate authority come from, so none of
+	// PostgresDSN, Opaque, BindHost, AdvertiseHost, HTTPHost or Connect may be set beside it.
+	Listeners *ListenerSet
 	// Connect builds a service Stutter dispatches to. Exactly one of Connect and Start is set.
 	Connect Connect
 	// Start builds a service that pulls from the bus for itself, as a provisioned container does.
@@ -180,6 +189,10 @@ func New(cfg Config) (*Sandbox, error) {
 		return nil, fmt.Errorf("%w: Drain %s is below the floor of %s", ErrDrainBelowFloor, cfg.Drain, floor)
 	}
 
+	if cfg.Listeners != nil {
+		return onListeners(cfg)
+	}
+
 	var upstream string
 
 	if cfg.PostgresDSN != "" {
@@ -211,6 +224,36 @@ func New(cfg Config) (*Sandbox, error) {
 		httpScript:   httpproxy.NewScript(cfg.HTTPDefault, cfg.HTTPRoutes),
 		certificates: certificates,
 		upstream:     upstream,
+	}, nil
+}
+
+// onListeners builds a sandbox whose endpoints are the invocation listener set's. Its HTTP host and
+// its certificate authority are the set's, so every consumer check presents the service one CA.
+func onListeners(cfg Config) (*Sandbox, error) {
+	beside := map[string]bool{
+		"PostgresDSN":   cfg.PostgresDSN != "",
+		"Opaque":        len(cfg.Opaque) > 0,
+		"BindHost":      cfg.BindHost != "",
+		"AdvertiseHost": cfg.AdvertiseHost != "",
+		"HTTPHost":      cfg.HTTPHost != "",
+		"Connect":       cfg.Connect != nil,
+	}
+
+	for _, field := range slices.Sorted(maps.Keys(beside)) {
+		if beside[field] {
+			return nil, fmt.Errorf("%w: Listeners is set beside %s", errListenersBeside, field)
+		}
+	}
+
+	cfg.HTTPHost = cfg.Listeners.cfg.HTTPHost
+	if cfg.HTTPHost == "" {
+		cfg.HTTPHost = defaultHTTPHost
+	}
+
+	return &Sandbox{
+		cfg:          cfg,
+		httpScript:   httpproxy.NewScript(cfg.HTTPDefault, cfg.HTTPRoutes),
+		certificates: cfg.Listeners.authority,
 	}, nil
 }
 
@@ -339,24 +382,41 @@ func (s *Sandbox) advertise(addr string) string {
 type egress struct {
 	httpRun *httpproxy.Run
 	served  chan error
-	at      Addresses
-	closers []func(context.Context) error
+	// attached is the start's hold on the invocation listeners; nil on the Go-caller path.
+	attached *attachment
+	at       Addresses
+	closers  []entryCloser
 	// taken counts the Serve results a wait took before teardown: the proxies that stopped early.
 	taken int
 }
 
-// start registers a proxy and begins serving it.
+// entryCloser tears down one proxy, under the endpoint key it serves.
+type entryCloser struct {
+	close func(context.Context) error
+	key   string
+}
+
+// start registers a proxy and begins serving it. A Serve that fails is reported under key, the
+// endpoint it stands in front of, so an unreachable dependency is named rather than merely noticed.
 //
 // Registering as each listener opens, rather than after all of them are up, is what lets a failure
 // half way through tear down the ones already running.
 func (e *egress) start(
 	ctx context.Context,
+	key string,
 	closer func(context.Context) error,
 	serve func(context.Context) error,
 ) {
-	e.closers = append(e.closers, closer)
+	e.closers = append(e.closers, entryCloser{close: closer, key: key})
 
-	go func() { e.served <- serve(ctx) }()
+	go func() {
+		err := serve(ctx)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", key, err)
+		}
+
+		e.served <- err
+	}()
 }
 
 // settle tears the proxies down and decides the run's fate.
@@ -383,15 +443,20 @@ func (e *egress) settle(ctx context.Context, runErr error) error {
 }
 
 // close tears the proxies down. A proxy that died mid-run would otherwise present as a handler that
-// simply stopped producing effects, so its error is surfaced rather than discarded.
+// simply stopped producing effects, so its error is surfaced rather than discarded. A start on the
+// invocation listeners detaches from them, within the drain bound.
 //
 // Only the results still to come are drained: one a wait took early already ended that wait, and is
 // the run's error.
 func (e *egress) close(ctx context.Context) error {
 	var err error
 
-	for _, closer := range e.closers {
-		err = errors.Join(err, closer(ctx))
+	if e.attached != nil {
+		err = e.detach(ctx)
+	} else {
+		for _, entry := range e.closers {
+			err = errors.Join(err, entry.close(ctx))
+		}
 	}
 
 	for range len(e.closers) - e.taken {
@@ -404,6 +469,10 @@ func (e *egress) close(ctx context.Context) error {
 // observe puts a proxy in front of each dependency, all recording into the same sink so one
 // ordered effect sequence covers the whole run.
 func (s *Sandbox) observe(ctx context.Context, sink *effect.Recorder, bus natsproxy.Options) (*egress, error) {
+	if s.cfg.Listeners != nil {
+		return s.observeRelayed(ctx, sink, bus)
+	}
+
 	observed := &egress{
 		served: make(chan error, s.proxyCount()),
 		at:     Addresses{Opaque: make(map[string]string, len(s.cfg.Opaque))},
@@ -464,7 +533,7 @@ func (s *Sandbox) observeBus(
 		return fmt.Errorf("listen in front of the bus: %w", err)
 	}
 
-	observed.start(ctx, ignoringContext(bus.Close), bus.Serve)
+	observed.start(ctx, KeyBus, ignoringContext(bus.Close), bus.Serve)
 	observed.at.NATS = "nats://" + s.advertise(bus.Addr())
 
 	return nil
@@ -480,7 +549,7 @@ func (s *Sandbox) observeDatabase(ctx context.Context, sink *effect.Recorder, ob
 		return fmt.Errorf("listen in front of the database: %w", err)
 	}
 
-	observed.start(ctx, ignoringContext(postgres.Close), postgres.Serve)
+	observed.start(ctx, keyDatabase, ignoringContext(postgres.Close), postgres.Serve)
 
 	proxied, err := rewriteHost(s.cfg.PostgresDSN, s.advertise(postgres.Addr()))
 	if err != nil {
@@ -505,7 +574,7 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 		return fmt.Errorf("listen for HTTP egress: %w", err)
 	}
 
-	observed.start(ctx, proxy.CloseContext, proxy.Serve)
+	observed.start(ctx, KeyHTTP, proxy.CloseContext, proxy.Serve)
 
 	if s.certificates == nil {
 		observed.at.HTTP = "http://" + s.advertise(proxy.Addr())
@@ -553,7 +622,7 @@ func (s *Sandbox) observeOpaque(ctx context.Context, sink *effect.Recorder, obse
 			return fmt.Errorf("listen in front of %q: %w", name, err)
 		}
 
-		observed.start(ctx, ignoringContext(proxy.Close), proxy.Serve)
+		observed.start(ctx, name, ignoringContext(proxy.Close), proxy.Serve)
 		observed.at.Opaque[name] = s.advertise(proxy.Addr())
 	}
 
