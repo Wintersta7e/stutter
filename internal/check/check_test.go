@@ -20,6 +20,17 @@ import (
 
 var errSessionBroken = errors.New("the sandbox never came up")
 
+// errDialFailed is an upstream refusing a proxy's dial mid-run: the environment, never the service.
+var errDialFailed = errors.New("dial the upstream: connection refused")
+
+// ending is how a scripted run ended: whether the service exited, how many messages were still owed,
+// and the egress-policy stop that ended it.
+type ending struct {
+	stopped string
+	exit    replay.Exit
+	owed    int
+}
+
 // stockWrite is the canonical form the scripted session's non-idempotent write renders as, named once
 // so a declaration in a test and the effect it is meant to match cannot drift apart.
 const stockWrite = "UPDATE stock"
@@ -35,6 +46,11 @@ type session struct {
 	// refuses are the faults this session cannot express against the service it drives, as a run
 	// watched on the wire cannot express a delay.
 	refuses map[policy.Fault]bool
+	// ends scripts how a run ended, from its name and the messages it kept. Nil ends every run normally.
+	ends func(name string, retain []uint64) ending
+	// failsUnder makes the hunt's runs under this fault fail with an environment error, as a
+	// dependency's dial failing during one faulted run does. Empty never fails.
+	failsUnder policy.Fault
 	// silent are messages the service takes delivery of and does nothing observable with.
 	silent map[uint64]bool
 	// readGuard are messages whose handler looks its claim up before writing, and looks again when the
@@ -78,6 +94,10 @@ func (s *session) Run(
 	if s.refuses[mutation.Fault()] {
 		return replay.Result{}, fmt.Errorf("%w: this session cannot express %s",
 			replay.ErrUnsupported, mutation.Fault())
+	}
+
+	if s.failsUnder != "" && strings.HasPrefix(name, string(s.failsUnder)) {
+		return replay.Result{}, errDialFailed
 	}
 
 	s.names = append(s.names, name)
@@ -130,6 +150,11 @@ func (s *session) Run(
 		}
 	}
 
+	var ended ending
+	if s.ends != nil {
+		ended = s.ends(name, retain)
+	}
+
 	return replay.Result{
 		Effects:         effects,
 		Clause:          "AckPolicy: explicit",
@@ -139,6 +164,9 @@ func (s *session) Run(
 		FedBack:         s.bus.FedBack,
 		Elsewhere:       s.bus.Elsewhere,
 		ClosedAfterInfo: s.bus.ClosedAfterInfo,
+		Exit:            ended.exit,
+		Owed:            ended.owed,
+		Stopped:         ended.stopped,
 	}, nil
 }
 
@@ -767,5 +795,241 @@ func TestCleanRunHealthCarriesTheBusCounts(t *testing.T) {
 	got := []int{health.NoResponders, health.FedBack, health.Elsewhere, health.ClosedAfterInfo}
 	if want := []int{2, 3, 4, 5}; !slices.Equal(got, want) {
 		t.Errorf("NoResponders, FedBack, Elsewhere, ClosedAfterInfo = %v, want %v", got, want)
+	}
+}
+
+// faulted reports whether a pass name is a faulted run's: the hunt's, or a shrink candidate's.
+func faulted(name string) bool {
+	return !strings.HasPrefix(name, "clean") && !strings.HasPrefix(name, "shrink-clean")
+}
+
+// egressStop is an egress-policy stop, as the HTTP stub reports one.
+const egressStop = "a connection to 203.0.113.9:443 sent nothing"
+
+// referenceRun is the name the reference clean run is given: the first pass.
+const referenceRun = "clean-1"
+
+// TestADialFailureUnderAFaultIsASetupError: an upstream that refuses a proxy's dial only during a
+// faulted run is the environment failing, not the service reacting to the fault — the check ends in
+// setup, and no finding is made from a run that could not be observed.
+func TestADialFailureUnderAFaultIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.failsUnder = policy.FaultDuplicate
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitSetupError || len(result.Findings) != 0 {
+		t.Fatalf("ExitCode() = %d with %d findings, want %d and none:\n%s", got, len(result.Findings),
+			report.ExitSetupError, result)
+	}
+
+	if !errors.Is(result.Setup, errDialFailed) {
+		t.Errorf("Setup = %v, want the dial failure", result.Setup)
+	}
+}
+
+// TestAnEgressStopFirstSeenUnderAFaultWarns: a stop that only a faulted run hits may be the fault's
+// consequence, so the comparison and the shrink go ahead — but what the service did after the stop
+// went unobserved, so the finding is held at WARN, carrying the stop.
+func TestAnEgressStopFirstSeenUnderAFaultWarns(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.ends = func(name string, _ []uint64) ending {
+		if faulted(name) {
+			return ending{stopped: egressStop}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(result.Findings) == 0 || result.ExitCode() != report.ExitPass {
+		t.Fatalf("ExitCode() = %d with %d findings, want WARN findings and a pass:\n%s", result.ExitCode(),
+			len(result.Findings), result)
+	}
+
+	for _, finding := range result.Findings {
+		if finding.Status != report.StatusWarn {
+			t.Errorf("%s under %s is %s, want WARN", finding.Consumer, finding.Fault, finding.Status)
+		}
+	}
+
+	if !strings.Contains(result.String(), egressStop) {
+		t.Errorf("the findings do not carry the stop:\n%s", result)
+	}
+}
+
+// TestAnEgressStopInACleanRunIsASetupError: nothing is faulted in a clean run, so a stop there is the
+// environment or the service's plain behaviour, and nothing can be compared against a run cut short.
+func TestAnEgressStopInACleanRunIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.ends = func(name string, _ []uint64) ending {
+		if name == referenceRun {
+			return ending{stopped: egressStop}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitSetupError {
+		t.Fatalf("ExitCode() = %d, want %d:\n%s", got, report.ExitSetupError, result)
+	}
+
+	if !strings.Contains(result.String(), egressStop) {
+		t.Errorf("the setup error does not name the stop:\n%s", result)
+	}
+}
+
+// TestATargetExitInACleanRunIsASetupError: a service that exits during a clean run before every message
+// is done leaves a reference with messages missing, and every comparison against it would be wrong.
+func TestATargetExitInACleanRunIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.ends = func(name string, _ []uint64) ending {
+		if name == referenceRun {
+			return ending{exit: replay.Exit{After: 2, Code: 1, Exited: true}, owed: 1}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitSetupError {
+		t.Fatalf("ExitCode() = %d, want %d:\n%s", got, report.ExitSetupError, result)
+	}
+
+	var exited *replay.ExitError
+	if !errors.As(result.Setup, &exited) || !strings.Contains(result.Setup.Error(), "message #2") {
+		t.Errorf("Setup = %v, want a *replay.ExitError naming message #2", result.Setup)
+	}
+}
+
+// TestAnExitAfterEveryMessageIsDoneIsRecorded: a service that exits once every message is done left a
+// complete clean run, so the exit is recorded beside the verdict and changes nothing else.
+func TestAnExitAfterEveryMessageIsDoneIsRecorded(t *testing.T) {
+	t.Parallel()
+
+	baseline, err := check.Run(t.Context(), newSession(), options(newSession()))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	scripted := newSession()
+	scripted.ends = func(name string, _ []uint64) ending {
+		if name == referenceRun {
+			return ending{exit: replay.Exit{After: 3, Code: 0, Exited: true}}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if result.Health == nil || !result.Health.Exit.Exited || result.Health.Exit.After != 3 {
+		t.Errorf("Health = %+v, want the exit after message 3 recorded", result.Health)
+	}
+
+	if got, want := result.ExitCode(), baseline.ExitCode(); got != want {
+		t.Errorf("ExitCode() = %d, want %d as without the exit", got, want)
+	}
+}
+
+// TestAnExitUnderAFaultIsCarriedByTheFinding: a service that exits under a fault may be showing what
+// the fault does to it, so the run's comparison stands and the finding says how the service ended.
+func TestAnExitUnderAFaultIsCarriedByTheFinding(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.ends = func(name string, _ []uint64) ending {
+		if faulted(name) {
+			return ending{exit: replay.Exit{After: 1, Code: 137, Exited: true, OOMKilled: true}}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(result.Findings) == 0 || result.ExitCode() != report.ExitFail {
+		t.Fatalf("ExitCode() = %d with %d findings, want the comparison to stand:\n%s", result.ExitCode(),
+			len(result.Findings), result)
+	}
+
+	if want := "exited under this fault after message #1: exited with code 137, OOM-killed"; !strings.Contains(
+		result.String(), want) {
+		t.Errorf("the finding does not carry the exit %q:\n%s", want, result)
+	}
+}
+
+// TestAnExitInAShrinkCleanRunDoesNotReproduce: a subset of the corpus may feed the service inputs it
+// cannot handle alone, and a candidate whose clean run the service exits during is simply one that
+// does not reproduce — the shrink goes on and still reaches a minimal repro.
+func TestAnExitInAShrinkCleanRunDoesNotReproduce(t *testing.T) {
+	t.Parallel()
+
+	// Message 3 is the non-idempotent one, so the shrink's first split, {1} and {2, 3}, has to try a
+	// subset holding message 2 before it can reach message 3 alone.
+	scripted := newSession()
+	scripted.nonIdempotent = map[uint64]bool{3: true}
+	exits := 0
+	scripted.ends = func(name string, retain []uint64) ending {
+		subset := len(retain) > 0 && len(retain) < len(scripted.messages)
+		if strings.HasPrefix(name, "shrink-clean") && subset && slices.Contains(retain, 2) {
+			exits++
+
+			return ending{exit: replay.Exit{After: 2, Code: 1, Exited: true}, owed: 1}
+		}
+
+		return ending{}
+	}
+
+	result, err := check.Run(t.Context(), scripted, options(scripted))
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	t.Logf("%d shrink clean runs exited", exits)
+
+	if exits == 0 {
+		t.Fatal("no shrink clean run exited, so the rule was never exercised")
+	}
+
+	if len(result.Findings) == 0 || result.ExitCode() != report.ExitFail {
+		t.Fatalf("ExitCode() = %d with %d findings, want the shrink to go on to a finding:\n%s",
+			result.ExitCode(), len(result.Findings), result)
+	}
+
+	for _, finding := range result.Findings {
+		if finding.Repro != "messages #3" {
+			t.Errorf("%s repro = %q, want the single message #3", finding.Fault, finding.Repro)
+		}
 	}
 }

@@ -226,6 +226,10 @@ func (Concurrent) Fault() policy.Fault { return policy.FaultConcurrent }
 type Result struct {
 	// Clause is the configuration that licensed this run's fault, quoted into any finding.
 	Clause string
+	// Stopped is the egress-policy stop that ended the run, in the stub's own words; empty otherwise.
+	// The harness sets it when the stub stops the run on the service's egress. What the service did
+	// after the stop went unobserved.
+	Stopped string
 	// Effects is the sequence the run produced, in observation order.
 	Effects []effect.Effect
 	// Refusals are the requests the bus declined before the first delivery, with its own code and

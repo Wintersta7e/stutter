@@ -7,6 +7,7 @@
 package check
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,10 @@ import (
 
 // delayMargin is added to a deadline so a delay fault crosses it rather than racing it.
 const delayMargin = 2
+
+// errCleanStopped means an egress-policy stop ended a clean run, where nothing was faulted: nothing
+// can be compared against a run it cut short.
+var errCleanStopped = errors.New("an egress-policy stop ended a clean run")
 
 // faultOrder is the order faults are attempted in, cheapest and most common first.
 //
@@ -142,16 +147,12 @@ type check struct {
 func (c *check) execute(ctx context.Context) (report.Report, error) {
 	scan := report.Scan{Consumers: 1, Messages: len(c.opts.Messages)}
 
-	reference, err := c.pass(ctx, "clean", replay.Clean{}, nil)
+	clean, err := c.cleanPair(ctx)
 	if err != nil {
 		return report.SetupFailed(err), nil
 	}
 
-	repeat, err := c.pass(ctx, "clean", replay.Clean{}, nil)
-	if err != nil {
-		return report.SetupFailed(err), nil
-	}
-
+	reference, repeat := clean[0], clean[1]
 	referenceEffects := effect.Compared(reference.Effects)
 
 	// Observation leads: a reference that saw nothing makes determinism hold over two empty
@@ -162,7 +163,7 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 		{Name: report.GateDeterminism, Result: c.comparer.Compare(referenceEffects, effect.Compared(repeat.Effects))},
 	}
 
-	health := c.health(reference, referenceEffects)
+	health := c.health(reference, repeat, referenceEffects)
 
 	// A violated gate stops the run rather than qualifying it: every comparison past this point
 	// would be noise, and a caveated finding list is worse than none.
@@ -192,9 +193,56 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 	return built, nil
 }
 
+// cleanPair runs the reference and repeat clean runs, refusing either one nothing can be compared
+// against.
+func (c *check) cleanPair(ctx context.Context) ([2]replay.Result, error) {
+	var pair [2]replay.Result
+
+	for at, which := range []string{"reference", "repeat"} {
+		result, err := c.pass(ctx, "clean", replay.Clean{}, nil)
+		if err != nil {
+			return pair, err
+		}
+
+		if err := cleanRunUsable(which, result); err != nil {
+			return pair, err
+		}
+
+		pair[at] = result
+	}
+
+	return pair, nil
+}
+
+// cleanRunUsable refuses a clean run nothing can be compared against: one an egress-policy stop
+// ended, or one the service exited during before every message was done. Nothing was faulted, so
+// neither is a fault's consequence — it is the environment or the service's plain behaviour. An exit
+// after every message was done leaves a complete run, and is only recorded.
+func cleanRunUsable(which string, result replay.Result) error {
+	if result.Stopped != "" {
+		return fmt.Errorf("the %s clean run: %w: %s", which, errCleanStopped, result.Stopped)
+	}
+
+	if result.Exit.Exited && result.Owed > 0 {
+		return fmt.Errorf("the %s clean run: %w", which, &replay.ExitError{Exit: result.Exit})
+	}
+
+	return nil
+}
+
+// exited keeps an exit only when the service stopped by itself.
+func exited(exit replay.Exit) replay.Exit {
+	if exit.Exited {
+		return exit
+	}
+
+	return replay.Exit{}
+}
+
 // health summarises the clean run every mutated run is compared against, from the same
-// rejected-free view the gates compared.
-func (c *check) health(reference replay.Result, compared []effect.Effect) report.Health {
+// rejected-free view the gates compared. The exit it records is either clean run's, when the service
+// exited by itself after every message was done.
+func (c *check) health(reference, repeat replay.Result, compared []effect.Effect) report.Health {
 	acted := make(map[uint64]struct{}, len(c.opts.Messages))
 	for _, item := range compared {
 		acted[item.MessageSeq] = struct{}{}
@@ -221,6 +269,9 @@ func (c *check) health(reference replay.Result, compared []effect.Effect) report
 		FedBack:         reference.FedBack,
 		Elsewhere:       reference.Elsewhere,
 		ClosedAfterInfo: reference.ClosedAfterInfo,
+		Owed:            reference.Owed,
+		Exhausted:       reference.Exhausted,
+		Exit:            cmp.Or(exited(reference.Exit), exited(repeat.Exit)),
 	}
 }
 
@@ -334,6 +385,9 @@ func (c *check) attempt(
 		forMessage(referenceEffects, outcome.Message),
 		forMessage(mutatedEffects, outcome.Message),
 	)
+	// A faulted run that ended on an exit or a stop may be showing the fault's consequence: the
+	// comparison stands, and the finding carries how the run ended.
+	divergence.Stopped, divergence.Exit = mutated.Stopped, exited(mutated.Exit)
 
 	return divergence, true, nil
 }
@@ -446,7 +500,14 @@ func (c *check) describe(
 // Each candidate is compared against a reference replayed over the SAME retained messages. Reusing
 // the full-corpus reference would make every subset look like it reproduces, and the shrink would
 // return a repro that proves nothing.
+//
+// The starting candidate replays the original experiment, so its clean run is judged like the
+// reference. Every later candidate is a subset, which may feed the service inputs it cannot handle on
+// their own: one whose clean run ends on an exit before every message is done, or on a stop, simply
+// does not reproduce, and the shrink goes on.
 func (c *check) shrink(ctx context.Context, mutation replay.Mutation) (string, error) {
+	starting := true
+
 	attempt := func(ctx context.Context, messages []uint64, mutations []replay.Mutation) (bool, error) {
 		if len(messages) == 0 || len(mutations) == 0 {
 			return false, nil
@@ -455,6 +516,17 @@ func (c *check) shrink(ctx context.Context, mutation replay.Mutation) (string, e
 		clean, err := c.pass(ctx, "shrink-clean", replay.Clean{}, messages)
 		if err != nil {
 			return false, err
+		}
+
+		first := starting
+		starting = false
+
+		if unusable := cleanRunUsable("shrink's starting", clean); unusable != nil {
+			if first {
+				return false, unusable
+			}
+
+			return false, nil
 		}
 
 		faulted, err := c.pass(ctx, "shrink-faulted", mutations[0], messages)
