@@ -270,6 +270,10 @@ make ci      # format check, lint, tidy, race tests, vulnerability scan, build
 The replay suite **skips** without `STUTTER_TEST_POSTGRES` and prints the same
 `ok` as a real pass, so set it or you are testing far less than you think.
 
+The test suite also needs a reachable Docker engine: a Docker test **fails**
+without one. `STUTTER_TEST_DOCKER=skip` skips the Docker tests instead, and the
+local gate then says so on its last line.
+
 Linting is `golangci-lint` with every linter enabled by default; each exception
 is justified inline in `.golangci.yml`.
 

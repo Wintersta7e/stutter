@@ -91,6 +91,16 @@ linters:
               desc: Superseded by stdlib errors wrapping; use fmt.Errorf with %w.
             - pkg: io/ioutil
               desc: Deprecated since Go 1.16; use io and os.
+        # The Docker test helpers spawn the docker CLI themselves. The product reaches Docker only
+        # through its own runner, so nothing but a test may import them.
+        test-only:
+          files:
+            - $all
+            - "!$test"
+            - "!**/internal/dockertest/**"
+          deny:
+            - pkg: github.com/Wintersta7e/stutter/internal/dockertest
+              desc: test-only; it reaches Docker outside the product's one runner.
     forbidigo:
       forbid:
         - pattern: ^fmt\.Print.*$
