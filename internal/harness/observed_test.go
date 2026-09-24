@@ -40,9 +40,9 @@ const observedAckWait = 500 * time.Millisecond
 // fetchWait bounds one pull. It is short so the service stops promptly when the run is over, and it
 // is what makes the service send a pull request per message rather than one for the whole run.
 //
-// It is not shorter because a pull's expiry bounds the Fill hold at a tenth of it: at 100 ms every
-// run's hold had 10 ms, against a measured 2.2 to 3.0 ms to publish three messages under the race
-// detector.
+// It is not shorter because a pull's expiry bounds the Fill hold at half of it: at 100 ms every run's
+// hold would have 50 ms, against up to 220 ms measured to publish three messages under the race
+// detector on a loaded machine.
 const fetchWait = 500 * time.Millisecond
 
 // pulling is a service Stutter does not dispatch to. It creates its own JetStream consumer, fetches

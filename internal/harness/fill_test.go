@@ -45,8 +45,9 @@ func orders(prefix string, count, size int) []corpus.Message {
 func TestAFillPastItsHoldBoundStopsTheRun(t *testing.T) {
 	t.Parallel()
 
+	// A 20 ms deadline caps the bound at half of it, 10 ms, well under what 50 MB takes to publish.
 	config := observedConfig()
-	config.AckWait = 300 * time.Millisecond
+	config.AckWait = 20 * time.Millisecond
 
 	built, _ := quirkySandbox(t, config, quirks{pullExpires: 5 * time.Second}, func(settings *harness.Config) {
 		settings.Recorded = orders("ORD-BIG", 50, 1_000_000)
@@ -57,7 +58,7 @@ func TestAFillPastItsHoldBoundStopsTheRun(t *testing.T) {
 		t.Fatalf("Run() error = %v, want ErrHoldExceeded", err)
 	}
 
-	for _, want := range []string{"hold", "30ms"} {
+	for _, want := range []string{"hold", "10ms"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Run() error = %v, want it to name %q", err, want)
 		}

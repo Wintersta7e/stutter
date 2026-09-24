@@ -7,8 +7,9 @@ import (
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 )
 
-// TestTheHoldBoundTakesItsLowestTerm: the hold stays a tenth below the shortest timer that would
-// redeliver or lose a message, and names the one that set it.
+// TestTheHoldBoundTakesItsLowestTerm: the hold is a tenth of the shortest timer that would redeliver
+// or lose a message, raised to the floor a loaded machine's scheduling needs but never past half that
+// timer, and names the timer that set it.
 func TestTheHoldBoundTakesItsLowestTerm(t *testing.T) {
 	t.Parallel()
 
@@ -19,19 +20,19 @@ func TestTheHoldBoundTakesItsLowestTerm(t *testing.T) {
 		deadline time.Duration
 		want     time.Duration
 	}{
-		{name: "a deadline alone", deadline: time.Second, want: 100 * time.Millisecond, term: termDeadline},
+		{name: "a deadline alone", deadline: time.Second, want: 250 * time.Millisecond, term: termDeadline},
 		{
 			name:     "a pull's expiry",
 			deadline: time.Second,
 			pulls:    []natsproxy.Pull{{Expires: 300 * time.Millisecond}},
-			want:     30 * time.Millisecond,
+			want:     150 * time.Millisecond,
 			term:     termExpires,
 		},
 		{
 			name:     "twice a pull's heartbeat",
 			deadline: time.Second,
 			pulls:    []natsproxy.Pull{{Expires: 300 * time.Millisecond, Heartbeat: 50 * time.Millisecond}},
-			want:     10 * time.Millisecond,
+			want:     50 * time.Millisecond,
 			term:     termHeartbeat,
 		},
 		{name: "no deadline and no pull", want: 500 * time.Millisecond, term: termCeiling},
@@ -39,17 +40,18 @@ func TestTheHoldBoundTakesItsLowestTerm(t *testing.T) {
 			name:     "a no-wait pull",
 			deadline: time.Second,
 			pulls:    []natsproxy.Pull{{Expires: 10 * time.Millisecond, NoWait: true}},
-			want:     100 * time.Millisecond,
+			want:     250 * time.Millisecond,
 			term:     termDeadline,
 		},
-		{name: "a push target", deadline: 2 * time.Second, want: 200 * time.Millisecond, term: termDeadline},
+		{name: "a push target", deadline: 2 * time.Second, want: 250 * time.Millisecond, term: termDeadline},
 		{
 			name:     "the shortest of several pulls",
 			deadline: time.Second,
 			pulls:    []natsproxy.Pull{{Expires: 400 * time.Millisecond}, {Expires: 200 * time.Millisecond}},
-			want:     20 * time.Millisecond,
+			want:     100 * time.Millisecond,
 			term:     termExpires,
 		},
+		{name: "a tenth above the floor", deadline: 3 * time.Second, want: 300 * time.Millisecond, term: termDeadline},
 	}
 
 	t.Logf("%d rows", len(rows))

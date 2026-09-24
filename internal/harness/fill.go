@@ -11,7 +11,8 @@ import (
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 )
 
-// The Fill hold's bound, B = min(Deadline(1), E, holdCeiling) / holdDivisor.
+// The Fill hold's bound, B = max(T / holdDivisor, min(holdFloor, T / holdFloorShare)), where
+// T = min(Deadline(1), E, holdCeiling).
 //
 // Every harm measured from holding deliveries appears at one times its timer or more: a hold past the
 // first-attempt deadline had the bus redeliver a clean-run message, one past a pull's life lost a
@@ -19,6 +20,14 @@ import (
 const (
 	// holdDivisor is how far below the shortest timer the hold must stay.
 	holdDivisor = 10
+	// holdFloor is what a tenth is raised to, because a busy machine's scheduling delay does not shrink
+	// with the timer. Measured under the race detector at load 38 on 24 CPUs, publishing one to three
+	// messages took up to 220 ms (p99 100 ms), where 11 ms was the unloaded worst; a 50 ms bound stopped
+	// correct runs, and holds up to 220 ms against a 500 ms deadline changed no clean run.
+	holdFloor = 250 * time.Millisecond
+	// holdFloorShare keeps the floor at no more than half the shortest timer: the earliest harm measured
+	// came at three quarters of one, a pull lost to a 150 ms hold against twice a 100 ms heartbeat.
+	holdFloorShare = 2
 	// holdCeiling is nats.go's default JetStream API timeout: the shortest default client timer that
 	// crosses a hold and never appears on the wire.
 	holdCeiling = 5 * time.Second
@@ -178,7 +187,7 @@ func (p *pullLimit) lower(pull natsproxy.Pull) bool {
 }
 
 // holdBound is B and the term that set it: the least of the first-attempt deadline, the pulls' limit
-// and the ceiling, each counted only when set, divided by holdDivisor.
+// and the ceiling, each counted only when set, divided by holdDivisor and raised to the floor.
 func holdBound(deadline time.Duration, pulls pullLimit) (time.Duration, string) {
 	limit, term := holdCeiling, termCeiling
 
@@ -190,7 +199,7 @@ func holdBound(deadline time.Duration, pulls pullLimit) (time.Duration, string) 
 		limit, term = pulls.limit, pulls.term
 	}
 
-	return limit / holdDivisor, term
+	return max(limit/holdDivisor, min(holdFloor, limit/holdFloorShare)), term
 }
 
 // fillHold is one run's hold: the gate the proxy waits at, and the clock that stops the run if the
