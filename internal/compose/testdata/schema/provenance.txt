@@ -1,0 +1,18 @@
+Compose file JSON schemas, one per supported compose release: the oldest (the floor) and the newest.
+Each is the schema of the compose-go module version that release's go.mod pins, fetched unmodified.
+
+compose-2.29.7.json
+  compose release: v2.29.7
+  go.mod line:     github.com/compose-spec/compose-go/v2 v2.2.0
+  source:          https://raw.githubusercontent.com/compose-spec/compose-go/v2.2.0/schema/compose-spec.json
+  sha256:          8535b9c0af36065c6200c230adc8e6301a6afe7a72dd5004464346625bc928c1
+  fetched:         2026-09-24
+
+compose-5.5.1.json
+  compose release: v5.5.1 (the latest release when fetched)
+  go.mod line:     github.com/compose-spec/compose-go/v2 v2.15.0
+  source:          https://raw.githubusercontent.com/compose-spec/compose-go/v2.15.0/schema/compose-spec.json
+  sha256:          dc7fac51b105fdf340fcf9e356d92bd3d0e61a1d3635ebe15026d58febc96987
+  fetched:         2026-09-24
+
+The go.mod lines were read from https://raw.githubusercontent.com/docker/compose/<release>/go.mod.

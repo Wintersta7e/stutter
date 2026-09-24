@@ -11,6 +11,8 @@ package compose
 import (
 	"context"
 	"io/fs"
+
+	"github.com/Wintersta7e/stutter/internal/proxy/pg"
 )
 
 // ConfigRead selects which of the three `docker compose … config` reads a ConfigFunc performs.
@@ -444,6 +446,8 @@ type Endpoint struct {
 
 // Dependency is one compose service other than the target, classified.
 type Dependency struct {
+	// Answers are the handshake answers its opaque ports gave, by container port.
+	Answers map[uint16]pg.Answer
 	// Service is the compose service name.
 	Service string
 	// Lineage names the image evidence that classified it, if any.

@@ -78,13 +78,22 @@ type Refusal struct {
 	Class Class
 }
 
-// Error names the service, the key path and the class — never a value.
+// Error names the service, the key path — for K10, the host path — and the class; never a value.
 func (r *Refusal) Error() string {
-	if r.Service == "" {
-		return fmt.Sprintf("compose top-level key %s is refused (%s)", r.Key, r.Class)
+	what := "key"
+	if r.Class == K10 {
+		what = "bind source"
 	}
 
-	return fmt.Sprintf("compose service %s: key %s is refused (%s)", r.Service, r.Key, r.Class)
+	if r.Service == "" {
+		if r.Class != K10 {
+			what = "top-level key"
+		}
+
+		return fmt.Sprintf("compose %s %s is refused (%s)", what, r.Key, r.Class)
+	}
+
+	return fmt.Sprintf("compose service %s: %s %s is refused (%s)", r.Service, what, r.Key, r.Class)
 }
 
 // Unwrap returns ErrRefused.
