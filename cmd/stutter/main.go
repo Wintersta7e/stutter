@@ -27,7 +27,13 @@ func interruptible(command func(context.Context) int) int {
 	defer cancel()
 
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+
+	// A hangup ignored at startup, as nohup leaves it, stays ignored: registering it would undo
+	// that, and a closed terminal would cancel a check the user asked to outlive it.
+	if !signal.Ignored(syscall.SIGHUP) {
+		signal.Notify(signals, syscall.SIGHUP)
+	}
 
 	go func() {
 		select {
