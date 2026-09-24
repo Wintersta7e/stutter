@@ -12,7 +12,7 @@ import (
 func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 	t.Parallel()
 
-	for _, release := range []string{"2.29.7", "5.5.1"} {
+	for _, release := range releases {
 		model := modelFrom(t, string(golden(t, release)))
 
 		cases := []struct {
@@ -25,9 +25,13 @@ func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 				Interval: 5 * time.Second, Timeout: 3 * time.Second, Retries: 4,
 				StartPeriod: 10 * time.Second, StartInterval: time.Second,
 			}},
-			{service: "cache", set: true, want: compose.Healthcheck{Test: []string{"CMD-SHELL", "redis-cli ping"}}},
-			{service: "worker", set: true, want: compose.Healthcheck{Disabled: true}},
-			{service: "migrate", set: true, want: compose.Healthcheck{Test: []string{"NONE"}, Disabled: true}},
+			{
+				service: cacheService,
+				set:     true,
+				want:    compose.Healthcheck{Test: []string{"CMD-SHELL", "redis-cli ping"}},
+			},
+			{service: workerService, set: true, want: compose.Healthcheck{Disabled: true}},
+			{service: jobService, set: true, want: compose.Healthcheck{Test: []string{"NONE"}, Disabled: true}},
 			{service: toolsService},
 			{service: target},
 		}
@@ -46,7 +50,7 @@ func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 			}
 		}
 
-		if _, _, err := model.Healthcheck("ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		if _, _, err := model.Healthcheck(absentService); err == nil || !strings.Contains(err.Error(), absentService) {
 			t.Errorf("compose %s: Healthcheck(ghost) = %v, want an error naming the service", release, err)
 		}
 	}
@@ -67,7 +71,7 @@ func TestAnUnparseableHealthcheckTimingIsNamed(t *testing.T) {
 func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 	t.Parallel()
 
-	for _, release := range []string{"2.29.7", "5.5.1"} {
+	for _, release := range releases {
 		model := modelFrom(t, string(golden(t, release)))
 
 		cases := []struct {
@@ -77,8 +81,8 @@ func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 			{service: "db", want: compose.Stop{
 				Signal: "SIGINT", Grace: 90 * time.Second, SignalSet: true, GraceSet: true,
 			}},
-			{service: "cache", want: compose.Stop{Signal: "SIGTERM", SignalSet: true}},
-			{service: "worker"},
+			{service: cacheService, want: compose.Stop{Signal: "SIGTERM", SignalSet: true}},
+			{service: workerService},
 		}
 
 		for _, tc := range cases {
@@ -88,7 +92,7 @@ func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 			}
 		}
 
-		if _, err := model.Stop("ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		if _, err := model.Stop(absentService); err == nil || !strings.Contains(err.Error(), absentService) {
 			t.Errorf("compose %s: Stop(ghost) = %v, want an error naming the service", release, err)
 		}
 	}

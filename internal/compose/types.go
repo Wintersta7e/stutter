@@ -97,7 +97,7 @@ type Mount struct {
 	Volume string
 	// Size is a tmpfs size in bytes; zero is unset.
 	Size int64
-	// Mode is a tmpfs mode; zero is unset.
+	// Mode is a tmpfs mode as compose wrote it, sticky bit included as the octal 01000; zero is unset.
 	Mode fs.FileMode
 	// ReadOnly mounts it read-only. Every bind is read-only.
 	ReadOnly bool
@@ -496,6 +496,8 @@ type Classification struct {
 	// DependencyNames maps each started dependency to the names jobs and other dependencies dial it
 	// by.
 	DependencyNames map[string][]string
+	// target is the service under test, which Started includes.
+	target string
 	// Deps are every service other than the target, by service name.
 	Deps []Dependency
 	// SelfAliases are the names the target answers to itself.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -58,6 +60,8 @@ const (
 	// drainPoll is how often an observed run checks whether the bus has gone quiet. Well below any
 	// redelivery deadline a consumer would be configured with, so it costs the run no accuracy.
 	drainPoll = 25 * time.Millisecond
+	// ownCheckpoint names the sandbox's own bus checkpoint, beside the store.
+	ownCheckpoint = "observed"
 )
 
 // Consumer is a service that pulls from the bus for itself.
@@ -75,10 +79,10 @@ type Start func(ctx context.Context, at Addresses) (Consumer, error)
 
 // runObserved replays the corpus into a service Stutter does not dispatch to.
 //
-// The shape is the driven run's, with three substitutions: the stream is rebuilt to scope the run
-// because the service cannot be told to skip a message, the fault is injected by swallowing
-// acknowledgements on the wire, and the run ends when the bus goes quiet rather than when the driver
-// stops delivering.
+// The shape is the driven run's, with three substitutions: the bus is restored to its starting point
+// and only the run's messages are published, because the service cannot be told to skip a message;
+// the fault is injected by swallowing acknowledgements on the wire; and the run ends when the bus goes
+// quiet rather than when the driver stops delivering.
 func (s *Sandbox) runObserved(
 	ctx context.Context,
 	name string,
@@ -101,9 +105,9 @@ func (s *Sandbox) runObserved(
 	}
 
 	recorder := effect.NewRecorder(effect.NewCanonicaliser(), s.cfg.HashKey)
-	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, corpus.Numbering(messages), s.quiesce())
+	run := newObservedRun(name, s.cfg.Corpus.Topic().Stream, wire, recorder, s.quiesce())
 
-	observed, err := s.observe(ctx, recorder, natsproxy.Options{Acks: run, Deliveries: run})
+	observed, err := s.observe(ctx, recorder, run.options())
 	if err != nil {
 		return replay.Result{}, err
 	}
@@ -135,29 +139,82 @@ func (s *Sandbox) runObserved(
 	return run.result(verdict.Clause)
 }
 
-// prepare returns the part of the corpus this run replays, and clears the stream to receive it.
+// prepare returns the part of the corpus this run replays, and restores the whole bus to its starting
+// point to receive it.
 //
-// Cleared rather than staged outright: the service starts against a stream holding nothing, and the
-// corpus arrives only once it has finished starting. Clearing is also the bus-side reset, since it
-// takes the previous run's consumers with the stream.
+// The restore is the bus-side reset: whatever the previous run's service created — buckets, streams,
+// consumers, pauses — is gone, and a key a job seeded reads at the job's revision again. Nothing is
+// published yet: the service starts against the starting point, and the corpus arrives only once it
+// has finished starting.
 //
-// The corpus is snapshotted once, before the first run reduces it. Sandbox runs are serial — a check
-// compares one run against the next — so the snapshot needs no guard of its own.
+// The corpus is taken once, before the first run: from Recorded, or else read out of the stream. Sandbox
+// runs are serial — a check compares one run against the next — so neither needs a guard of its own.
 func (s *Sandbox) prepare(ctx context.Context, retain []uint64) ([]corpus.Message, error) {
 	if s.recorded == nil {
-		snapshot, err := s.cfg.Corpus.Snapshot(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("read the corpus: %w", err)
+		if err := s.load(ctx); err != nil {
+			return nil, err
 		}
-
-		s.recorded = snapshot
 	}
 
-	if err := s.cfg.Corpus.Clear(ctx); err != nil {
-		return nil, fmt.Errorf("clear the corpus: %w", err)
+	baseline, err := s.startingPoint(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := s.cfg.Corpus.Restore(ctx, baseline); err != nil {
+		return nil, fmt.Errorf("restore the bus: %w", err)
 	}
 
 	return scope(s.recorded, retain), nil
+}
+
+// load takes the corpus the runs replay: Recorded when it is set, else the stream's contents.
+func (s *Sandbox) load(ctx context.Context) error {
+	if s.cfg.Recorded != nil {
+		s.recorded = s.cfg.Recorded
+
+		return nil
+	}
+
+	snapshot, err := s.cfg.Corpus.Snapshot(ctx)
+	if err != nil {
+		return fmt.Errorf("read the corpus: %w", err)
+	}
+
+	// Never nil once taken, so an empty stream is not read again after a run has written to it.
+	s.recorded = append([]corpus.Message{}, snapshot...)
+
+	return nil
+}
+
+// startingPoint is the checkpoint every observed run restores: Baseline, or the sandbox's own.
+//
+// The sandbox's own is taken once, at the first observed run: the corpus stream cleared — its
+// messages are already in hand — and the whole bus copied beside the store, never inside the store a
+// restore replaces.
+func (s *Sandbox) startingPoint(ctx context.Context) (corpus.Checkpoint, error) {
+	if s.cfg.Baseline != nil {
+		return *s.cfg.Baseline, nil
+	}
+
+	if s.checkpoint != nil {
+		return *s.checkpoint, nil
+	}
+
+	if err := s.cfg.Corpus.Clear(ctx); err != nil {
+		return corpus.Checkpoint{}, fmt.Errorf("clear the corpus: %w", err)
+	}
+
+	dir := filepath.Join(filepath.Dir(s.cfg.Corpus.StoreDir()), ownCheckpoint)
+
+	taken, err := s.cfg.Corpus.Checkpoint(ctx, dir)
+	if err != nil {
+		return corpus.Checkpoint{}, fmt.Errorf("checkpoint the bus: %w", err)
+	}
+
+	s.checkpoint = &taken
+
+	return taken, nil
 }
 
 // begin publishes the corpus once the service has finished starting, with every consumer but the one
@@ -206,11 +263,7 @@ func (s *Sandbox) begin(
 
 	run.scope(target, s.startupLimit())
 
-	if err := s.cfg.Corpus.Fill(ctx, messages); err != nil {
-		return fmt.Errorf("stage the corpus: %w", err)
-	}
-
-	return nil
+	return s.fill(ctx, run, target, messages)
 }
 
 // awaitStartup waits for the service to create a consumer on the corpus stream — the named one, when
@@ -368,9 +421,13 @@ type observedRun struct {
 	policy   *replay.WirePolicy
 	windows  *windows
 	recorder *effect.Recorder
-	// recorded translates a sequence the rebuilt stream is using back to the one the message was
-	// recorded under.
-	recorded map[uint64]uint64
+	// staged is the set of subjects this run publishes. Installed by stage.
+	staged atomic.Pointer[map[string]struct{}]
+	// core counts, by subject, staged messages handed to a core subscription.
+	core map[string]int
+	// recorded translates a sequence the stream is using back to the one the message was recorded
+	// under. Installed by stage before the corpus is published, and read from the proxy's goroutines.
+	recorded atomic.Pointer[map[uint64]uint64]
 	// began anchors activity to the monotonic clock. A wall-clock timestamp will not do: measured on
 	// WSL2, the wall clock steps forward by one to two seconds every thirty, and a step inside the drain
 	// period ends the run before a withheld acknowledgement's redelivery arrives — a clean sequence
@@ -387,6 +444,8 @@ type observedRun struct {
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
 	stream string
+	// hold keeps deliveries waiting while the corpus is published, and times itself.
+	hold fillHold
 	// startup is the limit the service had to create its consumer by, which a consumer that turns up
 	// later is told it missed.
 	startup time.Duration
@@ -396,6 +455,9 @@ type observedRun struct {
 	failed    atomic.Int64
 	// foreign counts deliveries to a consumer that is not under test.
 	foreign atomic.Int64
+	// elsewhere counts deliveries on another stream while a window was open.
+	elsewhere atomic.Int64
+	coreMu    sync.Mutex
 }
 
 func newObservedRun(
@@ -403,19 +465,12 @@ func newObservedRun(
 	stream string,
 	wire *replay.WirePolicy,
 	recorder *effect.Recorder,
-	staged []corpus.Staged,
 	quiesce time.Duration,
 ) *observedRun {
-	recorded := make(map[uint64]uint64, len(staged))
-	for _, message := range staged {
-		recorded[message.Sequence] = message.Recorded
-	}
-
 	run := &observedRun{
 		policy:   wire,
 		windows:  &windows{recorder: recorder, consumer: consumer, quiesce: quiesce},
 		recorder: recorder,
-		recorded: recorded,
 		began:    time.Now(),
 		stream:   stream,
 	}
@@ -432,6 +487,11 @@ func newObservedRun(
 // this run's business.
 func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	if delivery.Ack.Stream != r.stream {
+		// Neither paused nor checked, but how much of it happened inside the run's windows is noted.
+		if r.windows.opened() {
+			r.elsewhere.Add(1)
+		}
+
 		return
 	}
 
@@ -452,6 +512,39 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	}
 
 	r.windows.open(seq, delivery.Payload)
+}
+
+// CoreDelivered counts a staged message handed to a core subscription. The subscriber receives the
+// corpus beside the consumer under test, and whatever it does lands in the consumer's windows with no
+// way to tell the two apart.
+func (r *observedRun) CoreDelivered(subject string) {
+	staged := r.staged.Load()
+	if staged == nil {
+		return
+	}
+
+	if _, isStaged := (*staged)[subject]; !isStaged {
+		return
+	}
+
+	r.coreMu.Lock()
+	defer r.coreMu.Unlock()
+
+	if r.core == nil {
+		r.core = make(map[string]int)
+	}
+
+	r.core[subject]++
+}
+
+// Pulled takes a pull request on the run's stream into account for the Fill hold's bound. A pull on
+// any other stream is the service's own bus work.
+func (r *observedRun) Pulled(pull natsproxy.Pull) {
+	if pull.Stream != r.stream {
+		return
+	}
+
+	r.hold.pulled(pull)
 }
 
 // Withhold decides the fate of one acknowledgement and closes the window of the message it settles.
@@ -489,6 +582,29 @@ func (r *observedRun) Withhold(ack natsproxy.Ack) bool {
 	r.windows.settle(seq)
 
 	return withheld
+}
+
+// options are the hooks the run is watched, faulted and held through on the bus.
+func (r *observedRun) options() natsproxy.Options {
+	return natsproxy.Options{Acks: r, Deliveries: r, Pulls: r, Hold: &r.hold.gate}
+}
+
+// stage installs the translation from the sequences this run's corpus lands at to the ones its
+// messages were recorded under. It runs before the first publish, because the proxy may report a
+// delivery before Fill has heard back where it landed.
+func (r *observedRun) stage(messages []corpus.Message, first uint64) {
+	recorded := make(map[uint64]uint64, len(messages))
+	for _, message := range corpus.Numbering(messages, first) {
+		recorded[message.Sequence] = message.Recorded
+	}
+
+	subjects := make(map[string]struct{}, len(messages))
+	for _, message := range messages {
+		subjects[message.Subject] = struct{}{}
+	}
+
+	r.recorded.Store(&recorded)
+	r.staged.Store(&subjects)
 }
 
 // awaitQuiet blocks until the bus has handed nothing over and settled nothing for the drain period.
@@ -553,6 +669,25 @@ func (r *observedRun) unscoped() error {
 		"most likely one created after the service had finished starting", errUnscoped, count)
 }
 
+// coreSubscribed fails a run in which a core subscription was handed staged messages, naming each
+// subject and how many.
+func (r *observedRun) coreSubscribed() error {
+	r.coreMu.Lock()
+	defer r.coreMu.Unlock()
+
+	if len(r.core) == 0 {
+		return nil
+	}
+
+	counts := make([]string, 0, len(r.core))
+	for _, subject := range slices.Sorted(maps.Keys(r.core)) {
+		counts = append(counts, fmt.Sprintf("%s (%d)", subject, r.core[subject]))
+	}
+
+	return fmt.Errorf("%w: a core subscription was handed staged messages on %s, "+
+		"and its work cannot be told apart from the consumer's", errUnscoped, strings.Join(counts, ", "))
+}
+
 // strangerNames lists the consumers that took deliveries without being under test, in name order.
 func (r *observedRun) strangerNames() string {
 	var names []string
@@ -580,6 +715,10 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		return replay.Result{}, err
 	}
 
+	if err := r.coreSubscribed(); err != nil {
+		return replay.Result{}, err
+	}
+
 	effects := r.recorder.Effects()
 	unstaged := r.unstagedSequences()
 
@@ -589,13 +728,17 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 	}
 
 	return replay.Result{
-		Clause:    clause,
-		Effects:   effects,
-		Delivered: int(r.delivered.Load()),
-		Failed:    int(r.failed.Load()),
-		Late:      r.recorder.LateCount(),
-		Setup:     r.recorder.SetupCount(),
-		FedBack:   len(unstaged),
+		Clause:          clause,
+		Effects:         effects,
+		Delivered:       int(r.delivered.Load()),
+		Failed:          int(r.failed.Load()),
+		Late:            r.recorder.LateCount(),
+		Setup:           r.recorder.SetupCount(),
+		FedBack:         len(unstaged),
+		Elsewhere:       int(r.elsewhere.Load()),
+		Refusals:        r.recorder.Refusals(),
+		NoResponders:    r.recorder.NoResponders(),
+		ClosedAfterInfo: r.recorder.ClosedAfterInfoCount(),
 	}, nil
 }
 
@@ -637,12 +780,18 @@ func forMessage(effects []effect.Effect, message uint64) []effect.Effect {
 // sequence translates a stream sequence the bus is using into the one the message was recorded
 // under, or fedBack for a message Stutter did not stage.
 //
-// Staging renumbers the stream from one, so without the translation a fault aimed at a recorded
-// sequence would land on a different message, and every effect would be attributed to one. A
-// sequence staging never used is the service's own output fed back, and passing it off as recorded
-// would attribute that output to a corpus message — or aim that message's fault at it.
+// Staging lands the corpus wherever the stream is up to, so without the translation a fault aimed at
+// a recorded sequence would land on a different message, and every effect would be attributed to
+// one. A sequence staging never used is the service's own output fed back, or a message already in
+// the stream, and passing it off as recorded would attribute it to a corpus message — or aim that
+// message's fault at it.
 func (r *observedRun) sequence(staged uint64) uint64 {
-	if recorded, known := r.recorded[staged]; known {
+	translation := r.recorded.Load()
+	if translation == nil {
+		return fedBack
+	}
+
+	if recorded, known := (*translation)[staged]; known {
 		return recorded
 	}
 
@@ -736,6 +885,14 @@ func (w *windows) finish() {
 		w.active = false
 		w.recorder.Close()
 	}
+}
+
+// opened reports whether a message's window is open.
+func (w *windows) opened() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.active
 }
 
 // stop disarms a pending close. The caller holds the lock.

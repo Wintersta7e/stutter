@@ -20,6 +20,15 @@ const (
 	VerdictConditional
 )
 
+// Compose keys named in more than one table.
+const (
+	keyDeploy      = "deploy"
+	keyDevices     = "devices"
+	keyModels      = "models"
+	keyNetworks    = "networks"
+	keyNetworkMode = "network_mode"
+)
+
 // keyRule is one row of the verdict table. A path is dotted; list elements share their parent's
 // path, and `*` stands for a user-named map key. A subtree rule classifies every path beneath it.
 type keyRule struct {
@@ -125,7 +134,7 @@ var serviceKeys = []keyRule{
 	{path: "deploy.restart_policy", verdict: VerdictReplace, subtree: true},
 	{path: "healthcheck", verdict: VerdictReplace, subtree: true},
 	{path: "logging", verdict: VerdictReplace, subtree: true},
-	{path: "networks", verdict: VerdictReplace},
+	{path: keyNetworks, verdict: VerdictReplace},
 	{path: "networks.*", verdict: VerdictReplace},
 	{path: "networks.*.aliases", verdict: VerdictModel},
 	{path: "networks.*.ipv4_address", verdict: VerdictReplace},
@@ -136,7 +145,7 @@ var serviceKeys = []keyRule{
 	{path: "networks.*.priority", verdict: VerdictReplace},
 	{path: "networks.*.gw_priority", verdict: VerdictReplace},
 	{path: "networks.*.interface_name", verdict: VerdictReplace},
-	{path: "network_mode", verdict: VerdictConditional, class: K3},
+	{path: keyNetworkMode, verdict: VerdictConditional, class: K3},
 	{path: "dns", verdict: VerdictReplace},
 	{path: "dns_search", verdict: VerdictReplace},
 	{path: "dns_opt", verdict: VerdictReplace},
@@ -147,7 +156,7 @@ var serviceKeys = []keyRule{
 	{path: "stop_signal", verdict: VerdictReplace},
 	{path: "stop_grace_period", verdict: VerdictReplace},
 	// Refused whatever the value.
-	{path: "devices", verdict: VerdictRefuse, class: K5, subtree: true},
+	{path: keyDevices, verdict: VerdictRefuse, class: K5, subtree: true},
 	{path: "device_cgroup_rules", verdict: VerdictRefuse, class: K5},
 	{path: "gpus", verdict: VerdictRefuse, class: K5, subtree: true},
 	{path: "deploy.resources.reservations.devices", verdict: VerdictRefuse, class: K5, subtree: true},
@@ -157,7 +166,7 @@ var serviceKeys = []keyRule{
 	{path: "credential_spec", verdict: VerdictRefuse, class: K6, subtree: true},
 	{path: "volumes_from", verdict: VerdictRefuse, class: K7},
 	{path: "provider", verdict: VerdictRefuse, class: K7, subtree: true},
-	{path: "models", verdict: VerdictRefuse, class: K7, subtree: true},
+	{path: keyModels, verdict: VerdictRefuse, class: K7, subtree: true},
 	{path: "pre_start", verdict: VerdictRefuse, class: K8, subtree: true},
 	{path: "post_start", verdict: VerdictRefuse, class: K8, subtree: true},
 	{path: "pre_stop", verdict: VerdictRefuse, class: K8, subtree: true},

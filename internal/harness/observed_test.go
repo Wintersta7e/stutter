@@ -5,10 +5,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,7 +39,11 @@ const observedAckWait = 500 * time.Millisecond
 
 // fetchWait bounds one pull. It is short so the service stops promptly when the run is over, and it
 // is what makes the service send a pull request per message rather than one for the whole run.
-const fetchWait = 100 * time.Millisecond
+//
+// It is not shorter because a pull's expiry bounds the Fill hold at a tenth of it: at 100 ms every
+// run's hold had 10 ms, against a measured 2.2 to 3.0 ms to publish three messages under the race
+// detector.
+const fetchWait = 500 * time.Millisecond
 
 // pulling is a service Stutter does not dispatch to. It creates its own JetStream consumer, fetches
 // its own messages and acknowledges them on its own connection — the shape a provisioned container
@@ -49,13 +56,28 @@ type pulling struct {
 	consumer   jetstream.Consumer
 	dependency net.Conn
 	replies    *bufio.Reader
-	done       chan struct{}
-	stopped    chan struct{}
-	quirks     quirks
+	// seeded is the job-seeded bucket the handler writes to, under the seededKey quirk.
+	seeded jetstream.KeyValue
+	// stream is the service's JetStream context, and side its consumer on its own stream.
+	stream jetstream.JetStream
+	side   jetstream.Consumer
+	// keys are the idempotency keys the handler has seen, under the headerGuard quirk.
+	keys    map[string]bool
+	done    chan struct{}
+	stopped chan struct{}
+	quirks  quirks
 }
 
 // quirks are the ways a pulling service departs from the plain one, each for the test that needs it.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type quirks struct {
+	// seen is where a starting service notes what it found. Shared by every run of a sandbox.
+	seen *startups
+	// filter is the one subject the service's consumer admits. Empty admits the whole stream.
+	filter string
+	// stream is the stream the service consumes from. Empty is the corpus stream's default name.
+	stream string
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
 	// Zero never does.
 	nakFor time.Duration
@@ -70,6 +92,113 @@ type quirks struct {
 	echo bool
 	// echoWrites makes the service write to its dependency while handling its own note, too.
 	echoWrites bool
+	// tlsFirst makes the service also open a raw connection to the bus and start a TLS handshake on
+	// it, as a client configured for TLS does.
+	tlsFirst bool
+	// bucket makes the service look its own key/value bucket up at startup, noting whether it found
+	// one, and then create it and write to it.
+	bucket bool
+	// seededKey makes the service read a job-seeded key at startup, noting its revision, and makes
+	// the handler write that key.
+	seededKey bool
+	// audit makes the handler publish a note of every delivery into the stream it consumes, on a
+	// subject its own filter does not admit.
+	audit bool
+	// pullExpires is how long each pull lives. Zero is fetchWait.
+	pullExpires time.Duration
+	// coreSubscribe makes the service also subscribe to the order subject with a core subscription,
+	// beside its consumer.
+	coreSubscribe bool
+	// sideStream makes the service keep a stream of its own, and for every order publish a note into
+	// it and fetch one message from it while handling the order.
+	sideStream bool
+	// ephemeral makes the service create its consumer with no name, so the client names it afresh on
+	// every start.
+	ephemeral bool
+	// conflictingStream makes the service try, at startup, to create the corpus stream over other
+	// subjects — which the bus refuses — and carry on.
+	conflictingStream bool
+	// headerGuard makes the handler skip a message whose Idempotency-Key header it has already seen.
+	// A message without the header is never skipped.
+	headerGuard bool
+}
+
+// idempotencyKey is the header a header-keyed dedupe guard reads.
+const idempotencyKey = "Idempotency-Key"
+
+// The service's own stream, under the sideStream quirk.
+const (
+	sideStream   = "SIDE"
+	sideConsumer = "side"
+	sideSubject  = "side.note"
+)
+
+// auditSubject is where an auditing service notes each delivery: inside the stream it consumes, and
+// outside its own filter, so the note takes a stream sequence without ever being delivered to it.
+const auditSubject = corpus.SubjectPrefix + "order.audited"
+
+// Buckets a quirky service keeps state in.
+const (
+	// serviceBucket is the bucket the service creates for itself at startup.
+	serviceBucket = "svc-state"
+	// seededBucket and seededKey are what a job writes before the service ever starts.
+	seededBucket = "seeded"
+	seededKey    = "k"
+)
+
+// startups records what a service found each time it started, across the runs of one sandbox.
+type startups struct {
+	found     []bool
+	revisions []uint64
+	consumers []string
+	mu        sync.Mutex
+}
+
+// consumer notes the name a starting service's consumer was given.
+func (s *startups) consumer(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.consumers = append(s.consumers, name)
+}
+
+// consumerNames reports every start's consumer name, in order.
+func (s *startups) consumerNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.consumers)
+}
+
+// bucketFound notes whether a starting service found its own bucket already there.
+func (s *startups) bucketFound(found bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.found = append(s.found, found)
+}
+
+// revision notes the revision a starting service read the seeded key at.
+func (s *startups) revision(revision uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.revisions = append(s.revisions, revision)
+}
+
+// buckets and seededRevisions report what every start found, in order.
+func (s *startups) buckets() []bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.found)
+}
+
+func (s *startups) seededRevisions() []uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.revisions)
 }
 
 // echoSubject is where an echoing service notes each order: inside the corpus subjects, so its own
@@ -155,8 +284,23 @@ func startPulling(
 		return nil, fmt.Errorf("open jetstream: %w", err)
 	}
 
-	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
-		Name:          observedConsumer,
+	if startupErr := service.startup(ctx, stream); startupErr != nil {
+		return nil, startupErr
+	}
+
+	name := observedConsumer
+	if behaviour.ephemeral {
+		name = ""
+	}
+
+	consumes := corpus.StreamName
+	if behaviour.stream != "" {
+		consumes = behaviour.stream
+	}
+
+	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, consumes, jetstream.ConsumerConfig{
+		Name:          name,
+		FilterSubject: behaviour.filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       config.AckWait,
 		MaxDeliver:    config.MaxDeliver,
@@ -166,9 +310,53 @@ func startPulling(
 		return nil, fmt.Errorf("create the consumer: %w", err)
 	}
 
-	go service.pump()
+	if behaviour.seen != nil {
+		behaviour.seen.consumer(service.consumer.CachedInfo().Name)
+	}
+
+	if behaviour.coreSubscribe {
+		if _, err := service.connection.Subscribe(toy.SubjectOrderCreated, func(*nats.Msg) {}); err != nil {
+			return nil, fmt.Errorf("subscribe to the order subject: %w", err)
+		}
+	}
+
+	if behaviour.tlsFirst {
+		if err := handshake(ctx, at.NATS); err != nil {
+			return nil, err
+		}
+	}
+
+	go service.pump(ctx)
 
 	return service, nil
+}
+
+// handshake opens a raw connection to the bus, reads its greeting and answers with the opening bytes
+// of a TLS handshake, where a CONNECT would otherwise be.
+func handshake(ctx context.Context, address string) error {
+	bus, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("parse the bus address: %w", err)
+	}
+
+	dialer := net.Dialer{Timeout: time.Second}
+
+	conn, err := dialer.DialContext(ctx, "tcp", bus.Host)
+	if err != nil {
+		return fmt.Errorf("dial the bus: %w", err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		return fmt.Errorf("read the bus greeting: %w", err)
+	}
+
+	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01}); err != nil {
+		return fmt.Errorf("start a TLS handshake: %w", err)
+	}
+
+	return nil
 }
 
 // Close stops pulling and waits for the pump before the connections go, so the proxies are not torn
@@ -182,9 +370,76 @@ func (p *pulling) Close(context.Context) {
 	_ = p.dependency.Close()
 }
 
+// startup is the service's own work before it consumes: its bucket looked up and made, the seeded
+// key read.
+func (p *pulling) startup(ctx context.Context, stream jetstream.JetStream) error {
+	if p.quirks.bucket {
+		_, err := stream.KeyValue(ctx, serviceBucket)
+		if err != nil && !errors.Is(err, jetstream.ErrBucketNotFound) {
+			return fmt.Errorf("look the service bucket up: %w", err)
+		}
+
+		p.quirks.seen.bucketFound(err == nil)
+
+		own, err := stream.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: serviceBucket})
+		if err != nil {
+			return fmt.Errorf("create the service bucket: %w", err)
+		}
+
+		if _, err := own.Put(ctx, "state", []byte("started")); err != nil {
+			return fmt.Errorf("write the service bucket: %w", err)
+		}
+	}
+
+	p.stream = stream
+
+	if p.quirks.conflictingStream {
+		// Refused, as a service's own create is when the stream exists with other subjects; the
+		// service carries on regardless, as one that only logs the error does.
+		//nolint:errcheck // the refusal is the point, and the bus's answer is what the test reads.
+		_, _ = stream.CreateStream(ctx, jetstream.StreamConfig{Name: corpus.StreamName, Subjects: []string{"other.>"}})
+	}
+
+	if p.quirks.sideStream {
+		if _, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+			Name:     sideStream,
+			Subjects: []string{"side.>"},
+		}); err != nil {
+			return fmt.Errorf("create the side stream: %w", err)
+		}
+
+		side, err := stream.CreateOrUpdateConsumer(ctx, sideStream, jetstream.ConsumerConfig{
+			Durable:   sideConsumer,
+			AckPolicy: jetstream.AckExplicitPolicy,
+		})
+		if err != nil {
+			return fmt.Errorf("create the side consumer: %w", err)
+		}
+
+		p.side = side
+	}
+
+	if p.quirks.seededKey {
+		seeded, err := stream.KeyValue(ctx, seededBucket)
+		if err != nil {
+			return fmt.Errorf("open the seeded bucket: %w", err)
+		}
+
+		entry, err := seeded.Get(ctx, seededKey)
+		if err != nil {
+			return fmt.Errorf("read the seeded key: %w", err)
+		}
+
+		p.quirks.seen.revision(entry.Revision())
+		p.seeded = seeded
+	}
+
+	return nil
+}
+
 // pump pulls one message at a time for as long as the run lasts, which is what a real pull consumer
 // does and what makes a redelivery arrive on its own rather than being handed over.
-func (p *pulling) pump() {
+func (p *pulling) pump(ctx context.Context) {
 	defer close(p.stopped)
 
 	for {
@@ -194,20 +449,25 @@ func (p *pulling) pump() {
 		default:
 		}
 
-		batch, err := p.consumer.Fetch(1, jetstream.FetchMaxWait(fetchWait))
+		expires := fetchWait
+		if p.quirks.pullExpires > 0 {
+			expires = p.quirks.pullExpires
+		}
+
+		batch, err := p.consumer.Fetch(1, jetstream.FetchMaxWait(expires))
 		if err != nil {
 			return
 		}
 
 		for msg := range batch.Messages() {
-			p.handle(msg)
+			p.handle(ctx, msg)
 		}
 	}
 }
 
 // handle reserves stock once per delivery, which is the planted bug: the bus is permitted to deliver
 // the same message twice, and this service reserves twice when it does.
-func (p *pulling) handle(msg jetstream.Msg) {
+func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 	if p.quirks.nakFor > 0 && firstDelivery(msg) {
 		//nolint:errcheck // as below: a settle that fails is the run ending underneath the service.
 		_ = msg.NakWithDelay(p.quirks.nakFor)
@@ -224,8 +484,23 @@ func (p *pulling) handle(msg jetstream.Msg) {
 		if json.Unmarshal(msg.Data(), &note) != nil || (p.quirks.echoWrites && p.call("ECHO "+note.EchoOf) != nil) {
 			settle = msg.Nak
 		}
+	case p.seenKey(msg):
 	case !p.quirks.idempotent || firstDelivery(msg):
 		if err := p.reserve(msg.Data()); err != nil {
+			settle = msg.Nak
+		}
+
+		if p.seeded != nil {
+			if _, err := p.seeded.Put(ctx, seededKey, msg.Data()); err != nil {
+				settle = msg.Nak
+			}
+		}
+
+		if p.quirks.audit && p.connection.Publish(auditSubject, msg.Data()) != nil {
+			settle = msg.Nak
+		}
+
+		if p.side != nil && p.noteAside(ctx, msg.Data()) != nil {
 			settle = msg.Nak
 		}
 
@@ -241,6 +516,49 @@ func (p *pulling) handle(msg jetstream.Msg) {
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+}
+
+// seenKey reports whether the header guard has already handled this message's idempotency key, and
+// remembers the key. A message without one is never a repeat: the guard has nothing to key on.
+func (p *pulling) seenKey(msg jetstream.Msg) bool {
+	if !p.quirks.headerGuard {
+		return false
+	}
+
+	key := msg.Headers().Get(idempotencyKey)
+	if key == "" {
+		return false
+	}
+
+	if p.keys == nil {
+		p.keys = make(map[string]bool)
+	}
+
+	seen := p.keys[key]
+	p.keys[key] = true
+
+	return seen
+}
+
+// noteAside publishes a note into the service's own stream and takes it straight back off it: bus work
+// on a stream other than the one under test, done while handling a message.
+func (p *pulling) noteAside(ctx context.Context, note []byte) error {
+	if _, err := p.stream.Publish(ctx, sideSubject, note); err != nil {
+		return fmt.Errorf("note aside: %w", err)
+	}
+
+	batch, err := p.side.Fetch(1, jetstream.FetchMaxWait(fetchWait))
+	if err != nil {
+		return fmt.Errorf("fetch the note back: %w", err)
+	}
+
+	for msg := range batch.Messages() {
+		if err := msg.Ack(); err != nil {
+			return fmt.Errorf("settle the note: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // call sends one line to the dependency and waits for its answer.

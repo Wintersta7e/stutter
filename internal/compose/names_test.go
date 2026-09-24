@@ -35,7 +35,7 @@ func TestEveryNameKindIsInTheTargetView(t *testing.T) {
 			want: []string{"db", firstReplica, "shop-db-2"},
 		},
 		{
-			name: "hostname",
+			name: hostnameKey,
 			model: `{"name": "shop", "services": {"api": {"networks": {"default": null}},
 				"db": {"hostname": "pghost", "networks": {"default": null}}}}`,
 			want: []string{"db", "pghost", firstReplica},
@@ -86,7 +86,7 @@ func TestAForeignNetworkAliasIsAbsent(t *testing.T) {
 		t.Errorf("NamesFrom(db, batch) = %v, want hidden and not primary", got)
 	}
 
-	for _, dep := range []string{"island", "host", "ghost"} {
+	for _, dep := range []string{"island", "host", absentService} {
 		if got := compose.NamesFrom(model, dep, target); len(got) != 0 {
 			t.Errorf("NamesFrom(%s, api) = %v, want none: no shared network", dep, got)
 		}

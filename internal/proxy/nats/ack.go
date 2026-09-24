@@ -70,32 +70,35 @@ func (a Ack) Negative() bool {
 	return strings.HasPrefix(string(a.Payload), ackNegative)
 }
 
-// apiResponse is the shape every JetStream API reply shares. Only the presence of the error object
-// is read: which error it was is the dependency's business, and interpreting it is exactly the thing
-// the standing rule forbids.
+// apiResponse is the shape every JetStream API reply shares. The presence of the error object decides
+// whether the request was refused; what it says is carried to the report, never interpreted.
 type apiResponse struct {
 	Error *apiError `json:"error"`
 }
 
-// apiError is present on every JetStream reply that declined the request. Only its presence is read.
+// apiError is present on every JetStream reply that declined the request.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type apiError struct {
-	Code int `json:"code"`
+	Description string `json:"description"`
+	Code        int    `json:"code"`
+	ErrCode     int    `json:"err_code"`
 }
 
-// refused reports whether the bus answered a publish by declining to store it.
+// apiRefusal reads the error a JetStream reply declined a request with, and whether it declined it.
 //
 // A body that is not a JetStream API reply is not a refusal: a core NATS request-reply carries
 // whatever the responder chose, and guessing at it would drop effects that really happened. The
 // conservative direction is to keep the effect, because an effect wrongly kept is at worst a
 // divergence a human can dismiss, while one wrongly dropped is a bug that was never reported.
-func refused(payload []byte) bool {
+func apiRefusal(payload []byte) (apiError, bool) {
 	var answer apiResponse
 
-	if err := json.Unmarshal(payload, &answer); err != nil {
-		return false
+	if err := json.Unmarshal(payload, &answer); err != nil || answer.Error == nil {
+		return apiError{}, false
 	}
 
-	return answer.Error != nil
+	return *answer.Error, true
 }
 
 // isAckSubject reports whether a publish is an acknowledgement rather than the service's own work.

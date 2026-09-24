@@ -295,6 +295,13 @@ type servicePort struct {
 	Target    flexInt `json:"target"`
 }
 
+// The `type` of a long-form `volumes` entry Stutter mounts.
+const (
+	volumeTypeBind   = "bind"
+	volumeTypeVolume = "volume"
+	volumeTypeTmpfs  = "tmpfs"
+)
+
 // serviceVolume is one long-form `volumes` entry, as compose normalises every short form.
 type serviceVolume struct {
 	Bind     *volumeBind   `json:"bind"`

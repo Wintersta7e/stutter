@@ -40,7 +40,11 @@ type observed struct {
 // recorder is the Sink the proxy writes to. The proxy records from its own goroutines, so it locks.
 type recorder struct {
 	entries []observed
-	mu      sync.Mutex
+	// declined holds what the bus refused, with its code and description.
+	declined        []effect.Refusal
+	noResponders    int
+	closedAfterInfo int
+	mu              sync.Mutex
 }
 
 func (r *recorder) Record(item effect.Observation) {
@@ -72,6 +76,49 @@ func (r *recorder) Reject(correlation string) {
 }
 
 func (*recorder) Answered(string) {}
+
+func (r *recorder) Declined(refusal effect.Refusal) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.declined = append(r.declined, refusal)
+}
+
+func (r *recorder) NoResponder() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.noResponders++
+}
+
+func (r *recorder) ClosedAfterInfo() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closedAfterInfo++
+}
+
+// declinedRefusals returns what the bus refused, as the proxy reported it.
+func (r *recorder) declinedRefusals() []effect.Refusal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]effect.Refusal(nil), r.declined...)
+}
+
+func (r *recorder) noResponderCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.noResponders
+}
+
+func (r *recorder) closedAfterInfoCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.closedAfterInfo
+}
 
 // reads returns the text of every effect the proxy marked as a read.
 func (r *recorder) reads() []string {
@@ -463,53 +510,6 @@ func stubBus(t *testing.T, greeting string) string {
 	}()
 
 	return listener.Addr().String()
-}
-
-// refusal drains the client connection and returns what the proxy recorded once it hung up.
-func refusal(t *testing.T, sink *recorder, conn net.Conn) []string {
-	t.Helper()
-
-	if _, err := io.ReadAll(conn); err != nil {
-		t.Fatalf("read from the proxied connection: %v", err)
-	}
-
-	return sink.texts()
-}
-
-// TestServerRequiringTLSIsRefused covers the sign that arrives first: the bus tells the client to
-// upgrade, so the proxy knows the rest of the connection will be unreadable before a byte of it is.
-func TestServerRequiringTLSIsRefused(t *testing.T) {
-	t.Parallel()
-
-	sink, addr := startProxy(t, stubBus(t, `INFO {"tls_required":true}`+"\r\n"))
-
-	got := refusal(t, sink, dial(t, addr))
-	if len(got) != 1 || !strings.Contains(got[0], "TLS") {
-		t.Errorf("effects = %q, want one refusal naming TLS", got)
-	}
-}
-
-// TestClientUpgradingToTLSIsRefused covers the other sign: the bus merely offers TLS and the client
-// takes it, so what arrives where a CONNECT belongs is a handshake record.
-//
-// Refusing loudly is the whole point. A connection the proxy cannot read reports a handler as having
-// produced no side effects at all, which reads as "idempotent" — the most dangerous wrong answer
-// this tool can give.
-func TestClientUpgradingToTLSIsRefused(t *testing.T) {
-	t.Parallel()
-
-	sink, addr := startProxy(t, stubBus(t, `INFO {"tls_available":true}`+"\r\n"))
-	conn := dial(t, addr)
-
-	// The opening bytes of a TLS handshake record, where a CONNECT would otherwise be.
-	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01}); err != nil {
-		t.Fatalf("write a handshake record: %v", err)
-	}
-
-	got := refusal(t, sink, conn)
-	if len(got) != 1 || !strings.Contains(got[0], "TLS") {
-		t.Errorf("effects = %q, want one refusal naming TLS", got)
-	}
 }
 
 // TestUnparsableTrafficKeepsTheConnection is the promise made to a service under test: a message

@@ -206,13 +206,18 @@ func (c *check) health(reference replay.Result, compared []effect.Effect) report
 	}
 
 	return report.Health{
-		Messages:  len(c.opts.Messages),
-		Delivered: reference.Delivered,
-		Failed:    reference.Failed,
-		Effects:   len(compared),
-		Silent:    silent,
-		Setup:     reference.Setup,
-		Late:      reference.Late,
+		Messages:        len(c.opts.Messages),
+		Delivered:       reference.Delivered,
+		Failed:          reference.Failed,
+		Effects:         len(compared),
+		Silent:          silent,
+		Setup:           reference.Setup,
+		Late:            reference.Late,
+		Refusals:        reference.Refusals,
+		NoResponders:    reference.NoResponders,
+		FedBack:         reference.FedBack,
+		Elsewhere:       reference.Elsewhere,
+		ClosedAfterInfo: reference.ClosedAfterInfo,
 	}
 }
 
