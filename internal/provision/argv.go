@@ -63,7 +63,9 @@ type createPlan struct {
 	covers []string
 	// volumeLabels label every anonymous volume the create makes as this check's.
 	volumeLabels []string
-	spec         ContainerSpec
+	// hostPorts maps each published container port to the host port selected for it.
+	hostPorts map[uint16]uint16
+	spec      ContainerSpec
 }
 
 // createCall is a create's arguments after its fixed tokens, the env-file lines it sends on stdin,
@@ -81,7 +83,7 @@ func createArgs(p createPlan) createCall {
 
 	args := append([]arg{{val: "--name"}, {val: p.name}}, labelArgs(p.labels)...)
 	args = append(args, arg{val: "--restart"}, arg{val: "no"}, arg{val: "--log-driver"}, arg{val: "local"})
-	args = append(args, networkArgs(p.spec)...)
+	args = append(args, networkArgs(p.spec, p.hostPorts)...)
 	args = append(args, env...)
 	args = append(args, processArgs(p.spec.Spec)...)
 	args = append(args, resourceArgs(p.spec.Spec.Resources)...)
@@ -96,8 +98,9 @@ func createArgs(p createPlan) createCall {
 }
 
 // networkArgs attaches the container at create — every network, each with its aliases — or to no
-// network at all; publishes each port on loopback with an engine-assigned host port.
-func networkArgs(spec ContainerSpec) []arg {
+// network at all; publishes each port on loopback at the host port selected for it, never at one the
+// engine picks.
+func networkArgs(spec ContainerSpec, hostPorts map[uint16]uint16) []arg {
 	var out []arg
 
 	if spec.NoNetwork {
@@ -118,7 +121,8 @@ func networkArgs(spec ContainerSpec) []arg {
 	}
 
 	for _, port := range spec.Publish {
-		out = append(out, arg{val: "-p"}, arg{val: "127.0.0.1::" + strconv.Itoa(int(port)) + "/tcp"})
+		published := loopbackHost + ":" + strconv.Itoa(int(hostPorts[port])) + ":" + strconv.Itoa(int(port)) + "/tcp"
+		out = append(out, arg{val: "-p"}, arg{val: published})
 	}
 
 	return out

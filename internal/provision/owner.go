@@ -60,11 +60,25 @@ type Handle interface {
 
 // Container is a container the check created.
 type Container struct {
-	id    string
-	name  string
-	check string
-	kind  rules.Kind
-	seq   int
+	// spec is what the container was created from, kept so a start refused for a taken host port can
+	// create it again.
+	spec *ContainerSpec
+	// hostPorts maps each published container port to the host port selected for it.
+	hostPorts map[uint16]uint16
+	id        string
+	name      string
+	check     string
+	kind      rules.Kind
+	// copies are the copies made into the container before it started, in order: a container created
+	// again gets each of them again.
+	copies []copied
+	seq    int
+}
+
+// copied is one CopyIn.
+type copied struct {
+	dir   string
+	files []File
 }
 
 // ID returns the container's ID.
@@ -414,6 +428,10 @@ func (e *Engine) removeRecorded(ctx context.Context, b *book, rec record) error 
 
 	if rec.typ != ResourceContainer {
 		return nil
+	}
+
+	if b == e.book {
+		e.releaseHeldHostPorts(rec.seq)
 	}
 
 	var errs []error
@@ -768,10 +786,16 @@ type File struct {
 
 // CreateContainer creates one container, never started: from the image this check pinned, named
 // and labelled as this check's, `--restart no`, logged locally, on the check's networks and storage
-// only, every image VOLUME covered by a labelled volume, its environment on stdin. The read-back is
-// verified; a container that carries this check's labels but fails any property is removed before
-// the failure is returned.
+// only, every image VOLUME covered by a labelled volume, its environment on stdin, each published port
+// on a loopback host port selected for it. The read-back is verified; a container that carries this
+// check's labels but fails any property is removed before the failure is returned.
 func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Container, error) {
+	return e.createAvoiding(ctx, spec, nil)
+}
+
+// createAvoiding is CreateContainer, selecting no host port in avoid. Every create, a first one or
+// one made again after a refused start, goes through it.
+func (e *Engine) createAvoiding(ctx context.Context, spec ContainerSpec, avoid []uint16) (*Container, error) {
 	image, err := e.gate(ctx, spec)
 	if err != nil {
 		return nil, err
@@ -783,6 +807,26 @@ func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Cont
 		}
 	}
 
+	hostPorts, err := reserveHostPorts(ctx, spec.Publish, avoid)
+	if err != nil {
+		return nil, err
+	}
+
+	container, err := e.createOn(ctx, spec, image, hostPorts)
+	if err != nil {
+		releaseHostPorts(hostPorts)
+
+		return nil, err
+	}
+
+	return container, nil
+}
+
+// createOn creates spec's container publishing on hostPorts, which are reserved for it: intent,
+// create, verification, then the verified mark, each in the ledger.
+func (e *Engine) createOn(
+	ctx context.Context, spec ContainerSpec, image compose.Image, hostPorts map[uint16]uint16,
+) (*Container, error) {
 	rec, err := e.intend(ResourceContainer, spec.Kind, spec.Service, func(seq int) string {
 		return containerName(e.id, spec.Kind, seq)
 	})
@@ -792,7 +836,7 @@ func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Cont
 
 	call := createArgs(createPlan{
 		labels: labelSet(e.id, spec.Kind, spec.Service), name: rec.name, image: image.ID, spec: spec,
-		covers: uncovered(image.Volumes, spec), volumeLabels: []string{
+		covers: uncovered(image.Volumes, spec), hostPorts: hostPorts, volumeLabels: []string{
 			rules.LabelCheck + "=" + e.id, rules.LabelKind + "=" + string(spec.Kind),
 		},
 	})
@@ -808,7 +852,7 @@ func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Cont
 		return nil, err
 	}
 
-	if err := e.verifyCreated(ctx, rec, spec); err != nil {
+	if err := e.verifyCreated(ctx, rec, spec, hostPorts); err != nil {
 		return nil, err
 	}
 
@@ -816,7 +860,11 @@ func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Cont
 		return nil, err
 	}
 
-	return &Container{id: rec.id, name: rec.name, check: e.id, kind: spec.Kind, seq: rec.seq}, nil
+	e.holdHostPorts(rec.seq, hostPorts)
+
+	return &Container{
+		id: rec.id, name: rec.name, check: e.id, kind: spec.Kind, seq: rec.seq, spec: &spec, hostPorts: hostPorts,
+	}, nil
 }
 
 // uncovered returns the image VOLUME paths no mount of the spec lands exactly on.
@@ -845,7 +893,7 @@ func uncovered(volumes []string, spec ContainerSpec) []string {
 // verifyCreated proves a created container is this check's and is what was asked for. One without
 // this check's labels is never touched. Its anonymous volumes are ledgered against it first, so a
 // container that fails any other property is removed with them.
-func (e *Engine) verifyCreated(ctx context.Context, rec record, spec ContainerSpec) error {
+func (e *Engine) verifyCreated(ctx context.Context, rec record, spec ContainerSpec, hostPorts map[uint16]uint16) error {
 	var report containerReport
 
 	found, err := e.read(ctx, request{verb: verbInspect, args: []arg{{val: containerTemplate}, {val: rec.id}}},
@@ -864,7 +912,7 @@ func (e *Engine) verifyCreated(ctx context.Context, rec record, spec ContainerSp
 
 	anonymous, err := e.ledgerAnonymous(ctx, rec, report, spec)
 	if err == nil {
-		err = verifyContainer(report, e.expect(spec, anonymous))
+		err = verifyContainer(report, e.expect(spec, anonymous, hostPorts))
 	}
 
 	if err != nil {
@@ -913,10 +961,14 @@ func (e *Engine) ledgerAnonymous(
 }
 
 // expect is what verifyContainer holds a created container to.
-func (e *Engine) expect(spec ContainerSpec, anonymous map[string]bool) expectation {
+func (e *Engine) expect(spec ContainerSpec, anonymous map[string]bool, hostPorts map[uint16]uint16) expectation {
 	x := expectation{
 		binds: map[string]bool{}, named: map[string]bool{}, anonymous: anonymous, networks: map[string]bool{},
-		noNetwork: spec.NoNetwork,
+		ports: map[string]string{}, noNetwork: spec.NoNetwork,
+	}
+
+	for port, host := range hostPorts {
+		x.ports[strconv.Itoa(int(port))+"/tcp"] = strconv.Itoa(int(host))
 	}
 
 	for _, m := range spec.Spec.Mounts {
@@ -964,9 +1016,14 @@ func (e *Engine) CopyIn(ctx context.Context, c *Container, dir string, files []F
 		return err
 	}
 
-	_, err = e.run.call(ctx, request{verb: verbCopyIn, stdin: archive, args: []arg{{val: c.id + ":" + dir}}})
+	req := request{verb: verbCopyIn, stdin: archive, args: []arg{{val: c.id + ":" + dir}}}
+	if _, err := e.run.call(ctx, req); err != nil {
+		return err
+	}
 
-	return err
+	c.copies = append(c.copies, copied{dir: dir, files: slices.Clone(files)})
+
+	return nil
 }
 
 // regularFiles writes files as a tar of regular-file entries, refusing a path that escapes dir or
@@ -1035,16 +1092,76 @@ var errNotSeed = errors.New("only a seed container stops gracefully")
 // Start starts a container, then begins the wait whose end Exited reports. The wait begins only
 // once the container runs: a wait on a created container returns at once, which would read as an
 // exit.
+//
+// A start the engine refuses because a published host port is taken is not the container's failure:
+// the refused container is removed, created again on other host ports through the whole create
+// protocol, given every copy the first one was given, and started, with c becoming the new one. A
+// published port is therefore read after Start, never before. Past startAttempts refusals the start
+// fails with ErrPortTaken, naming every host port tried and what the engine said.
 func (e *Engine) Start(ctx context.Context, c *Container) error {
 	if err := e.owns(c); err != nil {
 		return err
 	}
 
-	if _, err := e.run.call(ctx, request{verb: verbStart, args: []arg{{val: c.id}}}); err != nil {
-		return err
+	var (
+		refusals []string
+		refused  []uint16
+	)
+
+	for {
+		_, err := e.run.call(ctx, request{verb: verbStart, args: []arg{{val: c.id}}})
+		if err == nil {
+			break
+		}
+
+		if len(c.hostPorts) == 0 || !portRefused(err) {
+			return err
+		}
+
+		refusals = append(refusals, fmt.Sprintf("host port %s: %v", hostPortList(c.hostPorts), err))
+		refused = slices.AppendSeq(refused, maps.Values(c.hostPorts))
+
+		if len(refusals) == startAttempts {
+			return fmt.Errorf("%w: container %s was refused %d times: %s", ErrPortTaken, c.name, len(refusals),
+				strings.Join(refusals, "; "))
+		}
+
+		if err := e.recreate(ctx, c, refused); err != nil {
+			return errors.Join(fmt.Errorf("%w: container %s: %s", ErrPortTaken, c.name, strings.Join(refusals, "; ")),
+				err)
+		}
 	}
 
 	e.watchExit(ctx, c)
+
+	return nil
+}
+
+// recreate replaces a container whose start was refused for a taken host port. The refused one is
+// removed through the ledger, with its anonymous volumes; the new one is created from the same spec
+// through the same create, on none of the refused host ports, and every copy made into the first is
+// made into it. c becomes the new container.
+func (e *Engine) recreate(ctx context.Context, c *Container, refused []uint16) error {
+	rec, _ := e.book.record(c.seq)
+	if err := e.removeRecorded(ctx, e.book, rec); err != nil {
+		return err
+	}
+
+	fresh, err := e.createAvoiding(ctx, *c.spec, refused)
+	if err != nil {
+		return err
+	}
+
+	// c names the new container before the copies are made again, so a copy that fails leaves the
+	// caller holding the container that exists.
+	made := c.copies
+	*c = *fresh
+
+	for _, again := range made {
+		if err := e.CopyIn(ctx, c, again.dir, again.files); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }
