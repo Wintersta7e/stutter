@@ -1,0 +1,280 @@
+{
+  "configs": {
+    "c_content": {
+      "name": "kitchen_c_content",
+      "content": "line one $$HOME\n"
+    },
+    "c_env": {
+      "name": "kitchen_c_env",
+      "environment": "CONFIG_VALUE"
+    },
+    "c_file": {
+      "name": "kitchen_c_file",
+      "file": "/project/conf/file.conf"
+    }
+  },
+  "name": "kitchen",
+  "networks": {
+    "default": {
+      "name": "kitchen_default",
+      "ipam": {}
+    }
+  },
+  "secrets": {
+    "s_env": {
+      "name": "kitchen_s_env",
+      "environment": "SECRET_VALUE"
+    }
+  },
+  "services": {
+    "api": {
+      "build": {
+        "context": "/project/app",
+        "dockerfile": "Dockerfile",
+        "args": {
+          "TOKEN": "build-arg"
+        },
+        "labels": {
+          "com.example.test.kind": "app"
+        },
+        "cache_to": [
+          "type=inline"
+        ],
+        "tags": [
+          "example.test/api:dev"
+        ],
+        "platforms": [
+          "linux/amd64"
+        ]
+      },
+      "cpus": 0.5,
+      "command": [
+        "--port",
+        "8080"
+      ],
+      "configs": [
+        {
+          "source": "c_content",
+          "target": "/etc/app/content.conf"
+        },
+        {
+          "source": "c_file",
+          "target": "/etc/app/file.conf"
+        },
+        {
+          "source": "c_env",
+          "target": "/etc/app/env.conf",
+          "uid": "1000",
+          "gid": "1000",
+          "mode": 256
+        }
+      ],
+      "depends_on": {
+        "db": {
+          "condition": "service_healthy",
+          "required": true
+        },
+        "migrate": {
+          "condition": "service_completed_successfully",
+          "required": true
+        }
+      },
+      "entrypoint": [
+        "/bin/app",
+        "--serve"
+      ],
+      "environment": {
+        "NATS_URL": "nats://bus:4222",
+        "PASS": "pa$$word",
+        "PLAIN": "plain",
+        "UNSET_VAR": null
+      },
+      "expose": [
+        "7000-7002",
+        "5353/udp"
+      ],
+      "image": "example.test/api:1",
+      "links": [
+        "db:database"
+      ],
+      "mem_limit": "536870912",
+      "networks": {
+        "default": null
+      },
+      "ports": [
+        {
+          "mode": "ingress",
+          "target": 80,
+          "published": "8080",
+          "protocol": "tcp"
+        },
+        {
+          "mode": "ingress",
+          "target": 9000,
+          "published": "9001",
+          "protocol": "udp"
+        }
+      ],
+      "secrets": [
+        {
+          "source": "s_env",
+          "target": "/run/secrets/token",
+          "uid": "1000",
+          "mode": 256
+        }
+      ],
+      "shm_size": "67108864",
+      "tmpfs": [
+        "/tmp"
+      ],
+      "ulimits": {
+        "nofile": {
+          "soft": 1024,
+          "hard": 2048
+        },
+        "nproc": 512
+      },
+      "user": "1000:1000",
+      "volumes": [
+        {
+          "type": "bind",
+          "source": "/project/conf",
+          "target": "/etc/app",
+          "read_only": true,
+          "bind": {
+            "create_host_path": true
+          }
+        },
+        {
+          "type": "bind",
+          "source": "/project/data",
+          "target": "/data"
+        },
+        {
+          "type": "volume",
+          "source": "cache-vol",
+          "target": "/var/cache",
+          "volume": {}
+        },
+        {
+          "type": "volume",
+          "target": "/scratch",
+          "volume": {}
+        },
+        {
+          "type": "tmpfs",
+          "target": "/run/tmp",
+          "tmpfs": {
+            "size": "1048576",
+            "mode": 1023
+          }
+        }
+      ],
+      "working_dir": "/srv"
+    },
+    "cache": {
+      "command": null,
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "CMD-SHELL",
+          "redis-cli ping"
+        ]
+      },
+      "image": "example.test/cache:8",
+      "networks": {
+        "default": null
+      },
+      "stop_signal": "SIGTERM"
+    },
+    "db": {
+      "command": null,
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "pg_isready",
+          "-U",
+          "x"
+        ],
+        "timeout": "3s",
+        "interval": "5s",
+        "retries": 4,
+        "start_period": "10s",
+        "start_interval": "1s"
+      },
+      "image": "example.test/pg:18",
+      "networks": {
+        "default": null
+      },
+      "stop_grace_period": "1m30s",
+      "stop_signal": "SIGINT"
+    },
+    "migrate": {
+      "command": [
+        "migrate"
+      ],
+      "entrypoint": null,
+      "healthcheck": {
+        "test": [
+          "NONE"
+        ]
+      },
+      "image": "example.test/api:1",
+      "networks": {
+        "default": null
+      }
+    },
+    "tools": {
+      "profiles": [
+        "debug"
+      ],
+      "command": null,
+      "entrypoint": null,
+      "image": "example.test/tools:1",
+      "networks": {
+        "default": null
+      }
+    },
+    "worker": {
+      "command": null,
+      "deploy": {
+        "resources": {
+          "limits": {
+            "cpus": 0.25,
+            "memory": "268435456",
+            "pids": 100
+          },
+          "reservations": {
+            "cpus": 0.1,
+            "memory": "67108864"
+          }
+        },
+        "placement": {}
+      },
+      "entrypoint": null,
+      "healthcheck": {
+        "disable": true
+      },
+      "image": "example.test/api:1",
+      "networks": {
+        "default": null
+      }
+    }
+  },
+  "volumes": {
+    "cache-vol": {
+      "name": "kitchen_cache-vol"
+    }
+  },
+  "x-stutter": {
+    "endpoints": {
+      "db": {
+        "5432": "pg"
+      }
+    },
+    "roles": {
+      "cache": "other"
+    }
+  }
+}
