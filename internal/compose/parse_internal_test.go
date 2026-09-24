@@ -37,7 +37,7 @@ func parseIn(t *testing.T, dir, model, environ string) *Model {
 		t.Fatalf("write compose file: %v", err)
 	}
 
-	parsed, err := Parse(t.Context(), staticRun(model, environ), Inputs{Service: "api", Files: []string{file}})
+	parsed, err := Parse(t.Context(), staticRun(model, environ), Inputs{Service: testTarget, Files: []string{file}})
 	if err != nil {
 		t.Fatalf("Parse: %v", err)
 	}

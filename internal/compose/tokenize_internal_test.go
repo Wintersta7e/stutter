@@ -84,7 +84,7 @@ func TestTokenizerFindsExactEndpoints(t *testing.T) {
 			name: "socket host", value: "host=/var/run/postgresql dbname=app",
 			want: []ref{{Host: "/var/run/postgresql", KeywordPG: true, Socket: true}},
 		},
-		{name: "bare host:port", value: "cache:6379", want: []ref{{Host: "cache", Port: 6379}}},
+		{name: "bare host:port", value: "cache:6379", want: []ref{{Host: cacheService, Port: 6379}}},
 		{name: "listen address", value: "0.0.0.0:8080", want: []ref{{Host: "0.0.0.0", Port: 8080}}},
 		{
 			name: "URL and bare token in one argument", value: "--listen=127.0.0.1:6000,http://api.test:8080/x",
@@ -95,7 +95,7 @@ func TestTokenizerFindsExactEndpoints(t *testing.T) {
 		},
 		{
 			name: "rediss with a password only", value: "rediss://:pw0rd@cache:6380/0", userinfo: []string{"pw0rd"},
-			want: []ref{{Scheme: "rediss", Host: "cache", Port: 6380, List: 1}},
+			want: []ref{{Scheme: "rediss", Host: cacheService, Port: 6380, List: 1}},
 		},
 		{name: "bare v6 literal", value: "fd00::7", want: []ref{{Host: "fd00::7"}}},
 		{name: "not a reference", value: "hello world at 12:30; a=b"},

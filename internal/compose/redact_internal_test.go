@@ -16,7 +16,7 @@ func TestASpecAndACopyInNeverPrintTheirValues(t *testing.T) {
 	sentinel := rand.Text()
 	copyIn := CopyIn{Target: "/run/secrets/tok", UID: 1000, GID: 1000, Mode: 0o400, data: []byte(sentinel)}
 	spec := Spec{
-		Service:    "api",
+		Service:    testTarget,
 		Image:      "sha256:0123",
 		Env:        map[string]string{secretKey: sentinel, "PLAIN": "x"},
 		raw:        map[string]string{secretKey: sentinel},
