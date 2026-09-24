@@ -16,6 +16,9 @@ import (
 	"github.com/Wintersta7e/stutter/internal/compose"
 )
 
+// composePlugin is the docker CLI plugin that runs compose.
+const composePlugin = "compose"
+
 // Templates for the three precondition reads. Each builds a snake_case JSON object inside the
 // template, so nothing decodes the engine's own field names.
 const (
@@ -201,7 +204,7 @@ func readInfo(ctx context.Context, runner *execRunner, identity *Identity) error
 	}
 
 	for _, plugin := range found.Plugins {
-		if plugin.Name == "compose" {
+		if plugin.Name == composePlugin {
 			identity.Compose = plugin.Version
 		}
 	}
@@ -228,9 +231,13 @@ func readTemplate(ctx context.Context, c caller, v verb, template string, into a
 		return err
 	}
 
-	if err := json.Unmarshal(bytes.TrimSpace(res.out), into); err != nil {
-		return fmt.Errorf("%w: the %s call printed something other than its template: %w",
-			ErrEngine, verbs()[v].name, err)
+	return decodeJSON(res.out, into)
+}
+
+// decodeJSON decodes the one JSON object a template call printed.
+func decodeJSON(out []byte, into any) error {
+	if err := json.Unmarshal(bytes.TrimSpace(out), into); err != nil {
+		return fmt.Errorf("%w: a template call printed something other than its template: %w", ErrEngine, err)
 	}
 
 	return nil
