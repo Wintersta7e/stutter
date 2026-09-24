@@ -55,14 +55,26 @@ type Sink interface {
 }
 
 // Proxy accepts Postgres connections and forwards them to an upstream server.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type Proxy struct {
 	listener net.Listener
 	sink     Sink
-	upstream string
-	dialer   net.Dialer
-	wg       sync.WaitGroup
+	// dialFailed is the first upstream dial that failed. It stops the proxy, and Serve reports it.
+	dialFailed error
+	upstream   string
+	dialer     net.Dialer
+	wg         sync.WaitGroup
 	// sessions numbers connections, so a statement's correlation token is unique across all of them.
 	sessions atomic.Uint64
+	failOnce sync.Once
+	failMu   sync.Mutex
+}
+
+// New serves a proxy on a listener the caller supplies, forwarding to the Postgres server at upstream.
+// The proxy binds no socket of its own: the caller's listener is where connections come from.
+func New(listener net.Listener, upstream string, sink Sink) *Proxy {
+	return &Proxy{listener: listener, upstream: upstream, sink: sink}
 }
 
 // Listen binds a proxy on addr, forwarding to the Postgres server at upstream.
@@ -76,7 +88,7 @@ func Listen(ctx context.Context, addr, upstream string, sink Sink) (*Proxy, erro
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	return &Proxy{listener: listener, upstream: upstream, sink: sink}, nil
+	return New(listener, upstream, sink), nil
 }
 
 // Addr is the address the proxy is listening on.
@@ -84,11 +96,17 @@ func (p *Proxy) Addr() string {
 	return p.listener.Addr().String()
 }
 
-// Serve accepts connections until the proxy is closed.
+// Serve accepts connections until the proxy is closed, or until an upstream dial fails — that failure
+// is what Serve then returns.
 func (p *Proxy) Serve(ctx context.Context) error {
 	for {
 		client, err := p.listener.Accept()
 		if err != nil {
+			// A dial failure outranks the closure it caused.
+			if failure := p.dialFailure(); failure != nil {
+				return failure
+			}
+
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				//nolint:nilerr // a closed listener is how Serve is stopped, not a failure.
 				return nil
@@ -112,11 +130,38 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
+// failDial records the first upstream dial that failed and stops accepting. There is no retry: the
+// database's readiness was the caller's to establish, and a run whose database the service cannot
+// reach reports a handler that did nothing.
+func (p *Proxy) failDial(err error) {
+	p.failOnce.Do(func() {
+		p.failMu.Lock()
+		p.dialFailed = err
+		p.failMu.Unlock()
+
+		_ = p.listener.Close()
+	})
+}
+
+func (p *Proxy) dialFailure() error {
+	p.failMu.Lock()
+	defer p.failMu.Unlock()
+
+	return p.dialFailed
+}
+
 func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	defer func() { _ = client.Close() }()
 
 	upstream, err := p.dialer.DialContext(ctx, "tcp", p.upstream)
 	if err != nil {
+		abort(client)
+
+		// A dial abandoned because the run is over is the run ending, not the database failing.
+		if ctx.Err() == nil {
+			p.failDial(fmt.Errorf("dial the upstream %s: %w", p.upstream, err))
+		}
+
 		return
 	}
 
@@ -436,6 +481,23 @@ func writeTyped(to io.Writer, msgType byte, body []byte) error {
 	}
 
 	return nil
+}
+
+// abort closes a client so it reads a reset, never EOF: the upstream could not be reached, and a clean
+// close would tell the client the database hung up on it. A relayed connection aborts itself, which
+// carries the reset back through the relay.
+func abort(conn net.Conn) {
+	if aborter, ok := conn.(interface{ Abort() error }); ok {
+		_ = aborter.Abort() //nolint:errcheck // the connection is being refused either way.
+
+		return
+	}
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0) //nolint:errcheck // a failed linger leaves a clean close, still a refusal.
+	}
+
+	_ = conn.Close()
 }
 
 // isEncryptionRequest reports whether a startup body is an SSL or GSSAPI request rather than a real

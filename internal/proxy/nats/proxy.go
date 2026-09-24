@@ -127,7 +127,14 @@ func ListenWith(ctx context.Context, addr, upstream string, sink Sink, opts Opti
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	return &Proxy{listener: listener, upstream: upstream, sink: sink, opts: opts}, nil
+	return New(listener, upstream, sink, opts), nil
+}
+
+// New serves a proxy on a listener the caller supplies, forwarding to the NATS server at upstream, as
+// ListenWith does. The proxy binds no socket of its own: the caller's listener is where connections
+// come from.
+func New(listener net.Listener, upstream string, sink Sink, opts Options) *Proxy {
+	return &Proxy{listener: listener, upstream: upstream, sink: sink, opts: opts}
 }
 
 // Addr is the address the proxy is listening on.
@@ -190,11 +197,29 @@ func (p *Proxy) serveFailure() error {
 	return p.failure
 }
 
+// dialUpstream dials the bus for one client. The bus is Stutter's own server, so a refused dial is a
+// real failure: it resets the client and stops the run. One abandoned because the run is over is the
+// run ending.
+func (p *Proxy) dialUpstream(ctx context.Context, client net.Conn) (net.Conn, bool) {
+	upstream, err := p.dialer.DialContext(ctx, "tcp", p.upstream)
+	if err == nil {
+		return upstream, true
+	}
+
+	abort(client)
+
+	if ctx.Err() == nil {
+		p.fail(fmt.Errorf("dial the upstream %s: %w", p.upstream, err))
+	}
+
+	return nil, false
+}
+
 func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	defer func() { _ = client.Close() }()
 
-	upstream, err := p.dialer.DialContext(ctx, "tcp", p.upstream)
-	if err != nil {
+	upstream, dialled := p.dialUpstream(ctx, client)
+	if !dialled {
 		return
 	}
 
@@ -238,6 +263,23 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	_ = upstream.Close()
 
 	<-served
+}
+
+// abort closes a client so it reads a reset, never EOF: the bus could not be reached, and a clean close
+// would tell the client the bus hung up on it. A relayed connection aborts itself, which carries the
+// reset back through the relay.
+func abort(conn net.Conn) {
+	if aborter, ok := conn.(interface{ Abort() error }); ok {
+		_ = aborter.Abort() //nolint:errcheck // the connection is being refused either way.
+
+		return
+	}
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetLinger(0) //nolint:errcheck // a failed linger leaves a clean close, still a refusal.
+	}
+
+	_ = conn.Close()
 }
 
 // session is one client connection and its upstream counterpart.
