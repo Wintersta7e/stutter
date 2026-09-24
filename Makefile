@@ -59,6 +59,20 @@ compose-floor: ## Install the oldest supported compose plugin as $(DEST)/docker-
 	fi; \
 	echo "compose-floor $(COMPOSE_FLOOR_VERSION): $(DEST)/docker-compose"
 
+.PHONY: nocontainers
+nocontainers: ## Fail if a container-orchestration test library is in the module graph
+	$(TESTGATE) nocontainers go.mod go.sum
+
+.PHONY: tree-snapshot
+tree-snapshot: ## Record the working tree before the suite (TREE=<file>)
+	@[ -n "$(TREE)" ] || { echo "tree-snapshot: name the snapshot file with TREE=<file>" >&2; exit 2; }
+	git status --porcelain=v1 -z --untracked-files=all | $(TESTGATE) tree -snapshot "$(TREE)"
+
+.PHONY: tree-check
+tree-check: ## Fail unless the suite left the tree as tree-snapshot found it (TREE=<file>)
+	@[ -n "$(TREE)" ] || { echo "tree-check: name the snapshot file with TREE=<file>" >&2; exit 2; }
+	git status --porcelain=v1 -z --untracked-files=all | $(TESTGATE) tree -compare "$(TREE)"
+
 .PHONY: localproofs
 localproofs: ## List the proofs CI never compiles, and fail on a production file hidden from it
 	git ls-files -z '*.go' | $(TESTGATE) localproofs
@@ -93,7 +107,7 @@ tidy: ## Fail if go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
 
 .PHONY: ci
-ci: fmt-check lint buildscan deadcode localproofs tidy test vuln build static-check ## Everything CI runs, locally
+ci: fmt-check lint buildscan deadcode localproofs nocontainers tidy test vuln build static-check ## Everything CI runs, locally
 
 .PHONY: clean
 clean:

@@ -61,3 +61,34 @@ func constrainedTo(content []byte, tag string) bool {
 func notInTag(r rune) bool {
 	return r != '_' && r != '.' && (r < '0' || r > '9') && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z')
 }
+
+// containerLibrary is the module that must never be a dependency: its reaper would be a second
+// remover of resources on the user's engine. Split so this source never holds the name itself.
+const containerLibrary = "testcontainers" + "/testcontainers-go"
+
+// errContainerLibrary means the module graph holds the container library, or nothing was scanned.
+var errContainerLibrary = errors.New("container library")
+
+// ScanNoContainers counts the lines of files that name the container library. It fails when any
+// does, and when no file was scanned.
+func ScanNoContainers(files []SourceFile) (int, error) {
+	if len(files) == 0 {
+		return 0, fmt.Errorf("%w: no files scanned", errContainerLibrary)
+	}
+
+	n := 0
+
+	for _, f := range files {
+		for line := range strings.Lines(string(f.Content)) {
+			if strings.Contains(line, containerLibrary) {
+				n++
+			}
+		}
+	}
+
+	if n > 0 {
+		return n, fmt.Errorf("%w: %d lines depend on it", errContainerLibrary, n)
+	}
+
+	return 0, nil
+}

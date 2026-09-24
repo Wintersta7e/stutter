@@ -14,6 +14,8 @@ const (
 	subCount    = "count"
 	subExpect   = "expect"
 	subDeadcode = "deadcode"
+	subTree     = "tree"
+	flagCompare = "-compare"
 	flagAction  = "-action"
 	optOutValue = "skip"
 )
@@ -205,5 +207,57 @@ func TestLocalproofsListsTaggedTests(t *testing.T) {
 
 	if got := runWith([]string{"localproofs"}, proof+"\x00"+hidden+"\x00", nil); got.code != exitFail {
 		t.Fatalf("a hidden production file: exit %d, want %d", got.code, exitFail)
+	}
+}
+
+func TestTreeComparesWithItsSnapshot(t *testing.T) {
+	t.Parallel()
+
+	snapshot := filepath.Join(t.TempDir(), "tree.json")
+
+	if got := runWith([]string{subTree, "-snapshot", snapshot}, "", nil); got.code != exitPass {
+		t.Fatalf("snapshot: exit %d, stderr %q", got.code, got.stderr)
+	}
+
+	got := runWith([]string{subTree, flagCompare, snapshot}, "", nil)
+	if got.code != exitPass || got.stdout != "STUTTER-AUDIT tree untracked-or-modified=0\n" {
+		t.Fatalf("an unchanged tree: exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	got = runWith([]string{subTree, flagCompare, snapshot}, "?? leftover.txt\x00", nil)
+	if got.code != exitFail || !strings.HasPrefix(got.stdout, "STUTTER-AUDIT tree untracked-or-modified=1\n") {
+		t.Fatalf("a new file: exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	missing := filepath.Join(t.TempDir(), "none.json")
+	if got := runWith([]string{subTree, flagCompare, missing}, "", nil); got.code != exitFail ||
+		!strings.Contains(got.stderr, "absent") {
+		t.Fatalf("no snapshot: exit %d, stderr %q", got.code, got.stderr)
+	}
+
+	for _, args := range [][]string{{subTree}, {subTree, "-snapshot", "a", flagCompare, "b"}} {
+		if got := runWith(args, "", nil); got.code != exitUsage {
+			t.Errorf("%q: exit %d, want %d", args, got.code, exitUsage)
+		}
+	}
+}
+
+func TestNocontainersCountsWhatItScanned(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	mod := filepath.Join(dir, "go.mod")
+
+	if err := os.WriteFile(mod, []byte("module x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got := runWith([]string{"nocontainers", mod}, "", nil)
+	if got.code != exitPass || got.stdout != "testcontainers files=1 occurrences=0\n" {
+		t.Fatalf("exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	if got := runWith([]string{"nocontainers"}, "", nil); got.code != exitFail {
+		t.Fatalf("no files: exit %d, want %d", got.code, exitFail)
 	}
 }

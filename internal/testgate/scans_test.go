@@ -32,3 +32,26 @@ func TestLocalProofsAreListed(t *testing.T) {
 		t.Fatalf("a production file only local builds compile was listed as %q; want an error", proofs)
 	}
 }
+
+func TestTestcontainersIsNeverADependency(t *testing.T) {
+	t.Parallel()
+
+	clean := []testgate.SourceFile{
+		file("go.mod", "module x\n\nrequire github.com/nats-io/nats.go v1.0.0\n"),
+		file("go.sum", "github.com/nats-io/nats.go v1.0.0 h1:abc=\n"),
+	}
+
+	if n, err := testgate.ScanNoContainers(clean); n != 0 || err != nil {
+		t.Fatalf("clean: occurrences=%d, %v; want 0 and nil", n, err)
+	}
+
+	dirty := append(slices.Clone(clean),
+		file("go.sum", "github.com/"+"testcontainers/testcontainers-go v0.40.0 h1:abc=\n"))
+	if n, err := testgate.ScanNoContainers(dirty); n != 1 || err == nil {
+		t.Fatalf("a go.sum line: occurrences=%d, %v; want 1 and an error", n, err)
+	}
+
+	if _, err := testgate.ScanNoContainers(nil); err == nil {
+		t.Fatal("zero files scanned passed")
+	}
+}
