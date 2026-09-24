@@ -180,6 +180,10 @@ type Proxy struct {
 	// failure is the first error net/http reported while serving. It stops the run rather than
 	// being recorded, so a broken connection can never be mistaken for a side effect.
 	failure error
+	// served holds the server names at least one TLS connection has sent a request for. A later
+	// connection to one of them that sends nothing is the client's pool, not a client that cannot
+	// reach the stub (see tunnel.Read).
+	served sync.Map
 
 	logicalHost string
 	closeOnce   sync.Once
@@ -320,7 +324,14 @@ type tunnel struct {
 func (t *tunnel) HandshakeContext(ctx context.Context) error {
 	err := t.Conn.HandshakeContext(context.WithValue(ctx, tunnelKey{}, t))
 	if err != nil {
-		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, err)))
+		// A stop's text is compared between runs, so the connection's addresses — an ephemeral port
+		// on every run — are dropped and only the cause is kept.
+		cause := err
+		if network, isNetwork := errors.AsType[*net.OpError](err); isNetwork {
+			cause = network.Err
+		}
+
+		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, cause)))
 	}
 
 	return err //nolint:wrapcheck // net/http type-checks this error to answer a cleartext client.
@@ -331,7 +342,17 @@ func (t *tunnel) HandshakeContext(ctx context.Context) error {
 func (t *tunnel) Read(buffer []byte) (int, error) {
 	if t.checked == nil && t.failure == nil {
 		t.checked, t.failure = checkConnection(t.Conn, headerBound, errNoRequest)
-		if t.failure != nil {
+
+		switch {
+		case t.failure == nil:
+			t.proxy.served.Store(t.serverName, struct{}{})
+		case errors.Is(t.failure, errNoRequest) && t.proxy.wasServed(t.serverName):
+			// Go's http.Transport dials for a waiting request, hands that request a connection that
+			// freed first, and pools the fresh one unused. Once this server name has been served, a
+			// connection that sends nothing is that pool, so it closes quietly. A client that pins
+			// certificates never gets a first connection through, so it still stops the run.
+			t.failure = io.EOF
+		default:
 			t.failure = t.named(t.failure)
 			t.proxy.fail(t.failure)
 		}
@@ -498,6 +519,13 @@ func (p *Proxy) fail(err error) {
 
 		_ = p.Close()
 	})
+}
+
+// wasServed reports whether a TLS connection has already sent a request for serverName.
+func (p *Proxy) wasServed(serverName string) bool {
+	_, served := p.served.Load(serverName)
+
+	return served
 }
 
 func (p *Proxy) serveFailure() error {

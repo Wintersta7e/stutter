@@ -234,11 +234,20 @@ func TestTLSIdleClientDoesNotDelayAnother(t *testing.T) {
 	}
 
 	client.CloseIdleConnections()
-	awaitStop(t, done, "sent no request")
+
+	// The quiet client shares the served one's server name, so it reads as a pooled connection and
+	// closes quietly; a quiet client with no served sibling still stops (TestTLSStubStopsOnSilentOutcomes).
+	select {
+	case serveErr := <-done:
+		t.Fatalf("Serve() stopped on a quiet client beside a served one: %v", serveErr)
+	case <-time.After(stopWait):
+	}
 
 	if abortErr := run.Abort(); abortErr != nil {
 		t.Fatal(abortErr)
 	}
+
+	closeProxy(t, proxy, done)
 
 	if got := len(current.all()); got != 1 {
 		t.Errorf("observations = %d, want only the concurrent request", got)
