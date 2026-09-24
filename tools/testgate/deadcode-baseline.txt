@@ -1,0 +1,8 @@
+# Functions unreachable from ./cmd/stutter, as `deadcode -json` names them: <import path>.<Func>, or
+# <import path>.<Recv>.<Method>. `make deadcode` passes only when its report equals this list. A change
+# that lands a function the CLI will call later names it here, with a # comment saying what calls it;
+# the change that wires or deletes a function removes its name.
+github.com/Wintersta7e/stutter/internal/proxy/nats.Listen
+github.com/Wintersta7e/stutter/internal/replay.Concurrent.Fault
+github.com/Wintersta7e/stutter/internal/report.Report.String
+github.com/Wintersta7e/stutter/internal/toy.Qty

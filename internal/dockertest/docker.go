@@ -202,10 +202,12 @@ var (
 // docker CLI from a closed verb table, in an environment of exactly PATH, DOCKER_HOST and an empty
 // private DOCKER_CONFIG. It removes only what a helper in this test process created, by exact ID.
 type Docker struct {
-	engine Engine
-	host   string
-	config string
-	calls  atomic.Int64
+	checks   map[string]bool
+	engine   Engine
+	host     string
+	config   string
+	calls    atomic.Int64
+	checksMu sync.Mutex
 }
 
 // Docker returns a helper bound to this engine.
@@ -305,8 +307,27 @@ func (d *Docker) Start(tb testing.TB, id string) {
 	d.must(tb, call{verb: verbStart, args: []string{id}})
 }
 
-// Kill stops a container with SIGKILL: one a helper in this process created, or one Stutter created
-// (it carries Stutter's check label) and a developer's own database never is.
+// OwnCheck registers checkID as the ID of a check this test ran itself, so Kill may stop that check's
+// containers. A check label alone is not enough: a developer's own check beside the suite carries one.
+func (d *Docker) OwnCheck(tb testing.TB, checkID string) {
+	tb.Helper()
+
+	if checkID == "" {
+		tb.Fatal("OwnCheck needs the check ID the test's own invocation reported")
+	}
+
+	d.checksMu.Lock()
+	defer d.checksMu.Unlock()
+
+	if d.checks == nil {
+		d.checks = map[string]bool{}
+	}
+
+	d.checks[checkID] = true
+}
+
+// Kill stops a container with SIGKILL: one a helper in this process created, or one whose Stutter
+// check label names a check registered with OwnCheck. A developer's own database never is.
 func (d *Docker) Kill(tb testing.TB, id string) {
 	tb.Helper()
 
@@ -317,9 +338,9 @@ func (d *Docker) Kill(tb testing.TB, id string) {
 		}
 
 		read := readLabelled(tb, raw)
-		if read.Config.Labels[rules.LabelCheck] == "" ||
+		if !d.ownsCheck(read.Config.Labels[rules.LabelCheck]) ||
 			slices.Contains(reservedNames(), strings.TrimPrefix(read.Name, "/")) {
-			tb.Fatalf("refusing to kill %s: neither this test process nor a Stutter check created it", id)
+			tb.Fatalf("refusing to kill %s: neither this test process nor a check it registered created it", id)
 		}
 	}
 
@@ -667,6 +688,14 @@ func (d *Docker) removeOwned(tb testing.TB, id string) error {
 	ownedMu.Unlock()
 
 	return nil
+}
+
+// ownsCheck reports whether checkID was registered with OwnCheck.
+func (d *Docker) ownsCheck(checkID string) bool {
+	d.checksMu.Lock()
+	defer d.checksMu.Unlock()
+
+	return checkID != "" && d.checks[checkID]
 }
 
 // withTestLabel returns labels plus the test label.

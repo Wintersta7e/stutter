@@ -19,17 +19,16 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
+	"github.com/Wintersta7e/stutter/internal/testgate"
 )
 
-// OptOutVariable names the environment variable that decides whether the Docker tests run.
-const OptOutVariable = "STUTTER_TEST_DOCKER"
-
-// optOutValue is the one value that skips the Docker tests; empty runs them.
-const optOutValue = "skip"
-
-// SkipPrefix begins the reason of every skip the opt-out causes, so a counter can admit exactly
-// those skips and no other.
-const SkipPrefix = OptOutVariable + "=" + optOutValue + ":"
+// The opt-out's variable, its one skipping value, and the prefix of every skip it causes, which the
+// skip counter admits and nothing else; declared once, where the counter reads them.
+const (
+	OptOutVariable = testgate.OptOutVariable
+	optOutValue    = testgate.OptOutValue
+	SkipPrefix     = testgate.OptOutPrefix
+)
 
 // testLabelKey is the label every resource a test creates carries. The product never writes or reads
 // it.
@@ -131,10 +130,12 @@ func decide(r reporter, value string, probe func() (provision.Identity, error)) 
 	return Engine{identity: identity}
 }
 
-// Main runs a Docker test package's tests. A package whose tests build the product calls it from
-// its TestMain.
+// Main runs a Docker test package's tests and then removes the binaries Binary built for them. A
+// package whose tests build the product calls it from its TestMain; Go exits with m.Run's code.
 func Main(m *testing.M) {
 	mainInstalled.Store(true)
+
+	defer processBuilder.remove()
 
 	m.Run()
 }
