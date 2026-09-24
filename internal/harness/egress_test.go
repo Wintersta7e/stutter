@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/harness"
+	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
 	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/toy"
 )
@@ -198,4 +200,53 @@ func TestAdvertisedAddressRendersLogicalHost(t *testing.T) {
 	}
 
 	t.Fatalf("no HTTP effect among %d", len(result.Effects))
+}
+
+// TestSandboxTallyIsItsScripts: a sandbox's tally is what its stub answered across its runs, which a
+// report lists per external host.
+func TestSandboxTallyIsItsScripts(t *testing.T) {
+	t.Parallel()
+
+	store, err := corpus.Start(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("corpus.Start() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	if _, publishErr := store.Publish(
+		t.Context(),
+		toy.SubjectOrderCreated,
+		orderPayload("ORD-TALLY", "W"),
+	); publishErr != nil {
+		t.Fatalf("Publish() error = %v", publishErr)
+	}
+
+	key := make([]byte, hashKeyLen)
+	if _, keyErr := rand.Read(key); keyErr != nil {
+		t.Fatalf("generate hash key: %v", keyErr)
+	}
+
+	built, err := harness.New(harness.Config{
+		Corpus:     store,
+		HTTPRoutes: []httpproxy.Route{{Path: "/claimed", Response: httpproxy.Response{StatusCode: http.StatusOK}}},
+		HashKey:    key,
+		Policy:     observedConfig(),
+		Quiesce:    toy.DefaultQuiesce,
+		Connect: func(_ context.Context, at harness.Addresses) (harness.Service, error) {
+			return &tlsClient{baseURL: at.HTTP, client: &http.Client{Timeout: time.Second}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	if _, err := built.Run(t.Context(), "clean", replay.Clean{}, nil); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	want := []httpproxy.HostTally{{Host: "dependency.invalid", Calls: 1, Routed: 1}}
+	if got := built.Tally(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Tally() = %+v, want %+v", got, want)
+	}
 }

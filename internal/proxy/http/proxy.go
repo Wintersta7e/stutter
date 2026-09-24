@@ -78,7 +78,9 @@ type Route struct {
 
 // Script is the persistent fixture shared by clean and faulted replay runs.
 type Script struct {
-	frozen          map[string][]Response
+	frozen map[string][]Response
+	// tally is what the committed runs answered per host.
+	tally           map[string]*HostTally
 	active          *Run
 	routes          []Route
 	defaultResponse Response
@@ -91,8 +93,10 @@ type Run struct {
 	script   *Script
 	captured map[string][]Response
 	replayed map[string]int
-	capture  bool
-	done     bool
+	// tally is what this run answered per host, kept only if the run commits.
+	tally   map[string]*HostTally
+	capture bool
+	done    bool
 }
 
 // NewScript constructs a fixture. Its configuration is copied, so later caller mutation cannot
@@ -148,6 +152,7 @@ func (r *Run) Commit() error {
 		r.script.frozen = cloneFrozen(r.captured)
 	}
 
+	r.script.keep(r)
 	r.done = true
 	r.script.active = nil
 
@@ -709,9 +714,18 @@ func (s *Script) reply(key string, request *nethttp.Request, logicalHost string)
 		return s.defaultResponse, effect.Observation{Stubbed: true, OffScript: true}
 	}
 
+	host, secure := stableHost(request.Host, logicalHost), request.TLS != nil
+
 	if s.active.capture {
-		response := s.routeResponse(request, logicalHost)
+		response, routed := s.routeResponse(request, host)
 		s.active.captured[key] = append(s.active.captured[key], cloneResponse(response))
+
+		call := HostTally{Host: host, Calls: 1, TLS: secure}
+		if routed {
+			call.Routed = 1
+		}
+
+		s.active.count(call)
 
 		return response, effect.Observation{}
 	}
@@ -720,6 +734,8 @@ func (s *Script) reply(key string, request *nethttp.Request, logicalHost string)
 	queue := s.frozen[key]
 
 	if occurrence >= len(queue) {
+		s.active.count(HostTally{Host: host, OffScript: 1, TLS: secure})
+
 		return s.defaultResponse, effect.Observation{Stubbed: true, OffScript: true}
 	}
 
@@ -728,8 +744,8 @@ func (s *Script) reply(key string, request *nethttp.Request, logicalHost string)
 	return cloneResponse(queue[occurrence]), effect.Observation{Stubbed: true}
 }
 
-func (s *Script) routeResponse(request *nethttp.Request, logicalHost string) Response {
-	host := stableHost(request.Host, logicalHost)
+// routeResponse is the response for a request to host, and whether a declared route matched it.
+func (s *Script) routeResponse(request *nethttp.Request, host string) (Response, bool) {
 	for _, route := range s.routes {
 		if route.Path != request.URL.Path {
 			continue
@@ -743,10 +759,10 @@ func (s *Script) routeResponse(request *nethttp.Request, logicalHost string) Res
 			continue
 		}
 
-		return cloneResponse(route.Response)
+		return cloneResponse(route.Response), true
 	}
 
-	return cloneResponse(s.defaultResponse)
+	return cloneResponse(s.defaultResponse), false
 }
 
 func readBody(body io.ReadCloser) ([]byte, error) {

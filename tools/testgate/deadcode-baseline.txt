@@ -64,3 +64,5 @@ github.com/Wintersta7e/stutter/internal/proxy/http.object
 github.com/Wintersta7e/stutter/internal/proxy/http.responseKeys
 github.com/Wintersta7e/stutter/internal/proxy/http.routesError
 github.com/Wintersta7e/stutter/internal/proxy/http.text
+# Summing the per-host stub tally over consumer checks: called by `stutter check --compose` for its header.
+github.com/Wintersta7e/stutter/internal/proxy/http.SumTallies

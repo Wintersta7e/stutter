@@ -279,6 +279,11 @@ func (s *Sandbox) Timings() Timings {
 	return Timings{Startup: s.startupLimit(), Quiesce: s.quiesce(), Drain: drain}
 }
 
+// Tally is what the sandbox's HTTP stub answered per external host over its committed runs.
+func (s *Sandbox) Tally() []httpproxy.HostTally {
+	return s.httpScript.Tally()
+}
+
 // Reset returns the service's dependencies to the starting position.
 func (s *Sandbox) Reset(ctx context.Context) error {
 	if s.cfg.Reset == nil {
