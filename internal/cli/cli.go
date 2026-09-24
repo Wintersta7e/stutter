@@ -43,7 +43,7 @@ Flags for check and gate:
   --consumer <name>   Name that findings attribute to (default reserve_stock)
 
 Exit codes:
-  0  every consumer passed and the gates held
+  0  every consumer passed and the gates held (gate: the gates held; no fault was injected)
   1  at least one failure
   2  a gate was violated, so no findings were computed — this is not a test failure
   3  setup error, or the command could not be run
