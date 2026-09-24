@@ -373,7 +373,9 @@ func (d *Docker) Remove(tb testing.TB, id string) {
 
 // CreateNetwork creates a network with the test label on subnet, and returns its full ID. A zero
 // subnet takes the next /24 of a range kept for tests that no host interface uses, moving on while
-// the engine reports the one tried overlaps a network it already has.
+// the engine reports the one tried overlaps a network it already has. The network holds its subnet
+// in the engine but puts no address on a host interface: a native engine otherwise gives its bridge
+// the gateway address, and the driver refuses that subnet itself before the engine is asked.
 func (d *Docker) CreateNetwork(tb testing.TB, name string, subnet netip.Prefix, labels map[string]string) string {
 	tb.Helper()
 
@@ -384,7 +386,8 @@ func (d *Docker) CreateNetwork(tb testing.TB, name string, subnet netip.Prefix, 
 	d.fresh(tb, ObjectNetwork, name)
 
 	create := func(on netip.Prefix) answer {
-		args := slices.Concat(labelArgs(d.withTestLabel(labels)), []string{"--subnet", on.String(), name})
+		args := slices.Concat(labelArgs(d.withTestLabel(labels)),
+			[]string{"-o", "com.docker.network.bridge.inhibit_ipv4=true", "--subnet", on.String(), name})
 
 		return d.run(tb, call{verb: verbNetworkCreate, args: args})
 	}
