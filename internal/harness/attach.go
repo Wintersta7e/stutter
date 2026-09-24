@@ -50,11 +50,20 @@ func newHandover(addr net.Addr) *handover {
 	return &handover{addr: addr, conns: make(chan net.Conn), done: make(chan struct{})}
 }
 
-// Accept returns the next handed-over connection, or net.ErrClosed once closed.
+// Accept returns the next handed-over connection, or net.ErrClosed once closed. A connection that
+// arrives as the hand-over closes is reset rather than returned: whoever serves the listener is
+// stopping, and must not be handed work after its close has begun.
 func (h *handover) Accept() (net.Conn, error) {
 	select {
 	case conn := <-h.conns:
-		return conn, nil
+		select {
+		case <-h.done:
+			abort(conn)
+
+			return nil, net.ErrClosed
+		default:
+			return conn, nil
+		}
 	case <-h.done:
 		return nil, net.ErrClosed
 	}
@@ -383,10 +392,8 @@ func (s *Sandbox) serveRelayed(
 	busProxy := natsproxy.New(attached.listener(KeyBus), attached.upstream(KeyBus), sink, bus)
 	observed.start(ctx, KeyBus, ignoringContext(busProxy.Close), busProxy.Serve)
 
-	monitor := &pipe{
-		listener: attached.listener(KeyBusMonitor),
-		route:    func(net.Conn) string { return attached.upstream(KeyBusMonitor) },
-	}
+	monitor := startPipe(ctx, attached.listener(KeyBusMonitor),
+		func(net.Conn) string { return attached.upstream(KeyBusMonitor) })
 	observed.start(ctx, KeyBusMonitor, monitor.close, monitor.serve)
 
 	for _, key := range s.cfg.Listeners.cfg.Postgres {
@@ -421,21 +428,44 @@ type pipe struct {
 	listener net.Listener
 	route    func(conn net.Conn) string
 	failed   error
-	wg       sync.WaitGroup
-	once     sync.Once
-	mu       sync.Mutex
+	// ended closes when the accept loop has returned.
+	ended chan struct{}
+	wg    sync.WaitGroup
+	once  sync.Once
+	mu    sync.Mutex
 }
 
-// serve accepts until the listener closes, and returns the first dial failure.
-func (p *pipe) serve(ctx context.Context) error {
+// startPipe starts accepting on listener. The accept loop counts itself in the pipe's WaitGroup, so
+// each connection's goroutine is added while the count is above zero, never racing stop's wait.
+func startPipe(ctx context.Context, listener net.Listener, route func(conn net.Conn) string) *pipe {
+	started := &pipe{listener: listener, route: route, ended: make(chan struct{})}
+
+	started.wg.Go(func() {
+		defer close(started.ended)
+
+		started.accept(ctx)
+	})
+
+	return started
+}
+
+// accept hands each connection to a goroutine of its own until the listener closes.
+func (p *pipe) accept(ctx context.Context) {
 	for {
 		conn, err := p.listener.Accept()
 		if err != nil {
-			return p.failure()
+			return
 		}
 
 		p.wg.Go(func() { p.splice(ctx, conn) })
 	}
+}
+
+// serve waits for the accept loop to end, and returns the first dial failure: an entry's serve.
+func (p *pipe) serve(context.Context) error {
+	<-p.ended
+
+	return p.failure()
 }
 
 func (p *pipe) splice(ctx context.Context, conn net.Conn) {

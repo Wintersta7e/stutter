@@ -268,13 +268,6 @@ func (s *ListenerSet) Queries() []relay.Query {
 // The addresses are the caller's to give once, because the bus does not restart during the seed phase.
 func (s *ListenerSet) OpenSeedBus(ctx context.Context, client, monitor netip.AddrPort) (uint16, error) {
 	seed := newHandover(nil)
-	bus := &pipe{listener: seed, route: func(conn net.Conn) string {
-		if relayed, ok := conn.(*relay.Conn); ok && relayed.DestinationPort() == MonitorPort {
-			return monitor.String()
-		}
-
-		return client.String()
-	}}
 
 	s.mu.Lock()
 
@@ -284,12 +277,15 @@ func (s *ListenerSet) OpenSeedBus(ctx context.Context, client, monitor netip.Add
 		return 0, errSeedBusOpen
 	}
 
-	s.seedHandover, s.seedBus = seed, bus
-	s.mu.Unlock()
+	s.seedHandover = seed
+	s.seedBus = startPipe(ctx, seed, func(conn net.Conn) string {
+		if relayed, ok := conn.(*relay.Conn); ok && relayed.DestinationPort() == MonitorPort {
+			return monitor.String()
+		}
 
-	s.wg.Go(func() {
-		_ = bus.serve(ctx) //nolint:errcheck // its failure is read, and named, by CloseSeedBus.
+		return client.String()
 	})
+	s.mu.Unlock()
 
 	accepts := func(port uint16) bool { return port == MonitorPort || slices.Contains(s.cfg.Bus, port) }
 
