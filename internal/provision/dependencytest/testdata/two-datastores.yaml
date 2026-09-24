@@ -1,0 +1,44 @@
+# Two Postgres datastores, each migrated by a job of its own.
+name: twodatastores
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+      ORDERS_URL: postgres://postgres@db-a:5432/postgres
+      STOCK_URL: postgres://postgres@db-b:5432/postgres
+    depends_on:
+      migrate-a:
+        condition: service_completed_successfully
+      migrate-b:
+        condition: service_completed_successfully
+
+  bus:
+    image: nats:2.14-alpine
+
+  db-a:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  db-b:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+
+  migrate-a:
+    image: postgres:18-alpine
+    depends_on:
+      db-a:
+        condition: service_started
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-h", "db-a", "-U", "postgres",
+                 "-c", "CREATE TABLE owned (who text); INSERT INTO owned VALUES ('a')"]
+
+  migrate-b:
+    image: postgres:18-alpine
+    depends_on:
+      db-b:
+        condition: service_started
+    entrypoint: ["psql", "-v", "ON_ERROR_STOP=1", "-h", "db-b", "-U", "postgres",
+                 "-c", "CREATE TABLE owned (who text); INSERT INTO owned VALUES ('b')"]
