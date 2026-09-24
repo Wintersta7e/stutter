@@ -100,13 +100,20 @@ func startCrowded(ctx context.Context, at harness.Addresses, config policy.Confi
 }
 
 // Close stops both consumers before the connections go.
-func (c *crowded) Close(context.Context) {
+func (c *crowded) Close(context.Context) (replay.Exit, error) {
 	close(c.done)
 	c.pumps.Wait()
 
 	c.connection.Close()
 
 	_ = c.dependency.Close()
+
+	return replay.Exit{}, nil
+}
+
+// Exited never fires: the service never stops by itself.
+func (*crowded) Exited() <-chan struct{} {
+	return nil
 }
 
 // pump pulls for one consumer, running afterFirstPull once the first pull has finished whatever it

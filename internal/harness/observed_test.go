@@ -74,6 +74,8 @@ type pulling struct {
 type quirks struct {
 	// seen is where a starting service notes what it found. Shared by every run of a sandbox.
 	seen *startups
+	// onStop is called when the service stops consuming under stopAfter.
+	onStop func()
 	// filter is the one subject the service's consumer admits. Empty admits the whole stream.
 	filter string
 	// stream is the stream the service consumes from. Empty is the corpus stream's default name.
@@ -106,6 +108,8 @@ type quirks struct {
 	audit bool
 	// pullExpires is how long each pull lives. Zero is fetchWait.
 	pullExpires time.Duration
+	// stopAfter stops the service consuming once it has handled this many deliveries. Zero never does.
+	stopAfter int
 	// coreSubscribe makes the service also subscribe to the order subject with a core subscription,
 	// beside its consumer.
 	coreSubscribe bool
@@ -240,13 +244,20 @@ func startLate(ctx context.Context, at harness.Addresses, config policy.Config, 
 }
 
 // Close stops the service if it ever came up, after waiting for it to finish coming up.
-func (l *latecomer) Close(ctx context.Context) {
+func (l *latecomer) Close(ctx context.Context) (replay.Exit, error) {
 	close(l.done)
 	<-l.settled
 
-	if l.service != nil {
-		l.service.Close(ctx)
+	if l.service == nil {
+		return replay.Exit{}, nil
 	}
+
+	return l.service.Close(ctx)
+}
+
+// Exited never fires: the service never stops by itself.
+func (*latecomer) Exited() <-chan struct{} {
+	return nil
 }
 
 // startPulling connects the service to the proxied bus and lets it start consuming.
@@ -361,13 +372,20 @@ func handshake(ctx context.Context, address string) error {
 
 // Close stops pulling and waits for the pump before the connections go, so the proxies are not torn
 // down underneath a delivery still being worked on.
-func (p *pulling) Close(context.Context) {
+func (p *pulling) Close(context.Context) (replay.Exit, error) {
 	close(p.done)
 	<-p.stopped
 
 	p.connection.Close()
 
 	_ = p.dependency.Close()
+
+	return replay.Exit{}, nil
+}
+
+// Exited never fires: the service never stops by itself.
+func (*pulling) Exited() <-chan struct{} {
+	return nil
 }
 
 // startup is the service's own work before it consumes: its bucket looked up and made, the seeded
@@ -442,6 +460,8 @@ func (p *pulling) startup(ctx context.Context, stream jetstream.JetStream) error
 func (p *pulling) pump(ctx context.Context) {
 	defer close(p.stopped)
 
+	handled := 0
+
 	for {
 		select {
 		case <-p.done:
@@ -461,6 +481,16 @@ func (p *pulling) pump(ctx context.Context) {
 
 		for msg := range batch.Messages() {
 			p.handle(ctx, msg)
+
+			handled++
+		}
+
+		if p.quirks.stopAfter > 0 && handled >= p.quirks.stopAfter {
+			if p.quirks.onStop != nil {
+				p.quirks.onStop()
+			}
+
+			return
 		}
 	}
 }
@@ -1009,7 +1039,9 @@ func TestCrashBeforeAckIsACrashLoop(t *testing.T) {
 // address it cannot reach does.
 type absent struct{}
 
-func (absent) Close(context.Context) {}
+func (absent) Close(context.Context) (replay.Exit, error) { return replay.Exit{}, nil }
+
+func (absent) Exited() <-chan struct{} { return nil }
 
 // TestAServiceThatNeverConnectedIsNotPassed is the false negative measured against a real container:
 // it never reached a proxy, three runs saw zero effects each, determinism held over two empty

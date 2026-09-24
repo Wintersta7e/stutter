@@ -38,6 +38,8 @@ var (
 	// corpus message, so there is nothing honest to compare it against.
 	errFedBack = errors.New("a message Stutter did not publish reached the consumer under test, " +
 		"and handling it did work")
+	// errRestarted means the engine restarted the service under test during the run.
+	errRestarted = errors.New("the service under test restarted")
 )
 
 // fedBack is the identity a delivery takes when Stutter did not publish its message. No corpus
@@ -73,8 +75,13 @@ const (
 // consumer and acknowledges on its own connection, which is why the run is watched and faulted on
 // the wire rather than driven.
 type Consumer interface {
-	// Close releases the service's connections. It runs BEFORE the proxies are closed.
-	Close(ctx context.Context)
+	// Close stops the service and releases its connections, and reports how it ended. It runs BEFORE
+	// the proxies are closed. It inspects the service BEFORE stopping it: after a kill the exit code is
+	// always the kill's own. Its error carries anything that died beside the service during the run.
+	Close(ctx context.Context) (replay.Exit, error)
+	// Exited closes when the service stops by itself, and never for one Stutter stopped. A service that
+	// cannot stop by itself returns nil, which never fires.
+	Exited() <-chan struct{}
 }
 
 // Start builds a service that consumes for itself, against the proxied addresses.
@@ -124,22 +131,47 @@ func (s *Sandbox) runObserved(
 		)
 	}
 
-	runErr := s.begin(ctx, run, recorder, messages)
-	if runErr == nil {
-		runErr = run.awaitQuiet(ctx, s.drainWait())
+	exit, runErr := s.watch(ctx, observed, service, run, recorder, messages)
+
+	if settleErr := observed.settle(ctx, runErr); settleErr != nil {
+		return replay.Result{}, settleErr
+	}
+
+	result, err := run.result(verdict.Clause)
+	if err != nil {
+		return replay.Result{}, err
+	}
+
+	result.Exit = exit
+
+	return result, nil
+}
+
+// watch takes one run from the service's start to its end: the corpus published once the service has
+// started, the run's end awaited, and the service stopped. It reports how the service ended.
+func (s *Sandbox) watch(
+	ctx context.Context,
+	observed *egress,
+	service Consumer,
+	run *observedRun,
+	recorder *effect.Recorder,
+	messages []corpus.Message,
+) (replay.Exit, error) {
+	ended, runErr := s.begin(ctx, observed, service.Exited(), run, recorder, messages)
+	if runErr == nil && ended == finished {
+		ended, runErr = s.drain(ctx, observed, service.Exited(), run)
 	}
 
 	run.finish()
 
 	// Ordered deliberately: the forwarding proxies wait for in-flight connections, so a service
 	// holding an idle connection open would make teardown hang rather than fail.
-	service.Close(ctx)
-
-	if err := observed.settle(ctx, runErr); err != nil {
-		return replay.Result{}, err
+	exit, closeErr := service.Close(ctx)
+	if closeErr != nil {
+		closeErr = fmt.Errorf("close the service under test: %w", closeErr)
 	}
 
-	return run.result(verdict.Clause)
+	return exit, errors.Join(runErr, run.ended(&exit, ended == targetExited), closeErr)
 }
 
 // prepare returns the part of the corpus this run replays, and restores the whole bus to its starting
@@ -228,20 +260,25 @@ func (s *Sandbox) startingPoint(ctx context.Context) (corpus.Checkpoint, error) 
 // target — and it may run several consumers in one process, whose effects interleave on shared
 // connections with no way to tell them apart. Holding the corpus back makes the first a setup effect;
 // pausing makes the second a service with one consumer.
+//
+// A service that stops by itself while starting ends the wait at once, and nothing is published: there
+// is nothing left to hand the corpus to.
 func (s *Sandbox) begin(
 	ctx context.Context,
+	observed *egress,
+	exited <-chan struct{},
 	run *observedRun,
 	recorder *effect.Recorder,
 	messages []corpus.Message,
-) error {
-	consumers, err := s.awaitStartup(ctx, recorder)
-	if err != nil {
-		return err
+) (interruption, error) {
+	consumers, ended, err := s.awaitStartup(ctx, observed, exited, recorder)
+	if err != nil || ended != finished {
+		return ended, err
 	}
 
 	target, err := s.target(consumers)
 	if err != nil {
-		return err
+		return finished, err
 	}
 
 	for _, other := range consumers {
@@ -250,7 +287,7 @@ func (s *Sandbox) begin(
 		}
 
 		if err := s.cfg.Corpus.Pause(ctx, other); err != nil {
-			return fmt.Errorf("scope the run to consumer %q: %w", target, err)
+			return finished, fmt.Errorf("scope the run to consumer %q: %w", target, err)
 		}
 	}
 
@@ -260,13 +297,13 @@ func (s *Sandbox) begin(
 	// then refuses whatever consumer it creates later.
 	if target != "" {
 		if err := s.cfg.Corpus.Serialise(ctx, target); err != nil {
-			return fmt.Errorf("serialise the consumer under test: %w", err)
+			return finished, fmt.Errorf("serialise the consumer under test: %w", err)
 		}
 	}
 
 	run.scope(target, s.startupLimit())
 
-	return s.fill(ctx, run, target, messages)
+	return finished, s.fill(ctx, run, target, messages)
 }
 
 // awaitStartup waits for the service to create a consumer on the corpus stream — the named one, when
@@ -280,18 +317,24 @@ func (s *Sandbox) begin(
 // the corpus is published regardless: the run then observes nothing, and the observation gate says so
 // and says where to look. Returning an error instead would bury that diagnosis under a timeout. A named
 // consumer still absent at the limit stops the run in target, before anything is published.
-func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) ([]string, error) {
-	ticker := time.NewTicker(drainPoll)
-	defer ticker.Stop()
-
+func (s *Sandbox) awaitStartup(
+	ctx context.Context,
+	observed *egress,
+	exited <-chan struct{},
+	recorder *effect.Recorder,
+) ([]string, interruption, error) {
 	started := time.Now()
 	quietSince, setup := started, recorder.SetupCount()
 
-	for {
-		consumers, err := s.cfg.Corpus.Consumers(ctx)
+	var consumers []string
+
+	ended, err := observed.await(ctx, exited, func(ctx context.Context) (bool, error) {
+		listed, err := s.cfg.Corpus.Consumers(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("watch the service under test start: %w", err)
+			return false, fmt.Errorf("list the corpus stream's consumers: %w", err)
 		}
+
+		consumers = listed
 
 		if count := recorder.SetupCount(); count != setup {
 			quietSince, setup = time.Now(), count
@@ -303,16 +346,14 @@ func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) (
 		}
 
 		settled := created && time.Since(quietSince) >= s.settle()
-		if settled || time.Since(started) >= s.startupLimit() {
-			return consumers, nil
-		}
 
-		select {
-		case <-ctx.Done():
-			return nil, fmt.Errorf("cancelled while the service under test was starting: %w", ctx.Err())
-		case <-ticker.C:
-		}
+		return settled || time.Since(started) >= s.startupLimit(), nil
+	})
+	if err != nil {
+		return nil, ended, fmt.Errorf("watch the service under test start: %w", err)
 	}
+
+	return consumers, ended, nil
 }
 
 // target picks the consumer under test from those the service created.
@@ -381,6 +422,21 @@ func scope(messages []corpus.Message, retain []uint64) []corpus.Message {
 	}
 
 	return scoped
+}
+
+// drain waits for an observed run to end: the bus quiet for the drain period, or the service gone.
+func (s *Sandbox) drain(
+	ctx context.Context,
+	observed *egress,
+	exited <-chan struct{},
+	run *observedRun,
+) (interruption, error) {
+	ended, err := observed.await(ctx, exited, run.quietFor(s.drainWait()))
+	if err != nil {
+		return ended, fmt.Errorf("wait for the run to end: %w", err)
+	}
+
+	return ended, nil
 }
 
 // drainWait is how long the bus must stay silent before an observed run is called finished.
@@ -453,9 +509,12 @@ type observedRun struct {
 	// later is told it missed.
 	startup time.Duration
 	// activity is when the bus was last active, as an offset from began.
-	activity  atomic.Int64
-	delivered atomic.Int64
-	failed    atomic.Int64
+	activity atomic.Int64
+	// lastDelivered is the recorded sequence of the last staged message delivered to the consumer
+	// under test, 0 before the first.
+	lastDelivered atomic.Uint64
+	delivered     atomic.Int64
+	failed        atomic.Int64
 	// foreign counts deliveries to a consumer that is not under test.
 	foreign atomic.Int64
 	// elsewhere counts deliveries on another stream while a window was open.
@@ -512,6 +571,8 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	seq := r.sequence(delivery.Ack.StreamSeq)
 	if seq == fedBack {
 		r.unstaged.Store(delivery.Ack.StreamSeq, struct{}{})
+	} else {
+		r.lastDelivered.Store(seq)
 	}
 
 	r.windows.open(seq, delivery.Payload)
@@ -610,24 +671,38 @@ func (r *observedRun) stage(messages []corpus.Message, first uint64) {
 	r.staged.Store(&subjects)
 }
 
-// awaitQuiet blocks until the bus has handed nothing over and settled nothing for the drain period.
+// quietFor is the wait's condition for the run's end: the bus has handed nothing over and settled
+// nothing for the drain period.
 //
 // Silence is the only honest signal an observed run has that it is over: Stutter no longer decides
 // when to stop delivering.
-func (r *observedRun) awaitQuiet(ctx context.Context, drain time.Duration) error {
-	ticker := time.NewTicker(drainPoll)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("observed run cancelled before the bus went quiet: %w", ctx.Err())
-		case <-ticker.C:
-			if r.silence() >= drain {
-				return nil
-			}
-		}
+func (r *observedRun) quietFor(drain time.Duration) func(context.Context) (bool, error) {
+	return func(context.Context) (bool, error) {
+		return r.silence() >= drain, nil
 	}
+}
+
+// ended reads what the service stopping by itself means for the run, completing its exit with the
+// message it followed. interrupted says the run's own wait ended on the exit.
+//
+// Before its first delivery the service left nothing to compare, whatever run it was, so the run cannot
+// be used. A restart is refused anywhere: the service came back with none of its state, and what it did
+// next cannot be attributed to the message it was handling.
+func (r *observedRun) ended(exit *replay.Exit, interrupted bool) error {
+	exit.After = r.lastDelivered.Load()
+	exit.Exited = exit.Exited || interrupted
+
+	var err error
+
+	if exit.Exited && exit.After == 0 {
+		err = &replay.ExitError{Exit: *exit}
+	}
+
+	if exit.Restarts > 0 {
+		err = errors.Join(err, fmt.Errorf("%w (RestartCount %d): attribution is unsound", errRestarted, exit.Restarts))
+	}
+
+	return err
 }
 
 // finish ends whatever window is still open, once the run is over.

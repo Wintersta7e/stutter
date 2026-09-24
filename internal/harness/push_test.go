@@ -85,13 +85,20 @@ func startPushed(ctx context.Context, at harness.Addresses, config policy.Config
 }
 
 // Close stops the subscription before the connections go.
-func (p *pushed) Close(context.Context) {
+func (p *pushed) Close(context.Context) (replay.Exit, error) {
 	//nolint:errcheck // the connection is closed next either way.
 	_ = p.subscription.Unsubscribe()
 
 	p.connection.Close()
 
 	_ = p.dependency.Close()
+
+	return replay.Exit{}, nil
+}
+
+// Exited never fires: the service never stops by itself.
+func (*pushed) Exited() <-chan struct{} {
+	return nil
 }
 
 // handle reserves stock for one delivery, noting how many more the bus has already pushed behind it.

@@ -231,6 +231,9 @@ type Result struct {
 	// Refusals are the requests the bus declined before the first delivery, with its own code and
 	// description: the likeliest reason a service never consumed.
 	Refusals []effect.Refusal
+	// Exit is how the service under test ended an observed run, read from its Close. Zero on a driven
+	// run, where Stutter's own driver is what stops.
+	Exit Exit
 	// Delivered counts handler invocations, including redeliveries.
 	Delivered int
 	// Failed counts handler invocations that returned an error. A high count on a clean run means
