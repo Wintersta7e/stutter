@@ -1,14 +1,21 @@
 package provision
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"maps"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
+	"github.com/Wintersta7e/stutter/internal/compose"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
 )
 
@@ -19,9 +26,11 @@ import (
 // Templates for the reads that identify a resource before it is used or removed.
 const (
 	containerIDTemplate = `{"id":{{json .Id}},"labels":{{json .Config.Labels}}}`
-	imageIDTemplate     = `{"id":{{json .Id}},"labels":{{json .Config.Labels}}}`
-	networkIDTemplate   = `{"id":{{json .Id}},"labels":{{json .Labels}}}`
-	volumeTemplate      = `{"name":{{json .Name}},"labels":{{json .Labels}}}`
+	// An image's inspect fails outright on a key its JSON lacks, and an unlabelled image has no
+	// Labels key: index returns null instead.
+	imageIDTemplate   = `{"id":{{json .Id}},"labels":{{json (index .Config "Labels")}}}`
+	networkIDTemplate = `{"id":{{json .Id}},"labels":{{json .Labels}}}`
+	volumeTemplate    = `{"name":{{json .Name}},"labels":{{json .Labels}}}`
 )
 
 var (
@@ -435,6 +444,226 @@ func verifyRecorded(rec record, report identified, check string) error {
 	default:
 		return nil
 	}
+}
+
+// BuildSpec is one build of every Stutter-started service with a `build:` key.
+type BuildSpec struct {
+	// Render writes the compose model the build reads, given each service's reserved reference and
+	// its own label set.
+	Render func(tags map[string]string, labels map[string]map[string]string) ([]byte, error)
+	// Services maps each service built to its kind: target, job or dependency.
+	Services map[string]rules.Kind
+	// Dir is the compose project directory.
+	Dir string
+}
+
+// buildKinds are the kinds a build may make.
+func buildKinds() []rules.Kind {
+	return []rules.Kind{rules.KindTarget, rules.KindJob, rules.KindDependency}
+}
+
+// pull lands ref in the user's environment, cancelled with the run. A pulled image is never ledgered
+// and never removed: it is the user's.
+func (e *Engine) pull(ctx context.Context, ref, platform string) error {
+	req := request{verb: verbPull, tail: []arg{{val: ref}}}
+	if platform != "" {
+		req.args = []arg{{val: "--platform"}, {val: platform}}
+	}
+
+	_, err := e.run.call(ctx, req)
+
+	return err
+}
+
+// Build builds every service in one compose invocation under this check's project name, each image
+// under a reference the check reserved and labelled as the check's with the service's own kind. The
+// model goes on stdin; the output goes to the check's logs. Every image is then inspected on the
+// pinned engine: one absent or without this check's labels is a named build failure.
+func (e *Engine) Build(ctx context.Context, spec BuildSpec) (map[string]compose.Image, error) {
+	if e.book.containerCreated() {
+		return nil, fmt.Errorf("%w: a build asked for after the first container", ErrImage)
+	}
+
+	services := slices.Sorted(maps.Keys(spec.Services))
+	tags, labels := map[string]string{}, map[string]map[string]string{}
+	recs := make([]record, 0, len(services))
+
+	for _, service := range services {
+		kind := spec.Services[service]
+		if !slices.Contains(buildKinds(), kind) {
+			return nil, fmt.Errorf("%w: service %s cannot be built as a %s", ErrImage, service, kind)
+		}
+
+		rec, err := e.intend(ResourceImage, kind, service, func(seq int) string { return imageRef(e.id, kind, seq) })
+		if err != nil {
+			return nil, err
+		}
+
+		recs = append(recs, rec)
+		tags[service], labels[service] = rec.name, labelSet(e.id, kind, service)
+	}
+
+	if err := e.runBuild(ctx, spec, recs, tags, labels); err != nil {
+		return nil, errors.Join(err, e.resolveAll(ctx, recs))
+	}
+
+	out := make(map[string]compose.Image, len(recs))
+
+	for _, rec := range recs {
+		image, err := e.verifyImage(ctx, rec, "")
+		if err != nil {
+			return nil, fmt.Errorf("%w: the build of service %s: %w", ErrImage, rec.service, err)
+		}
+
+		out[rec.service] = image
+	}
+
+	return out, nil
+}
+
+// runBuild renders the model and runs the one compose build, its output in the check's logs.
+func (e *Engine) runBuild(
+	ctx context.Context, spec BuildSpec, recs []record, tags map[string]string, labels map[string]map[string]string,
+) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
+	model, err := spec.Render(tags, labels)
+	if err != nil {
+		return fmt.Errorf("%w: render the build model: %w", ErrImage, err)
+	}
+
+	path := filepath.Join(e.private, logsDir, "build-"+strconv.Itoa(recs[0].seq)+".log")
+
+	output, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fileMode)
+	if err != nil {
+		return fmt.Errorf("%w: create the build log: %w", ErrImage, err)
+	}
+
+	req := request{
+		verb: verbComposeBuild, dir: spec.Dir, stdin: bytes.NewReader(model), stdout: output, stderr: output,
+		args: []arg{{val: e.Project()}},
+	}
+
+	for _, rec := range recs {
+		req.tail = append(req.tail, arg{val: rec.service})
+	}
+
+	_, err = e.run.call(ctx, req)
+	if closeErr := output.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+
+	if err != nil {
+		return fmt.Errorf("%w: the build failed; its output is in %s: %w", ErrImage, path, err)
+	}
+
+	return nil
+}
+
+// resolveAll settles the intents of a failed build by reference: an image that landed anyway with
+// this check's labels is removed.
+func (e *Engine) resolveAll(ctx context.Context, recs []record) error {
+	errs := make([]error, 0, len(recs))
+
+	for _, rec := range recs {
+		errs = append(errs, e.resolveIntent(ctx, e.book, rec))
+	}
+
+	return errors.Join(errs...)
+}
+
+// Import makes an image from a tar on stdin, labelled as this check's with changes applied, under a
+// reference the check reserved. It needs no builder and leaves no build cache.
+func (e *Engine) Import(ctx context.Context, kind rules.Kind, tar io.Reader, changes []string) (compose.Image, error) {
+	rec, err := e.intend(ResourceImage, kind, "", func(seq int) string { return imageRef(e.id, kind, seq) })
+	if err != nil {
+		return compose.Image{}, err
+	}
+
+	args := labelChanges(labelSet(e.id, kind, ""))
+	for _, change := range changes {
+		args = append(args, arg{val: "--change"}, arg{val: change})
+	}
+
+	res, err := e.run.call(ctx, request{verb: verbImport, stdin: tar, args: args, tail: []arg{{val: rec.name}}})
+	if err != nil {
+		return compose.Image{}, errors.Join(fmt.Errorf("%w: import %s: %w", ErrImage, rec.name, err),
+			e.resolveIntent(ctx, e.book, rec))
+	}
+
+	return e.verifyImage(ctx, rec, strings.TrimSpace(string(res.out)))
+}
+
+// Commit makes an image of a container's writable layer — never its volumes, tmpfs or binds —
+// labelled as this check's with kind, under a reference the check reserved first.
+func (e *Engine) Commit(ctx context.Context, c *Container, kind rules.Kind) (compose.Image, error) {
+	if err := e.owns(c); err != nil {
+		return compose.Image{}, err
+	}
+
+	from, _ := e.book.record(c.seq)
+
+	rec, err := e.intend(ResourceImage, kind, from.service, func(seq int) string { return imageRef(e.id, kind, seq) })
+	if err != nil {
+		return compose.Image{}, err
+	}
+
+	args := append(labelChanges(labelSet(e.id, kind, from.service)), arg{val: c.id})
+
+	res, err := e.run.call(ctx, request{verb: verbCommit, args: args, tail: []arg{{val: rec.name}}})
+	if err != nil {
+		return compose.Image{}, errors.Join(fmt.Errorf("%w: commit %s: %w", ErrImage, c.name, err),
+			e.resolveIntent(ctx, e.book, rec))
+	}
+
+	return e.verifyImage(ctx, rec, strings.TrimSpace(string(res.out)))
+}
+
+// labelChanges renders labels as `--change 'LABEL key="value"'`, in key order.
+func labelChanges(labels map[string]string) []arg {
+	out := make([]arg, 0, len(labels)+len(labels))
+
+	for _, key := range slices.Sorted(maps.Keys(labels)) {
+		out = append(out, arg{val: "--change"}, arg{val: "LABEL " + key + "=" + strconv.Quote(labels[key])})
+	}
+
+	return out
+}
+
+// verifyImage records the ID an image create returned — or, for a build, the one its reference
+// resolves to — and proves by inspect that the reference names it with this check's labels, then
+// pins it.
+func (e *Engine) verifyImage(ctx context.Context, rec record, id string) (compose.Image, error) {
+	image, found, err := e.inspectImage(ctx, rec.name)
+	if err != nil {
+		return compose.Image{}, err
+	}
+
+	if !found {
+		return compose.Image{}, fmt.Errorf("%w: %s is absent on the engine", ErrImage, rec.name)
+	}
+
+	if id == "" {
+		id = image.ID
+	}
+
+	if err := e.created(&rec, id); err != nil {
+		return compose.Image{}, err
+	}
+
+	if image.ID != id || !ours(image.Labels, e.id, rec.kind) {
+		return compose.Image{}, notOurs(ResourceImage, rec.name, rec.kind, image.Labels, e.id)
+	}
+
+	if err := e.book.note(entry{Seq: rec.seq, Op: opVerified, Type: ResourceImage}); err != nil {
+		return compose.Image{}, err
+	}
+
+	e.pin(rec.name, image)
+
+	return image, nil
 }
 
 // killContainer stops a container b records with SIGKILL, after verifying it is still that one:

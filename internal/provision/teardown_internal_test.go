@@ -164,7 +164,7 @@ func TestRetentionFollowsTheOutcome(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, "worker")
+		plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, testService)
 		stagePrivate(t, engine)
 
 		down := engine.Close(t.Context(), tc.retention)
@@ -255,7 +255,7 @@ func TestTeardownOrderIsByType(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second := plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, "worker")
+	second := plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, testService)
 
 	if down := engine.Close(t.Context(), DiscardLogs); down.Err != nil {
 		t.Fatalf("Close: %v", down.Err)
@@ -349,7 +349,7 @@ func TestTheAuditLineCountsEveryType(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	container := plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, "worker")
+	container := plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, testService)
 	appendBook(t, engine.book, entry{
 		Seq: engine.book.led.next(), Op: opCreated, Type: ResourceVolume, Kind: rules.KindTarget,
 		Name: strings.Repeat("a", 64), Parent: container.seq,
@@ -395,11 +395,11 @@ func TestAKeptCheckNamesEverySecretBearingResource(t *testing.T) {
 	engine, fake := openFakeEngineOpts(t, Options{Keep: true})
 
 	secret := map[string]record{
-		"snapshot": plantRecord(t, engine, fake, ResourceImage, rules.KindSnapshot, "db"),
-		"target":   plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, "worker"),
-		"seed":     plantRecord(t, engine, fake, ResourceContainer, rules.KindSeed, "db"),
-		"template": plantRecord(t, engine, fake, ResourceVolume, rules.KindTemplateVolume, "db"),
-		"restore":  plantRecord(t, engine, fake, ResourceVolume, rules.KindRestore, "db"),
+		"snapshot":   plantRecord(t, engine, fake, ResourceImage, rules.KindSnapshot, "db"),
+		"run target": plantRecord(t, engine, fake, ResourceContainer, rules.KindTarget, testService),
+		"seed":       plantRecord(t, engine, fake, ResourceContainer, rules.KindSeed, "db"),
+		"template":   plantRecord(t, engine, fake, ResourceVolume, rules.KindTemplateVolume, "db"),
+		"restore":    plantRecord(t, engine, fake, ResourceVolume, rules.KindRestore, "db"),
 	}
 	plain := []record{
 		plantRecord(t, engine, fake, ResourceContainer, rules.KindRelay, ""),

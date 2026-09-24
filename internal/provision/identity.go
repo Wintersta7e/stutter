@@ -16,6 +16,9 @@ import (
 	"github.com/Wintersta7e/stutter/internal/compose"
 )
 
+// composePlugin is the docker CLI plugin that runs compose.
+const composePlugin = "compose"
+
 // Templates for the three precondition reads. Each builds a snake_case JSON object inside the
 // template, so nothing decodes the engine's own field names.
 const (
@@ -201,7 +204,7 @@ func readInfo(ctx context.Context, runner *execRunner, identity *Identity) error
 	}
 
 	for _, plugin := range found.Plugins {
-		if plugin.Name == "compose" {
+		if plugin.Name == composePlugin {
 			identity.Compose = plugin.Version
 		}
 	}

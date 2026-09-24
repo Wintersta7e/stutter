@@ -41,6 +41,7 @@ type openDeps struct {
 type Engine struct {
 	run        engineCaller
 	book       *book
+	pins       map[string]compose.Image
 	interfaces func() ([]localAddr, error)
 	log        *invLog
 	identity   Identity

@@ -25,6 +25,8 @@ var (
 	// ErrSubnetOverlap means a requested subnet is not a masked IPv4 prefix, or intersects a prefix
 	// of a local interface; it is refused before any call.
 	ErrSubnetOverlap = errors.New("subnet refused")
+	// ErrImage means an image could not be resolved, built, imported or committed as this check's.
+	ErrImage = errors.New("image failure")
 	// ErrLive means clean was asked for a check whose owner still holds its ledger's lock.
 	ErrLive = errors.New("the check is still running")
 )

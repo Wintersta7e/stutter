@@ -42,6 +42,10 @@ const (
 	verbVolumeList
 	verbImageList
 	verbKill
+	verbPull
+	verbComposeBuild
+	verbImport
+	verbCommit
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -213,6 +217,32 @@ func verbs() [verbCount]verbSpec {
 			name: "kill", program: programDocker, prefix: []string{"stop", "--signal", "KILL"},
 			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
 		},
+		verbPull: {
+			name: "pull", program: programDocker, prefix: []string{"pull", "-q"},
+			mode: modeUser, deadline: deadlineLong, stderr: stderrFirstLine, mutates: true,
+		},
+		verbComposeBuild: {
+			name:    "composeBuild",
+			program: programCompose,
+			prefix:  []string{"compose", "-p"},
+			suffix: []string{
+				"-f",
+				"-",
+				"build",
+			},
+			mode:     modeUser,
+			deadline: deadlineLong,
+			stderr:   stderrCount,
+			mutates:  true,
+		},
+		verbImport: {
+			name: "import", program: programDocker, prefix: []string{"import"}, suffix: []string{"-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCommit: {
+			name: "commit", program: programDocker, prefix: []string{"commit"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
 	}
 }
 
@@ -234,8 +264,10 @@ type arg struct {
 
 // request is one call: a verb, its typed arguments and tail, and which fixed form it takes.
 type request struct {
-	stdin    io.Reader
-	stdout   io.Writer
+	stdin  io.Reader
+	stdout io.Writer
+	// stderr, when set, receives the call's stderr too: a build's output goes to its log file.
+	stderr   io.Writer
 	dir      string
 	args     []arg
 	tail     []arg
@@ -553,6 +585,10 @@ func spawn(
 
 	if req.stdout != nil {
 		cmd.Stdout = req.stdout
+	}
+
+	if req.stderr != nil {
+		cmd.Stderr = io.MultiWriter(sink, req.stderr)
 	}
 
 	runtime.LockOSThread()

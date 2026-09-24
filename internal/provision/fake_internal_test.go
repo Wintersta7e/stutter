@@ -9,6 +9,9 @@ import (
 	"testing"
 )
 
+// testService is the compose service tests name.
+const testService = "worker"
+
 // fakeCaller is a scripted engine: it records every request and answers each from answer.
 type fakeCaller struct {
 	answer    func(req request) (result, error)

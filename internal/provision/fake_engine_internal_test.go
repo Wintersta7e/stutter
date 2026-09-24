@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"maps"
 	"net/netip"
 	"os"
 	"slices"
@@ -19,6 +21,8 @@ import (
 // fakeObject is one resource the fake engine holds.
 type fakeObject struct {
 	labels   map[string]string
+	volumes  map[string]any
+	env      []string
 	id       string
 	name     string
 	subnet   string
@@ -44,8 +48,10 @@ type fakeEngine struct {
 	// afterCreate, when set, edits a network or volume as the engine reports it after create.
 	afterCreate func(typ ResourceType, obj *fakeObject)
 	// hang names verbs whose calls block until their context ends, as a hung engine does.
-	hang        map[string]bool
-	logCall     func(callLine)
+	hang    map[string]bool
+	logCall func(callLine)
+	// registry holds the images a pull can land, by reference.
+	registry    map[string]*fakeObject
 	ledgerPath  string
 	configDir   string
 	calls       []fakeCall
@@ -54,6 +60,8 @@ type fakeEngine struct {
 	unreachable bool
 	// readOnly refuses mutating calls, as a runner attached read-only does.
 	readOnly bool
+	// buildDropsLabels makes a build land images without the labels it was handed.
+	buildDropsLabels bool
 }
 
 func newFakeEngine() *fakeEngine {
@@ -88,6 +96,10 @@ func (f *fakeEngine) mintID() string {
 
 // find resolves ref as the engine does: by ID, then by name, then by an image tag.
 func (f *fakeEngine) find(typ ResourceType, ref string) *fakeObject {
+	if ref == "" {
+		return nil
+	}
+
 	if obj, ok := f.objects[typ][ref]; ok {
 		return obj
 	}
@@ -159,7 +171,113 @@ func (f *fakeEngine) call(ctx context.Context, req request) (result, error) {
 
 	rest := argv[len(spec.prefix):]
 
+	if answer, ok := f.imageAnswers(req, spec, rest); ok {
+		return answer()
+	}
+
 	return f.answer(req.verb, spec, rest)
+}
+
+// imageAnswers answers the calls that make images: pull, build, import and commit.
+func (f *fakeEngine) imageAnswers(req request, spec verbSpec, rest []string) (func() (result, error), bool) {
+	answers := map[verb]func() (result, error){
+		verbPull:         func() (result, error) { return f.pull(spec, rest[len(rest)-1]) },
+		verbComposeBuild: func() (result, error) { return f.build(req.stdin) },
+		verbImport:       func() (result, error) { return f.importImage(rest) },
+		verbCommit:       func() (result, error) { return f.commit(spec, rest) },
+	}
+
+	answer, ok := answers[req.verb]
+
+	return answer, ok
+}
+
+// pull lands a registry image under ref, as a pull does.
+func (f *fakeEngine) pull(spec verbSpec, ref string) (result, error) {
+	image, ok := f.registry[ref]
+	if !ok {
+		return fail(spec, "pull access denied for "+ref)
+	}
+
+	pulled := *image
+	pulled.tags = []string{ref}
+
+	if existing := f.find(ResourceImage, image.id); existing != nil {
+		existing.tags = append(existing.tags, ref)
+	} else {
+		f.objects[ResourceImage][pulled.id] = &pulled
+	}
+
+	return result{out: []byte(ref + "\n")}, nil
+}
+
+// fakeBuild is what a test's render function hands the fake's build: per service, a tag and labels.
+type fakeBuild map[string]struct {
+	Labels map[string]string `json:"labels"`
+	Tag    string            `json:"tag"`
+}
+
+// build lands one image per service of the rendered model, dropping labels when told to.
+func (f *fakeEngine) build(stdin io.Reader) (result, error) {
+	var model fakeBuild
+	if err := json.NewDecoder(stdin).Decode(&model); err != nil {
+		return result{exit: 1}, &CallError{Verb: "composeBuild", Code: 1}
+	}
+
+	for _, service := range model {
+		labels := service.Labels
+		if f.buildDropsLabels {
+			labels = map[string]string{}
+		}
+
+		id := "sha256:" + f.mintID()
+		f.objects[ResourceImage][id] = &fakeObject{id: id, tags: []string{service.Tag}, labels: labels}
+	}
+
+	return result{}, nil
+}
+
+// changes reads `--change 'LABEL k="v"'` arguments into labels.
+func changes(args []string) map[string]string {
+	labels := map[string]string{}
+
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] != "--change" {
+			continue
+		}
+
+		key, value, ok := strings.Cut(strings.TrimPrefix(args[i+1], "LABEL "), "=")
+		if ok {
+			labels[key] = strings.Trim(value, `"`)
+		}
+	}
+
+	return labels
+}
+
+// importImage lands an image whose labels come from its --change lines, tagged with the last argument.
+func (f *fakeEngine) importImage(rest []string) (result, error) {
+	id := "sha256:" + f.mintID()
+	f.objects[ResourceImage][id] = &fakeObject{id: id, tags: []string{rest[len(rest)-1]}, labels: changes(rest)}
+
+	return result{out: []byte(id + "\n")}, nil
+}
+
+// commit lands an image from a container: its labels, overridden by the --change lines.
+func (f *fakeEngine) commit(spec verbSpec, rest []string) (result, error) {
+	container := f.find(ResourceContainer, rest[len(rest)-2])
+	if container == nil {
+		return fail(spec, "No such container")
+	}
+
+	labels := map[string]string{}
+	maps.Copy(labels, container.labels)
+	maps.Copy(labels, changes(rest))
+
+	id := "sha256:" + f.mintID()
+	f.objects[ResourceImage][id] = &fakeObject{id: id, tags: []string{rest[len(rest)-1]}, labels: labels}
+
+	return result{out: []byte(id + "\n")}, nil
 }
 
 func (f *fakeEngine) answer(v verb, spec verbSpec, rest []string) (result, error) {
@@ -342,6 +460,12 @@ func (o *fakeObject) report(typ ResourceType) map[string]any {
 	}
 
 	out["id"] = o.id
+
+	if typ == ResourceImage {
+		out["env"], out["entrypoint"], out["cmd"] = o.env, []string{"entry"}, []string{"run"}
+		out["exposed"], out["volumes"] = map[string]any{"5432/tcp": map[string]any{}}, o.volumes
+		out["os"], out["arch"] = "linux", "amd64"
+	}
 
 	if typ == ResourceNetwork {
 		out["name"], out["internal"], out["ipv6"] = o.name, o.internal, o.ipv6

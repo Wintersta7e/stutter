@@ -76,7 +76,7 @@ func plantLedger(t *testing.T, state string, fake *fakeEngine, p plant) planted 
 	labels := labelSet(id, rules.KindTarget, "")
 
 	if p.foreign {
-		labels = map[string]string{rules.LabelCheck: strings.Repeat("e", 32), rules.LabelKind: "target"}
+		labels = map[string]string{rules.LabelCheck: strings.Repeat("e", 32), rules.LabelKind: string(rules.KindTarget)}
 	}
 
 	if !p.noObject {

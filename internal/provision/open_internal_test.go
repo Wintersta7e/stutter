@@ -175,7 +175,7 @@ func TestComposeConfigNeverQuotesItsStderr(t *testing.T) {
 		t.Errorf("error %q, stderr lines %d: want the sentinel unquoted and one line counted", err, lines)
 	}
 
-	for _, read := range []compose.ConfigRead{{Environment: true}, {Service: "worker"}} {
+	for _, read := range []compose.ConfigRead{{Environment: true}, {Service: testService}} {
 		if _, _, err := engine.ComposeConfig(t.Context(), dir, []string{"-f", "compose.yaml"}, read); err == nil {
 			t.Fatalf("ComposeConfig(%+v) succeeded against a failing shim", read)
 		}

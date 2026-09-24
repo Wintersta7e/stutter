@@ -551,6 +551,18 @@ func (b *book) engineDone(confirmed map[int]bool) bool {
 	return true
 }
 
+// containerCreated reports whether the check has created a container: from then on nothing is
+// pulled or built.
+func (b *book) containerCreated() bool {
+	for _, rec := range b.all() {
+		if rec.typ == ResourceContainer && rec.state != opIntent && rec.state != opAbsent {
+			return true
+		}
+	}
+
+	return false
+}
+
 // allRemoved reports whether every engine resource the ledger names is verified gone, with no
 // absent intent left to confirm.
 func (b *book) allRemoved() bool {
