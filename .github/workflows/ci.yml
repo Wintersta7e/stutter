@@ -81,19 +81,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
 
-      - name: Test with race detection
-        # -count=1 defeats the test cache: a cached pass proves nothing about this commit.
-        run: go test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: Prove the database suite actually ran
-        # A skipped integration suite prints the same "ok" as one that ran. Assert
-        # that the tests needing a database really executed.
+      - name: The engine this Docker suite runs against
+        # The Docker tests fail without an engine, so this job is the Docker job. The compose version
+        # is read from docker info's plugin list.
         run: |
-          go test -run 'TestCheckAgainstAReferenceConsumer' -count=1 -v ./internal/cli/ | tee run.log
-          if grep -q -- '--- SKIP' run.log; then
-            echo "::error::the database-backed suite skipped; CI proved nothing"
-            exit 1
-          fi
+          docker version
+          docker info
+
+      - name: Test with race detection
+        # Uncached, and counted: a cached pass proves nothing about this commit, and a skipped test
+        # prints the same "ok" as one that ran. The counter fails on any skip.
+        run: make test
 
       - name: Coverage floor
         run: |
@@ -177,6 +175,25 @@ jobs:
         # CGO in the environment must not override the Makefile's plain default; only a CGO=1 on
         # make's own command line may, and nothing in CI passes one.
         run: CGO=1 make build BIN=stutter-env && make static-check BIN=stutter-env
+      - name: A Docker test fails without an engine and skips only when opted out
+        env:
+          DOCKER_HOST: unix:///nonexistent.sock
+        run: |
+          set -uo pipefail
+          dir="$RUNNER_TEMP/optout"; mkdir -p "$dir"
+          probe() { go test -count=1 -json -run '^TestTheEngineAnswers$' ./internal/dockertest/; }
+          (unset STUTTER_TEST_DOCKER; probe) > "$dir/unset.json"
+          STUTTER_TEST_DOCKER=skip probe > "$dir/skip.json"
+          STUTTER_TEST_DOCKER=bogus probe > "$dir/bogus.json"
+          set -e
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action fail < "$dir/unset.json"
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action skip -reason 'STUTTER_TEST_DOCKER=skip:' < "$dir/skip.json"
+          go run ./tools/testgate expect -test TestTheEngineAnswers -action fail < "$dir/bogus.json"
+          if STUTTER_TEST_DOCKER=skip go run ./tools/testgate count < "$dir/skip.json" > "$dir/count.out"; then
+            cat "$dir/count.out"; echo "::error::the counter accepted an opted-out Docker suite in CI"; exit 1
+          fi
+          cat "$dir/count.out"
+          grep -q '^refused: STUTTER_TEST_DOCKER=skip' "$dir/count.out"
       - name: version and help succeed
         run: |
           ./stutter version

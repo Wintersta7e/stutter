@@ -26,8 +26,8 @@ lint: ## Run the full linter set
 	golangci-lint run
 
 .PHONY: test
-test: ## Race-enabled, shuffled, with coverage
-	$(GO) test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+test: ## Race-enabled, shuffled, uncached, with coverage; every outcome counted, any skip fails
+	$(GO) test -race -shuffle=on -count=1 -covermode=atomic -coverprofile=coverage.out -json ./... | $(TESTGATE) count
 
 .PHONY: build
 build: ## Build the CLI: the one build of the product, static unless CGO=1 is passed to make
