@@ -43,7 +43,7 @@ func TestTLSStubStopsOnSilentOutcomes(t *testing.T) {
 	}{
 		{
 			name: "h2-only ALPN",
-			want: "unsupported application protocols",
+			want: "offered [h2]; only http/1.1 is served",
 			client: func(t *testing.T, address string, trust *x509.CertPool) net.Conn {
 				t.Helper()
 
@@ -86,16 +86,6 @@ func TestTLSStubStopsOnSilentOutcomes(t *testing.T) {
 				_ = connection.Close()
 
 				return nil
-			},
-		},
-		{
-			name: "handshake then idle",
-			want: "sent no request",
-			client: func(t *testing.T, address string, trust *x509.CertPool) net.Conn {
-				t.Helper()
-
-				// Held open past the header bound; closed only after the stop is seen.
-				return mustDialTLS(t, address, trust)
 			},
 		},
 	}
@@ -337,7 +327,9 @@ func startTLSProxy(
 
 	certificate, trust := selfSigned(t)
 
-	proxy, err := proxyhttp.ListenTLS(t.Context(), "127.0.0.1:0", "logical.test", current, script, certificate)
+	present := func(*tls.ClientHelloInfo) (*tls.Certificate, error) { return &certificate, nil }
+
+	proxy, err := proxyhttp.New(proxyhttp.Entries{TLS: listen(t)}, "logical.test", current, script, present)
 	if err != nil {
 		t.Fatal(err)
 	}

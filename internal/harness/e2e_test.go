@@ -611,7 +611,6 @@ func tlsSandbox(
 	built, err := harness.New(harness.Config{
 		Corpus:   store,
 		HTTPHost: guardHost,
-		HTTPTLS:  true,
 		HashKey:  key,
 		Policy:   config,
 		Quiesce:  50 * time.Millisecond,
@@ -622,7 +621,7 @@ func tlsSandbox(
 			}
 
 			return &tlsClient{
-				baseURL: at.HTTP,
+				baseURL: at.HTTPS,
 				client: &http.Client{
 					Timeout: time.Second,
 					Transport: &http.Transport{

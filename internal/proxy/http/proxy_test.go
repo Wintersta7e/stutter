@@ -758,7 +758,7 @@ func doRequest(t *testing.T, proxy *proxyhttp.Proxy, method, path, body string) 
 func startProxy(t *testing.T, current proxyhttp.Sink, script *proxyhttp.Script) (*proxyhttp.Proxy, <-chan error) {
 	t.Helper()
 
-	proxy, err := proxyhttp.Listen(t.Context(), "127.0.0.1:0", "logical.test", current, script)
+	proxy, err := proxyhttp.New(proxyhttp.Entries{Cleartext: listen(t)}, "logical.test", current, script, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,6 +767,20 @@ func startProxy(t *testing.T, current proxyhttp.Sink, script *proxyhttp.Script) 
 	go func() { done <- proxy.Serve(t.Context()) }()
 
 	return proxy, done
+}
+
+// listen binds a loopback listener on a kernel-assigned port.
+func listen(t *testing.T) net.Listener {
+	t.Helper()
+
+	var config net.ListenConfig
+
+	listener, err := config.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return listener
 }
 
 func closeProxy(t *testing.T, proxy *proxyhttp.Proxy, done <-chan error) {

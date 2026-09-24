@@ -3,7 +3,6 @@ package harness_test
 import (
 	"context"
 	"net"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -223,32 +222,25 @@ func TestANakDelayLengthensTheOwedLimit(t *testing.T) {
 	}
 }
 
-// encryptedStart writes the opening bytes of a TLS handshake to the cleartext HTTP stub and hangs up,
-// as a client configured for TLS does: the stub cannot read it, and stops.
-func encryptedStart(ctx context.Context, t *testing.T, stub string) {
+// unreachableDependency names a dependency whose real address nothing listens on: its proxy cannot
+// dial it, and stops.
+const unreachableDependency = "unreachable"
+
+// reachUnreachable dials the proxy in front of the unreachable dependency and hangs up, as a service
+// reaching a dependency that is down does: the proxy's dial fails, and it stops.
+func reachUnreachable(ctx context.Context, t *testing.T, proxy string) {
 	t.Helper()
-
-	address, err := url.Parse(stub)
-	if err != nil {
-		t.Errorf("parse the stub address: %v", err)
-
-		return
-	}
 
 	dialer := net.Dialer{Timeout: time.Second}
 
-	conn, err := dialer.DialContext(ctx, "tcp", address.Host)
+	conn, err := dialer.DialContext(ctx, "tcp", proxy)
 	if err != nil {
-		t.Errorf("dial the stub: %v", err)
+		t.Errorf("dial the proxy: %v", err)
 
 		return
 	}
 
-	defer func() { _ = conn.Close() }()
-
-	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x00}); err != nil {
-		t.Errorf("start a TLS handshake: %v", err)
-	}
+	_ = conn.Close()
 }
 
 // TestTheRunEndsAtOnceOnAProxyError: a proxy that stops mid-run leaves the service's traffic unobserved,
@@ -263,12 +255,15 @@ func TestTheRunEndsAtOnceOnAProxyError(t *testing.T) {
 
 	var stopped time.Time
 
+	down := closedPort(t)
+
 	built, _ := quirkySandbox(t, config, quirks{}, func(settings *harness.Config) {
+		settings.Opaque[unreachableDependency] = down.String()
 		settings.Start = func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
 			stop := func() {
 				stopped = time.Now()
 
-				encryptedStart(ctx, t, at.HTTP)
+				reachUnreachable(ctx, t, at.Opaque[unreachableDependency])
 			}
 
 			service, err := startPulling(ctx, at, config, quirks{stopAfter: 1, onStop: stop})
@@ -286,10 +281,10 @@ func TestTheRunEndsAtOnceOnAProxyError(t *testing.T) {
 	_, err := built.Run(ctx, "clean-1", replay.Clean{}, nil)
 
 	elapsed := time.Since(stopped)
-	t.Logf("the run returned %s after the stub was sent TLS: %v", elapsed, err)
+	t.Logf("the run returned %s after the proxy's dial failed: %v", elapsed, err)
 
-	if err == nil || !strings.Contains(err.Error(), "used TLS") {
-		t.Fatalf("Run() error = %v, want the stub's own error", err)
+	if err == nil || !strings.Contains(err.Error(), down.String()) {
+		t.Fatalf("Run() error = %v, want the proxy's own error naming %s", err, down)
 	}
 
 	if elapsed > 2*time.Second {
@@ -304,10 +299,13 @@ func TestAProxyErrorDuringStartupEndsTheWait(t *testing.T) {
 
 	const startup = 5 * time.Second
 
+	down := closedPort(t)
+
 	built, _ := quirkySandbox(t, observedConfig(), quirks{}, func(settings *harness.Config) {
 		settings.Startup = startup
+		settings.Opaque[unreachableDependency] = down.String()
 		settings.Start = func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
-			encryptedStart(ctx, t, at.HTTP)
+			reachUnreachable(ctx, t, at.Opaque[unreachableDependency])
 
 			return absent{}, nil
 		}
@@ -323,8 +321,8 @@ func TestAProxyErrorDuringStartupEndsTheWait(t *testing.T) {
 	elapsed := time.Since(began)
 	t.Logf("the run returned after %s (startup limit %s): %v", elapsed, startup, err)
 
-	if err == nil || !strings.Contains(err.Error(), "used TLS") {
-		t.Fatalf("Run() error = %v, want the stub's own error", err)
+	if err == nil || !strings.Contains(err.Error(), down.String()) {
+		t.Fatalf("Run() error = %v, want the proxy's own error naming %s", err, down)
 	}
 
 	if elapsed >= startup {
