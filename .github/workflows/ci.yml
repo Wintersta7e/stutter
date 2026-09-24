@@ -46,6 +46,10 @@ jobs:
         run: golangci-lint fmt --diff
       - name: One build definition
         run: make buildscan
+      - name: Functions unreachable from the CLI
+        # The set must equal the committed baseline: a new name is a function nothing calls, and a
+        # baseline name no longer reported was wired or deleted without the baseline following.
+        run: make deadcode
       - name: Workflows are valid
         run: |
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"

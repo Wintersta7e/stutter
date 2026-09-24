@@ -9,6 +9,9 @@ PKG ?= ./cmd/stutter
 # silently make the release dynamic.
 CGO = 0
 TESTGATE := $(GO) run ./tools/testgate
+# The one pin of the unreachable-function check, shared by CI and the local gate; go run leaves go.mod
+# untouched.
+DEADCODE_VERSION := v0.50.0
 
 .PHONY: all
 all: fmt lint test build
@@ -45,6 +48,11 @@ static-check: ## Fail unless $(BIN) was built without cgo and has no ELF interpr
 buildscan: ## Fail unless the Makefile's build recipe is the only build of the product
 	git ls-files -z | $(TESTGATE) builddef $(BUILDSCAN_EXTRA)
 
+.PHONY: deadcode
+deadcode: ## Fail unless the functions unreachable from the CLI equal the committed baseline
+	$(GO) run golang.org/x/tools/cmd/deadcode@$(DEADCODE_VERSION) -json ./cmd/stutter | \
+		$(TESTGATE) deadcode tools/testgate/deadcode-baseline.txt
+
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities
 	govulncheck ./...
@@ -54,7 +62,7 @@ tidy: ## Fail if go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
 
 .PHONY: ci
-ci: fmt-check lint buildscan tidy test vuln build static-check ## Everything CI runs, locally
+ci: fmt-check lint buildscan deadcode tidy test vuln build static-check ## Everything CI runs, locally
 
 .PHONY: clean
 clean:

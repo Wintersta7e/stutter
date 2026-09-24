@@ -13,6 +13,7 @@ const (
 	subBuilddef = "builddef"
 	subCount    = "count"
 	subExpect   = "expect"
+	subDeadcode = "deadcode"
 	flagAction  = "-action"
 	optOutValue = "skip"
 )
@@ -150,5 +151,30 @@ func TestFlakesetPrintsTheDerivedPackages(t *testing.T) {
 
 	if got := runWith([]string{"flakeset"}, "", nil); got.code != exitFail {
 		t.Fatalf("an empty set: exit %d, want %d", got.code, exitFail)
+	}
+}
+
+func TestDeadcodeComparesWithTheBaselineFile(t *testing.T) {
+	t.Parallel()
+
+	baseline := filepath.Join(t.TempDir(), "baseline.txt")
+	if err := os.WriteFile(baseline, []byte("# header\nexample.test/a.F\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	report := `[{"Path": "example.test/a", "Funcs": [{"Name": "F"}]}]`
+	if got := runWith([]string{subDeadcode, baseline}, report, nil); got.code != exitPass ||
+		!strings.HasPrefix(got.stdout, "deadcode reported=1 baseline=1\n") {
+		t.Fatalf("equal: exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	report = `[{"Path": "example.test/a", "Funcs": [{"Name": "F"}, {"Name": "G"}]}]`
+	if got := runWith([]string{subDeadcode, baseline}, report, nil); got.code != exitFail ||
+		!strings.Contains(got.stdout, "new example.test/a.G\n") {
+		t.Fatalf("a new name: exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	if got := runWith([]string{subDeadcode}, report, nil); got.code != exitUsage {
+		t.Fatalf("no baseline: exit %d, want %d", got.code, exitUsage)
 	}
 }
