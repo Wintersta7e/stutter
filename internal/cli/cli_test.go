@@ -111,6 +111,26 @@ func TestUsageIsHonestAboutProvisioning(t *testing.T) {
 	}
 }
 
+// TestRelayIsAHiddenCommand keeps the relay out of the user's view while the binary still runs it: a
+// relay container's entrypoint is this binary, so the command must dispatch, and a user has no use
+// for it, so the usage must not offer it.
+func TestRelayIsAHiddenCommand(t *testing.T) {
+	t.Parallel()
+
+	if help := run(t, "help"); strings.Contains(help.stdout, "relay") {
+		t.Errorf("the usage mentions relay:\n%s", help.stdout)
+	}
+
+	got := run(t, "relay")
+	if got.code != 2 {
+		t.Errorf("relay with no mode: exit = %d, want 2 (stderr: %s)", got.code, got.stderr)
+	}
+
+	if strings.Contains(got.stderr, "unknown command") {
+		t.Errorf("relay was not dispatched: %s", got.stderr)
+	}
+}
+
 // TestCheckAgainstAReferenceConsumer is the whole binary end to end: provision, gate, inject,
 // shrink, report, exit. It must FAIL, because the reference consumer carries a handler that
 // genuinely loses stock under redelivery.

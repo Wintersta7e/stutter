@@ -112,11 +112,11 @@ func TestSplice(t *testing.T) {
 
 		pair := splice(t)
 
-		send(t, pair.server, "hello")
+		send(t, pair.server, hello)
 		closeWrite(t, pair.server)
 
-		if greeting := drain(t, pair.client); greeting != "hello" {
-			t.Fatalf("client read = %q, want %q", greeting, "hello")
+		if greeting := drain(t, pair.client); greeting != hello {
+			t.Fatalf("client read = %q, want %q", greeting, hello)
 		}
 
 		send(t, pair.client, "more")

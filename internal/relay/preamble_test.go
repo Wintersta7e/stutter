@@ -10,8 +10,12 @@ import (
 	"github.com/Wintersta7e/stutter/internal/relay"
 )
 
-// ioBound keeps a broken relay from hanging a test: every read a test makes gives up after it.
-const ioBound = 5 * time.Second
+const (
+	// ioBound keeps a broken relay from hanging a test: every read a test makes gives up after it.
+	ioBound = 5 * time.Second
+	// hello is the payload the transport tests send.
+	hello = "hello"
+)
 
 // tcpEnds are the two ends of one real loopback TCP connection. Never net.Pipe: it has no half-close
 // and no reset, which are the behaviours under test.
@@ -107,7 +111,7 @@ func TestPreambleRoundTrip(t *testing.T) {
 		t.Fatalf("WritePreamble() error = %v", err)
 	}
 
-	if _, err := io.WriteString(ends.dialled, "hello"); err != nil {
+	if _, err := io.WriteString(ends.dialled, hello); err != nil {
 		t.Fatalf("write the payload: %v", err)
 	}
 
@@ -122,13 +126,13 @@ func TestPreambleRoundTrip(t *testing.T) {
 
 	bound(t, accepted)
 
-	payload := make([]byte, len("hello"))
+	payload := make([]byte, len(hello))
 	if _, err := io.ReadFull(accepted, payload); err != nil {
 		t.Fatalf("read the payload after the preamble: %v", err)
 	}
 
-	if string(payload) != "hello" {
-		t.Errorf("payload = %q, want %q", payload, "hello")
+	if string(payload) != hello {
+		t.Errorf("payload = %q, want %q", payload, hello)
 	}
 }
 

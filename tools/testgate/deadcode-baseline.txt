@@ -26,3 +26,24 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
 github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
 github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
+# The host side of the relay framing: called by the invocation listener set the compose path opens.
+github.com/Wintersta7e/stutter/internal/relay.Accept
+github.com/Wintersta7e/stutter/internal/relay.Conn.Abort
+github.com/Wintersta7e/stutter/internal/relay.Conn.CloseWrite
+github.com/Wintersta7e/stutter/internal/relay.Conn.DestinationPort
+github.com/Wintersta7e/stutter/internal/relay.ReadQuery
+github.com/Wintersta7e/stutter/internal/relay.WriteAck
+# The relay token and argv: written by the compose path when it creates the relay containers.
+github.com/Wintersta7e/stutter/internal/relay.NewToken
+github.com/Wintersta7e/stutter/internal/relay.Spec.Args
+github.com/Wintersta7e/stutter/internal/relay.Verify.Args
+# The copy helper's argv: written and read by the compose path's volume restore.
+github.com/Wintersta7e/stutter/internal/relay.Copy.Args
+github.com/Wintersta7e/stutter/internal/relay.ParseCopy
+github.com/Wintersta7e/stutter/internal/relay.parsePath
+# Verify mode's argv: read by `stutter relay verify` once that mode is dispatched.
+github.com/Wintersta7e/stutter/internal/relay.ParseVerify
+github.com/Wintersta7e/stutter/internal/relay.parseDial
+github.com/Wintersta7e/stutter/internal/relay.parseTarget
+# The DNS signal record: written by the stub relay's responder once it answers.
+github.com/Wintersta7e/stutter/internal/relay.WriteQuery

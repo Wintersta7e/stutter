@@ -13,6 +13,7 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/policy"
+	"github.com/Wintersta7e/stutter/internal/relay"
 	"github.com/Wintersta7e/stutter/internal/version"
 )
 
@@ -75,6 +76,9 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stdout, usage)
 
 		return 0
+	case "relay":
+		// Hidden: a relay container runs this binary as its entrypoint, and a user has no use for it.
+		return relay.Run(ctx, args[1:], stdout, stderr)
 	default:
 		fmt.Fprintf(stderr, "stutter: unknown command %q\n\n%s", args[0], usage)
 
