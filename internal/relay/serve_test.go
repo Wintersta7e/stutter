@@ -412,10 +412,21 @@ func TestRelayTransport(t *testing.T) {
 		run := startRelay(t, spec.Args())
 		run.ready(t)
 
-		client := relayed{run: run, at: netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)}.dial(t)
+		// On a loaded host the relay's reset can land before the dial reads back its own connect, so a
+		// reset from the dial is the same answer as one from the first read.
+		var dialer net.Dialer
 
-		if _, err := client.Read(make([]byte, 1)); !errors.Is(err, syscall.ECONNRESET) {
-			t.Errorf("client read err = %v, want ECONNRESET", err)
+		client, err := dialer.DialContext(t.Context(), "tcp4",
+			netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port).String())
+		if err == nil {
+			t.Cleanup(func() { _ = client.Close() })
+			bound(t, client)
+
+			_, err = client.Read(make([]byte, 1))
+		}
+
+		if !errors.Is(err, syscall.ECONNRESET) {
+			t.Errorf("the service's connection ended with %v, want ECONNRESET", err)
 		}
 
 		if code := run.exit(); code != 4 {

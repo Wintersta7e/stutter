@@ -2,8 +2,10 @@ package harness_test
 
 import (
 	"context"
+	"errors"
 	"net"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -234,6 +236,12 @@ func reachUnreachable(ctx context.Context, t *testing.T, proxy string) {
 	dialer := net.Dialer{Timeout: time.Second}
 
 	conn, err := dialer.DialContext(ctx, "tcp", proxy)
+	// The proxy resets the client once its upstream dial fails. On a loaded host that reset can land
+	// before the dial reads back its own connect, and it is the answer this helper provokes.
+	if errors.Is(err, syscall.ECONNRESET) {
+		return
+	}
+
 	if err != nil {
 		t.Errorf("dial the proxy: %v", err)
 
