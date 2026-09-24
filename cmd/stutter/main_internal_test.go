@@ -36,7 +36,7 @@ func TestMain(m *testing.M) {
 			signal.Ignore(syscall.SIGHUP)
 		}
 
-		//nolint:revive // The helper exits with what the wiring returns; m.Run never runs in it.
+		// The helper exits with what the wiring returns; m.Run never runs in it.
 		os.Exit(interruptible(slowTeardown))
 	}
 

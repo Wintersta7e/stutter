@@ -20,7 +20,7 @@ const helperMode = "STUTTER_PROVISION_HELPER"
 
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(helperMode); mode != "" {
-		//nolint:revive // The helper exits with its mode's code; m.Run never runs in it.
+		// The helper exits with its mode's code; m.Run never runs in it.
 		os.Exit(runHelper(mode))
 	}
 

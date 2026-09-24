@@ -136,6 +136,14 @@ linters:
         linters:
           - revive
         text: (function-length|cyclomatic|cognitive-complexity)
+      # A test binary that re-executes itself as a helper process must exit from TestMain with the
+      # helper's own code, which is not the redundant os.Exit(m.Run()) this rule targets (and that one
+      # is harmless). Excluded here rather than by a nolint directive at each site, because nolintlint
+      # judged those directives unused on some runs and not others over one unchanged tree.
+      - path: _test\.go
+        linters:
+          - revive
+        text: redundant-test-main-exit
       # Protocol packages intentionally use the protocol name. Here the import path keeps this
       # package distinct from net/http, while renaming it would make every caller less clear.
       - path: ^internal/proxy/http/
