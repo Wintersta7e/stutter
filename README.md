@@ -119,9 +119,10 @@ outside that will be poor.
   function call that writes. A transaction rolled back to a savepoint still
   counts the statements it undid
 - Stub replies are configured in Go, so without provisioning every HTTP endpoint
-  answers an empty JSON object. A service that pins certificates or ships its own
-  certificate pool cannot reach the stub at all; that stops the run loudly rather
-  than being recorded as a handler that did nothing
+  answers an empty JSON object. A service that rejects the stub's certificate —
+  during the handshake, or by hanging up before its first request — or that
+  offers only HTTP/2 stops the run loudly; it is never recorded as a handler that
+  did nothing
 - The differential re-keying gate is designed but not built; it arrives with the
   redaction pipeline
 - `concurrent` delivery is refused rather than injected — it needs per-connection

@@ -29,18 +29,24 @@ const (
 	maxRequestHeader      = 1 << 20
 	initialHeaderCapacity = 1024
 	tlsRecord             = 0x16
+	// headerBound is how long a connection has to deliver its first request header: from accept in
+	// cleartext, from handshake completion behind TLS. net/http's handshake timeout derives from it.
+	headerBound = time.Second
 )
 
 var (
 	errActiveRun       = errors.New("HTTP script already has an active run")
 	errServerLog       = errors.New("the HTTP stub could not serve a connection")
 	errEncrypted       = errors.New("client used TLS with the HTTP stub; cleartext HTTP/1.1 is required")
+	errHandshake       = errors.New("TLS handshake with the HTTP stub failed")
 	errInactiveRun     = errors.New("HTTP script run is not active")
 	errMissingHost     = errors.New("HTTP proxy requires a stable logical host")
 	errMissingScript   = errors.New("HTTP proxy requires a script")
 	errMissingSink     = errors.New("HTTP proxy requires an effect sink")
 	errOversizeRequest = errors.New("HTTP request body exceeds configured limit")
 	errUnparseable     = errors.New("client traffic is not parseable HTTP/1.1; effects cannot be observed")
+	errNoRequest       = errors.New("the client completed a TLS handshake and sent no request: " +
+		"application-level certificate pinning or a protocol the stub does not serve")
 )
 
 // Sink receives the effects the stub observes and supplies the run canonical form used as a
@@ -201,7 +207,10 @@ func ListenTLS(
 ) (*Proxy, error) {
 	return bind(ctx, addr, logicalHost, sink, script, &tls.Config{
 		Certificates: []tls.Certificate{certificate},
-		MinVersion:   tls.VersionTLS12,
+		// HTTP/1.1 is all the stub serves. Agreeing on it in the handshake makes an h2-only client
+		// fail there, loudly, instead of connecting and hanging up unseen.
+		NextProtos: []string{"http/1.1"},
+		MinVersion: tls.VersionTLS12,
 	})
 }
 
@@ -231,19 +240,21 @@ func bind(
 		return nil, fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	// The cleartext guard would reject every TLS ClientHello, so it is skipped when the stub is the
-	// one terminating TLS. Malformed traffic inside the tunnel still stops the run, through the
-	// same net/http error path.
-	bound := net.Listener(checkedListener{Listener: listener, readTimeout: time.Second})
+	proxy := &Proxy{logicalHost: logicalHost, script: script, sink: sink}
+
+	// The cleartext guard runs in Accept and would reject every ClientHello. Behind TLS each
+	// connection instead applies the same first-request rules to its decrypted stream, after its
+	// handshake and on its own goroutine, and a failure there stops the run just as it does in
+	// cleartext.
+	proxy.listener = checkedListener{Listener: listener, readTimeout: headerBound}
 	if serverTLS != nil {
-		bound = tls.NewListener(listener, serverTLS)
+		proxy.listener = tunnelListener{Listener: listener, config: serverTLS, proxy: proxy}
 	}
 
-	proxy := &Proxy{listener: bound, logicalHost: logicalHost, script: script, sink: sink}
 	proxy.server = &nethttp.Server{
 		Handler:           nethttp.HandlerFunc(proxy.serveRequest),
 		ErrorLog:          log.New(proxyErrorWriter{proxy: proxy}, "", 0),
-		ReadHeaderTimeout: time.Second,
+		ReadHeaderTimeout: headerBound,
 	}
 
 	return proxy, nil
@@ -264,7 +275,7 @@ func (l checkedListener) Accept() (net.Conn, error) {
 		return nil, fmt.Errorf("accept HTTP connection: %w", err)
 	}
 
-	checked, err := checkConnection(connection, l.readTimeout)
+	checked, err := checkConnection(connection, l.readTimeout, errUnparseable)
 	if err != nil {
 		_ = connection.Close()
 
@@ -272,6 +283,85 @@ func (l checkedListener) Accept() (net.Conn, error) {
 	}
 
 	return checked, nil
+}
+
+// tunnelListener hands each TLS connection to net/http before its handshake, as tls.NewListener
+// does, so no client's handshake or first request can delay another's accept.
+type tunnelListener struct {
+	net.Listener
+
+	config *tls.Config
+	proxy  *Proxy
+}
+
+func (l tunnelListener) Accept() (net.Conn, error) {
+	connection, err := l.Listener.Accept()
+	if err != nil {
+		return nil, fmt.Errorf("accept HTTPS connection: %w", err)
+	}
+
+	tunnel := &tunnel{proxy: l.proxy}
+	config := l.config.Clone()
+	config.GetConfigForClient = tunnel.hello
+	tunnel.Conn = tls.Server(connection, config)
+
+	return tunnel, nil
+}
+
+// tunnel is one TLS connection to the stub. net/http completes its handshake through
+// HandshakeContext; its first Read then passes the decrypted stream through checkConnection.
+type tunnel struct {
+	*tls.Conn
+
+	checked    net.Conn
+	failure    error
+	proxy      *Proxy
+	serverName string
+}
+
+// HandshakeContext stops the run on a failed handshake, naming the server name the client asked
+// for. The error goes back to net/http unchanged, so its answer to a cleartext client is too.
+func (t *tunnel) HandshakeContext(ctx context.Context) error {
+	err := t.Conn.HandshakeContext(ctx)
+	if err != nil {
+		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, err)))
+	}
+
+	return err //nolint:wrapcheck // net/http type-checks this error to answer a cleartext client.
+}
+
+// Read applies the cleartext first-request check to the decrypted stream before net/http sees any
+// of it. net/http reads first right after the handshake, so the header bound runs from there.
+func (t *tunnel) Read(buffer []byte) (int, error) {
+	if t.checked == nil && t.failure == nil {
+		t.checked, t.failure = checkConnection(t.Conn, headerBound, errNoRequest)
+		if t.failure != nil {
+			t.failure = t.named(t.failure)
+			t.proxy.fail(t.failure)
+		}
+	}
+
+	if t.failure != nil {
+		return 0, t.failure
+	}
+
+	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
+}
+
+// hello records the server name the client asked for. It is taken from the ClientHello because a
+// handshake that fails on ALPN never stores it on the connection.
+func (t *tunnel) hello(info *tls.ClientHelloInfo) (*tls.Config, error) {
+	t.serverName = info.ServerName
+
+	return nil, nil //nolint:nilnil // A nil config keeps the listener's own, as crypto/tls documents.
+}
+
+func (t *tunnel) named(err error) error {
+	if t.serverName == "" {
+		return fmt.Errorf("TLS connection without SNI: %w", err)
+	}
+
+	return fmt.Errorf("TLS connection for %q: %w", t.serverName, err)
 }
 
 type replayConn struct {
@@ -284,7 +374,9 @@ func (c *replayConn) Read(buffer []byte) (int, error) {
 	return c.reader.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-func checkConnection(connection net.Conn, timeout time.Duration) (net.Conn, error) {
+// checkConnection admits a connection only once its first request header parses as HTTP/1.x.
+// noRequest is the error for one that closes, or stays silent past timeout, before its first byte.
+func checkConnection(connection net.Conn, timeout time.Duration, noRequest error) (net.Conn, error) {
 	if err := connection.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("bound HTTP header read: %w", err)
 	}
@@ -293,7 +385,7 @@ func checkConnection(connection net.Conn, timeout time.Duration) (net.Conn, erro
 
 	first, err := reader.Peek(1)
 	if err != nil {
-		return nil, errUnparseable
+		return nil, noRequest
 	}
 
 	if first[0] == tlsRecord {
