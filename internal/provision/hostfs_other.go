@@ -12,12 +12,13 @@ import (
 // every other host first.
 func defaultHostFS() hostFS {
 	return hostFS{
-		statfs:  func(string) (int64, error) { return 0, notLinux() },
-		tryLock: func(*os.File) (bool, error) { return false, notLinux() },
-		sync:    func(*os.File) error { return notLinux() },
-		lstat:   func(string) (fs.FileInfo, error) { return nil, notLinux() },
-		owner:   func(fs.FileInfo) (int, bool) { return -1, false },
-		euid:    -1,
+		statfs:    func(string) (int64, error) { return 0, notLinux() },
+		tryLock:   func(*os.File) (bool, error) { return false, notLinux() },
+		sync:      func(*os.File) error { return notLinux() },
+		lstat:     func(string) (fs.FileInfo, error) { return nil, notLinux() },
+		owner:     func(fs.FileInfo) (int, bool) { return -1, false },
+		startTime: startTime,
+		euid:      -1,
 	}
 }
 
