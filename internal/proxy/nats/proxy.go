@@ -50,14 +50,6 @@ const (
 	statusNoResponders = "503"
 )
 
-// errEncrypted means the client negotiated TLS with the bus, leaving nothing for the proxy to read.
-//
-// Failing here is deliberate. A silently unreadable connection would report a handler as having no
-// side effects at all, which reads as "idempotent" — the most dangerous wrong answer this tool can
-// give, and the exact answer this package exists to stop being reached by accident.
-var errEncrypted = errors.New("client negotiated TLS with the bus; " +
-	"published effects cannot be observed — disable TLS on the sandbox connection")
-
 // Sink receives the effects the proxy observes, and the bus's verdict on the ones it answers.
 type Sink interface {
 	Record(observed effect.Observation)
@@ -98,13 +90,20 @@ type Options struct {
 }
 
 // Proxy accepts NATS client connections and forwards them to an upstream server.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type Proxy struct {
 	listener net.Listener
 	sink     Sink
+	// failure is the first bus client the embedded server cannot stand in for. It stops the proxy,
+	// and Serve reports it.
+	failure  error
 	opts     Options
 	upstream string
 	dialer   net.Dialer
 	wg       sync.WaitGroup
+	failOnce sync.Once
+	failed   sync.Mutex
 }
 
 // Listen binds a proxy on addr, forwarding to the NATS server at upstream.
@@ -132,11 +131,18 @@ func (p *Proxy) Addr() string {
 	return p.listener.Addr().String()
 }
 
-// Serve accepts connections until the proxy is closed.
+// Serve accepts connections until the proxy is closed, or until a bus client the embedded server
+// cannot stand in for stops it — that failure is what Serve then returns.
 func (p *Proxy) Serve(ctx context.Context) error {
 	for {
 		client, err := p.listener.Accept()
 		if err != nil {
+			// A stop outranks the closure it caused: closing the listener is how fail stops the proxy,
+			// so the closed listener would otherwise read as an orderly stop.
+			if failure := p.serveFailure(); failure != nil {
+				return failure
+			}
+
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				//nolint:nilerr // a closed listener is how Serve is stopped, not a failure.
 				return nil
@@ -160,6 +166,26 @@ func (p *Proxy) Close() error {
 	return nil
 }
 
+// fail records the first unsupported bus client and stops accepting, so Serve reports it. Connections
+// already open keep flowing: the run is over, but its service still has to be shut down cleanly.
+func (p *Proxy) fail(err error) {
+	p.failOnce.Do(func() {
+		p.failed.Lock()
+		p.failure = err
+		p.failed.Unlock()
+
+		_ = p.listener.Close()
+	})
+}
+
+// serveFailure is the failure fail recorded, if any.
+func (p *Proxy) serveFailure() error {
+	p.failed.Lock()
+	defer p.failed.Unlock()
+
+	return p.failure
+}
+
 func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	defer func() { _ = client.Close() }()
 
@@ -178,15 +204,15 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 		sink:       p.sink,
 		awaiting:   make(map[string]string),
 		opts:       p.opts,
+		fail:       p.fail,
 	}
 
+	// An unreadable connection is never recorded as anything: it would report a handler as having no
+	// side effects at all, which reads as "idempotent" — the most dangerous wrong answer this tool can
+	// give. It stops the run instead.
 	if err := current.negotiate(); err != nil {
-		if errors.Is(err, errEncrypted) {
-			p.sink.Record(effect.Observation{
-				Raw:       errEncrypted.Error(),
-				Printable: errEncrypted.Error(),
-				Kind:      effect.KindNATS,
-			})
+		if errors.Is(err, ErrUnsupportedBus) {
+			p.fail(err)
 		}
 
 		return
@@ -217,6 +243,8 @@ type session struct {
 	fromClient *bufio.Reader
 	fromServer *bufio.Reader
 	sink       Sink
+	// fail stops the proxy on a bus client the embedded server cannot stand in for.
+	fail func(err error)
 	// awaiting maps the reply inbox of each publish the bus has not answered yet to the subject it
 	// was published to. The two pumps are separate goroutines, so it is guarded.
 	awaiting map[string]string
@@ -251,8 +279,8 @@ func (s *session) awaited(inbox string) (string, bool) {
 // negotiate forwards the server's opening INFO and confirms the connection will stay readable.
 //
 // The server speaks first, and a client that is told to upgrade does so immediately: what follows is
-// a TLS handshake rather than a CONNECT. Both signs are checked, and both are fatal — see
-// errEncrypted for why refusing beats reporting a handler that appears to do nothing.
+// a TLS handshake rather than a CONNECT. Both signs are checked, and both stop the run: nothing on
+// such a connection could be observed.
 func (s *session) negotiate() error {
 	info, err := readLine(s.fromServer)
 	if err != nil {
@@ -264,7 +292,7 @@ func (s *session) negotiate() error {
 	}
 
 	if infoRequiresTLS(info) {
-		return errEncrypted
+		return fmt.Errorf("%w: a TLS-first bus client (the bus requires TLS)", ErrUnsupportedBus)
 	}
 
 	first, err := s.fromClient.Peek(greeting)
@@ -279,7 +307,7 @@ func (s *session) negotiate() error {
 	}
 
 	if first[0] == tlsRecord {
-		return errEncrypted
+		return fmt.Errorf("%w: a TLS-first bus client (it opened with a TLS handshake)", ErrUnsupportedBus)
 	}
 
 	return nil
@@ -392,6 +420,11 @@ func (s *session) judge(current *frame) {
 
 	s.sink.Reject(current.args.subject)
 
+	if answer.ErrCode == errCodeReplicas {
+		s.fail(fmt.Errorf("%w: the bus refused %s, which asks for more replicas than one server has (err_code %d)",
+			ErrUnsupportedBus, refusedReplicas(request), errCodeReplicas))
+	}
+
 	if strings.HasPrefix(request, jsPrefix) {
 		s.sink.Declined(effect.Refusal{
 			Subject:     request,
@@ -439,6 +472,13 @@ func (s *session) forwardClient(raw []byte) bool {
 func (s *session) inspect(current *frame) {
 	if !isPublish(current.op) {
 		return
+	}
+
+	// The one embedded server has no domain: every request to one goes unanswered, and the service
+	// never starts. The frame is still forwarded, so the service sees what it would have seen.
+	if domain, addressed := jetStreamDomain(current.args.subject); addressed {
+		s.fail(fmt.Errorf("%w: a request to JetStream domain %s, and the embedded bus has none",
+			ErrUnsupportedBus, domain))
 	}
 
 	// An acknowledgement or a pull request is delivery bookkeeping, not the service's own work.

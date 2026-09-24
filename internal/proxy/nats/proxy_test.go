@@ -512,53 +512,6 @@ func stubBus(t *testing.T, greeting string) string {
 	return listener.Addr().String()
 }
 
-// refusal drains the client connection and returns what the proxy recorded once it hung up.
-func refusal(t *testing.T, sink *recorder, conn net.Conn) []string {
-	t.Helper()
-
-	if _, err := io.ReadAll(conn); err != nil {
-		t.Fatalf("read from the proxied connection: %v", err)
-	}
-
-	return sink.texts()
-}
-
-// TestServerRequiringTLSIsRefused covers the sign that arrives first: the bus tells the client to
-// upgrade, so the proxy knows the rest of the connection will be unreadable before a byte of it is.
-func TestServerRequiringTLSIsRefused(t *testing.T) {
-	t.Parallel()
-
-	sink, addr := startProxy(t, stubBus(t, `INFO {"tls_required":true}`+"\r\n"))
-
-	got := refusal(t, sink, dial(t, addr))
-	if len(got) != 1 || !strings.Contains(got[0], "TLS") {
-		t.Errorf("effects = %q, want one refusal naming TLS", got)
-	}
-}
-
-// TestClientUpgradingToTLSIsRefused covers the other sign: the bus merely offers TLS and the client
-// takes it, so what arrives where a CONNECT belongs is a handshake record.
-//
-// Refusing loudly is the whole point. A connection the proxy cannot read reports a handler as having
-// produced no side effects at all, which reads as "idempotent" — the most dangerous wrong answer
-// this tool can give.
-func TestClientUpgradingToTLSIsRefused(t *testing.T) {
-	t.Parallel()
-
-	sink, addr := startProxy(t, stubBus(t, `INFO {"tls_available":true}`+"\r\n"))
-	conn := dial(t, addr)
-
-	// The opening bytes of a TLS handshake record, where a CONNECT would otherwise be.
-	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01}); err != nil {
-		t.Fatalf("write a handshake record: %v", err)
-	}
-
-	got := refusal(t, sink, conn)
-	if len(got) != 1 || !strings.Contains(got[0], "TLS") {
-		t.Errorf("effects = %q, want one refusal naming TLS", got)
-	}
-}
-
 // TestUnparsableTrafficKeepsTheConnection is the promise made to a service under test: a message
 // Stutter cannot frame costs an effect, never the connection.
 //

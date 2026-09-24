@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -70,6 +71,9 @@ type quirks struct {
 	echo bool
 	// echoWrites makes the service write to its dependency while handling its own note, too.
 	echoWrites bool
+	// tlsFirst makes the service also open a raw connection to the bus and start a TLS handshake on
+	// it, as a client configured for TLS does.
+	tlsFirst bool
 }
 
 // echoSubject is where an echoing service notes each order: inside the corpus subjects, so its own
@@ -166,9 +170,43 @@ func startPulling(
 		return nil, fmt.Errorf("create the consumer: %w", err)
 	}
 
+	if behaviour.tlsFirst {
+		if err := handshake(ctx, at.NATS); err != nil {
+			return nil, err
+		}
+	}
+
 	go service.pump()
 
 	return service, nil
+}
+
+// handshake opens a raw connection to the bus, reads its greeting and answers with the opening bytes
+// of a TLS handshake, where a CONNECT would otherwise be.
+func handshake(ctx context.Context, address string) error {
+	bus, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("parse the bus address: %w", err)
+	}
+
+	dialer := net.Dialer{Timeout: time.Second}
+
+	conn, err := dialer.DialContext(ctx, "tcp", bus.Host)
+	if err != nil {
+		return fmt.Errorf("dial the bus: %w", err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if _, err := bufio.NewReader(conn).ReadString('\n'); err != nil {
+		return fmt.Errorf("read the bus greeting: %w", err)
+	}
+
+	if _, err := conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x01}); err != nil {
+		return fmt.Errorf("start a TLS handshake: %w", err)
+	}
+
+	return nil
 }
 
 // Close stops pulling and waits for the pump before the connections go, so the proxies are not torn
