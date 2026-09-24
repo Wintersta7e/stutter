@@ -22,9 +22,15 @@ type Recorder struct {
 	// An effect is removed once answered, because a correlation token is used exactly once.
 	awaiting map[string]int
 	effects  []Effect
+	// refusals holds what the bus declined before the first delivery.
+	refusals []Refusal
 	window   window
 	// setup counts effects observed before the first message was ever delivered.
 	setup int
+	// noResponders counts requests the bus answered with "no responders".
+	noResponders int
+	// closedAfterInfo counts bus clients that hung up after the greeting without sending a byte.
+	closedAfterInfo int
 	// armed becomes true at the first Open. Before it, nothing is the service's response to traffic.
 	armed bool
 	mu    sync.Mutex
@@ -144,6 +150,62 @@ func (r *Recorder) Answered(correlation string) {
 	defer r.mu.Unlock()
 
 	delete(r.awaiting, correlation)
+}
+
+// Declined keeps a request the bus refused, if the first message has not been delivered yet.
+//
+// After the first delivery a refusal is already the Rejected mark on the effect that made the request;
+// before it there is no effect to mark, and the refusal is the only record of why the service never
+// started consuming.
+func (r *Recorder) Declined(refusal Refusal) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if !r.armed {
+		r.refusals = append(r.refusals, refusal)
+	}
+}
+
+// Refusals returns what the bus declined before the first delivery, in the order it declined them.
+func (r *Recorder) Refusals() []Refusal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]Refusal(nil), r.refusals...)
+}
+
+// NoResponder counts a request nothing on the bus answered. The request itself stays an effect: it
+// was made, and nobody answering is not the bus refusing it.
+func (r *Recorder) NoResponder() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.noResponders++
+}
+
+// NoResponders reports how many requests nothing answered.
+func (r *Recorder) NoResponders() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.noResponders
+}
+
+// ClosedAfterInfo counts a bus client that hung up after the server's greeting without sending a
+// byte: a client that requires TLS does exactly that, and so does a script waiting for the port.
+func (r *Recorder) ClosedAfterInfo() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closedAfterInfo++
+}
+
+// ClosedAfterInfoCount reports how many bus clients hung up after the greeting.
+func (r *Recorder) ClosedAfterInfoCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.closedAfterInfo
 }
 
 // Close ends the attribution window. Effects recorded afterwards are marked Late.

@@ -40,7 +40,11 @@ type observed struct {
 // recorder is the Sink the proxy writes to. The proxy records from its own goroutines, so it locks.
 type recorder struct {
 	entries []observed
-	mu      sync.Mutex
+	// declined holds what the bus refused, with its code and description.
+	declined        []effect.Refusal
+	noResponders    int
+	closedAfterInfo int
+	mu              sync.Mutex
 }
 
 func (r *recorder) Record(item effect.Observation) {
@@ -72,6 +76,49 @@ func (r *recorder) Reject(correlation string) {
 }
 
 func (*recorder) Answered(string) {}
+
+func (r *recorder) Declined(refusal effect.Refusal) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.declined = append(r.declined, refusal)
+}
+
+func (r *recorder) NoResponder() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.noResponders++
+}
+
+func (r *recorder) ClosedAfterInfo() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.closedAfterInfo++
+}
+
+// declinedRefusals returns what the bus refused, as the proxy reported it.
+func (r *recorder) declinedRefusals() []effect.Refusal {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return append([]effect.Refusal(nil), r.declined...)
+}
+
+func (r *recorder) noResponderCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.noResponders
+}
+
+func (r *recorder) closedAfterInfoCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	return r.closedAfterInfo
+}
 
 // reads returns the text of every effect the proxy marked as a read.
 func (r *recorder) reads() []string {

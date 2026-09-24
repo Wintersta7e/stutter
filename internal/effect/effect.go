@@ -105,3 +105,21 @@ type Observation struct {
 	// Read marks a request for data rather than a change to it. See Effect.Read.
 	Read bool
 }
+
+// Refusal is a request the bus declined before the service under test was handed its first message:
+// the request's subject and the bus's own code, error code and description.
+//
+// It is kept because nothing else records it. A service whose startup request is refused — a stream
+// created twice with different subjects, a replicated stream on a single server — never gets as far
+// as consuming, and without the refusal the report could only say that it never did.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type Refusal struct {
+	// Subject is the request's subject, which names the API call and what it was about.
+	Subject string
+	// Description is the bus's own explanation.
+	Description string
+	// Code is the status-like code of the answer; ErrCode the bus's specific error.
+	Code    int
+	ErrCode int
+}

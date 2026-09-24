@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
@@ -42,6 +43,11 @@ const (
 	// tlsRecord opens a TLS handshake record. A client that upgrades sends it where a CONNECT would
 	// otherwise be.
 	tlsRecord = 0x16
+	// jsPrefix opens every JetStream subject.
+	jsPrefix = "$JS."
+	// statusNoResponders is the header status the bus answers a request with when nothing is
+	// subscribed to its subject.
+	statusNoResponders = "503"
 )
 
 // errEncrypted means the client negotiated TLS with the bus, leaving nothing for the proxy to read.
@@ -59,6 +65,13 @@ type Sink interface {
 	Reject(correlation string)
 	// Answered forgets a correlation the bus accepted.
 	Answered(correlation string)
+	// Declined carries what the bus said when it refused a JetStream API request: before the first
+	// delivery there is no effect to mark, and this is the only record of why a service never started.
+	Declined(refusal effect.Refusal)
+	// NoResponder counts a request nothing answered. The request stays an effect.
+	NoResponder()
+	// ClosedAfterInfo counts a client that hung up after the greeting without sending a byte.
+	ClosedAfterInfo()
 }
 
 // Acks decides the fate of an acknowledgement the service under test sends.
@@ -163,7 +176,7 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 		fromClient: bufio.NewReaderSize(client, readBuffer),
 		fromServer: bufio.NewReaderSize(upstream, readBuffer),
 		sink:       p.sink,
-		awaiting:   make(map[string]struct{}),
+		awaiting:   make(map[string]string),
 		opts:       p.opts,
 	}
 
@@ -204,34 +217,35 @@ type session struct {
 	fromClient *bufio.Reader
 	fromServer *bufio.Reader
 	sink       Sink
-	// awaiting holds the reply inboxes of publishes the bus has not answered yet. The two pumps are
-	// separate goroutines, so it is guarded.
-	awaiting map[string]struct{}
+	// awaiting maps the reply inbox of each publish the bus has not answered yet to the subject it
+	// was published to. The two pumps are separate goroutines, so it is guarded.
+	awaiting map[string]string
 	opts     Options
 	mu       sync.Mutex
 }
 
-// expect notes that the bus owes an answer on this inbox.
-func (s *session) expect(inbox string) {
+// expect notes that the bus owes an answer on this inbox to a publish on subject.
+func (s *session) expect(inbox, subject string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.awaiting[inbox] = struct{}{}
+	s.awaiting[inbox] = subject
 }
 
 // awaited reports whether a message the bus sent is the answer to a publish this session observed,
-// consuming the expectation.
-func (s *session) awaited(subject string) bool {
+// and the subject that publish went to, consuming the expectation.
+func (s *session) awaited(inbox string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, owed := s.awaiting[subject]; !owed {
-		return false
+	request, owed := s.awaiting[inbox]
+	if !owed {
+		return "", false
 	}
 
-	delete(s.awaiting, subject)
+	delete(s.awaiting, inbox)
 
-	return true
+	return request, true
 }
 
 // negotiate forwards the server's opening INFO and confirms the connection will stay readable.
@@ -255,6 +269,12 @@ func (s *session) negotiate() error {
 
 	first, err := s.fromClient.Peek(greeting)
 	if err != nil {
+		// Hanging up after the greeting is what a client that requires TLS does, and what a script
+		// waiting for the port does: the same bytes, so it is counted and never stops anything.
+		if s.fromClient.Buffered() == 0 {
+			s.sink.ClosedAfterInfo()
+		}
+
 		return fmt.Errorf("read client greeting: %w", err)
 	}
 
@@ -344,19 +364,42 @@ func (s *session) pumpServer() {
 // judge reports the bus's answer to a publish this session recorded.
 //
 // Only a message addressed to an inbox the session is waiting on is an answer, so ordinary traffic
-// that happens to carry an error payload is never mistaken for one.
+// that happens to carry an error payload is never mistaken for one. A "no responders" status is not a
+// refusal — nothing was there to refuse — so the request stays an effect and the answer is counted.
 func (s *session) judge(current *frame) {
-	if !isDelivery(current.op) || !s.awaited(current.args.subject) {
+	if !isDelivery(current.op) {
 		return
 	}
 
-	if refused(current.body[current.args.headerLen:]) {
-		s.sink.Reject(current.args.subject)
+	request, owed := s.awaited(current.args.subject)
+	if !owed {
+		return
+	}
+
+	if noResponders(current.body[:current.args.headerLen]) {
+		s.sink.NoResponder()
+		s.sink.Answered(current.args.subject)
 
 		return
 	}
 
-	s.sink.Answered(current.args.subject)
+	answer, declined := apiRefusal(current.body[current.args.headerLen:])
+	if !declined {
+		s.sink.Answered(current.args.subject)
+
+		return
+	}
+
+	s.sink.Reject(current.args.subject)
+
+	if strings.HasPrefix(request, jsPrefix) {
+		s.sink.Declined(effect.Refusal{
+			Subject:     request,
+			Description: answer.Description,
+			Code:        answer.Code,
+			ErrCode:     answer.ErrCode,
+		})
+	}
 }
 
 // noteDelivery reports a message the bus handed over, identified by the subject it will be
@@ -413,7 +456,7 @@ func (s *session) inspect(current *frame) {
 	// comparison; a publish with nowhere to answer is fire-and-forget and stands as recorded.
 	correlation := current.args.reply
 	if correlation != "" {
-		s.expect(correlation)
+		s.expect(correlation, current.args.subject)
 	}
 
 	// A direct get looks a key up. It is the lookup a dedupe guard repeats on every redelivery.
@@ -455,6 +498,15 @@ func (s *session) forward(raw []byte) bool {
 	_, err := s.upstream.Write(raw)
 
 	return err == nil
+}
+
+// noResponders reports whether a header block carries the "no responders" status: nothing was
+// subscribed to answer the request.
+func noResponders(block []byte) bool {
+	line, _, _ := bytes.Cut(block, []byte(crlf))
+	fields := strings.Fields(string(line))
+
+	return len(fields) > 1 && fields[0] == headerVersion && fields[1] == statusNoResponders
 }
 
 // infoRequiresTLS reports whether the server's INFO tells the client to upgrade.
