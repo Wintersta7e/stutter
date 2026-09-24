@@ -6,3 +6,23 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.Listen
 github.com/Wintersta7e/stutter/internal/replay.Concurrent.Fault
 github.com/Wintersta7e/stutter/internal/report.Report.String
 github.com/Wintersta7e/stutter/internal/toy.Qty
+# Loading a corpus directory: called by `stutter check --compose … --corpus <dir>`.
+github.com/Wintersta7e/stutter/internal/corpus.LoadDir
+github.com/Wintersta7e/stutter/internal/corpus.compareOrder
+github.com/Wintersta7e/stutter/internal/corpus.decodeSubject
+github.com/Wintersta7e/stutter/internal/corpus.invalid
+github.com/Wintersta7e/stutter/internal/corpus.isMessageExt
+github.com/Wintersta7e/stutter/internal/corpus.order
+github.com/Wintersta7e/stutter/internal/corpus.parseName
+github.com/Wintersta7e/stutter/internal/corpus.parseSidecar
+github.com/Wintersta7e/stutter/internal/corpus.read
+github.com/Wintersta7e/stutter/internal/corpus.readSidecars
+# Consumer-name stability across two starts: called by discovery on the compose path.
+github.com/Wintersta7e/stutter/internal/corpus.Unstable
+# Refusing a bus URL the embedded server cannot stand in for: called by the compose path before any start.
+github.com/Wintersta7e/stutter/internal/proxy/nats.RefuseURLs
+github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
+# Classifying a Postgres endpoint by its handshake: called by the compose path's dependency classification.
+github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
+github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
+github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
