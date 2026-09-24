@@ -5,29 +5,111 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 )
+
+// localPortRange is where the kernel says which ports it picks outbound source ports from.
+const localPortRange = "/proc/sys/net/ipv4/ip_local_port_range"
 
 var (
 	// errBind means the relay could not find exactly one of its own addresses to listen on.
 	errBind = errors.New("cannot choose an address to listen on")
 	// errUnserved means the spec asks for a listener this build cannot serve.
 	errUnserved = errors.New("listener not served")
+	// errPortRange means the kernel's source-port range could not be read.
+	errPortRange = errors.New("unreadable local port range")
 )
 
 // system is what the relay reads from the machine it runs on. Production reads the machine; internal
 // tests replace a part of it.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type system struct {
 	// addresses lists the IP addresses on the relay's own interfaces.
 	addresses func() ([]netip.Addr, error)
+	// portRangeFile holds the kernel's source-port range, which the catch-all leaves free.
+	portRangeFile string
+	// catchAllFirst and catchAllLast bound the ports a catch-all covers before any exclusion: every TCP
+	// port, in production. A test process cannot bind the privileged ones.
+	catchAllFirst uint16
+	catchAllLast  uint16
 }
 
 // hostSystem reads the machine the relay runs on.
 func hostSystem() system {
-	return system{addresses: interfaceAddresses}
+	return system{
+		addresses:     interfaceAddresses,
+		portRangeFile: localPortRange,
+		catchAllFirst: 1,
+		catchAllLast:  math.MaxUint16,
+	}
+}
+
+// catchAllPorts is every port a catch-all binds: its whole span, except the DNS port, every pipe port,
+// and the range the kernel is using for the relay's own dials — binding one of those would starve the
+// dials the catch-all itself makes.
+func (s system) catchAllPorts(spec Spec) ([]uint16, error) {
+	sources, err := readPortRange(s.portRangeFile)
+	if err != nil {
+		return nil, err
+	}
+
+	excluded := map[uint16]bool{DNSPort: true}
+
+	for _, listener := range spec.Listeners {
+		if listener.Kind == Pipe {
+			excluded[listener.Port] = true
+		}
+	}
+
+	var ports []uint16
+
+	for port := s.catchAllFirst; ; port++ {
+		if !excluded[port] && (port < sources.first || port > sources.last) {
+			ports = append(ports, port)
+		}
+
+		if port == s.catchAllLast {
+			return ports, nil
+		}
+	}
+}
+
+// portSpan is an inclusive range of ports.
+type portSpan struct {
+	first uint16
+	last  uint16
+}
+
+// readPortRange reads the kernel's source-port range: two numbers separated by whitespace.
+func readPortRange(path string) (portSpan, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return portSpan{}, fmt.Errorf("%w: %w", errPortRange, err)
+	}
+
+	// The kernel writes the first port, whitespace, the last port.
+	const fieldCount = 2
+
+	fields := strings.Fields(string(content))
+	if len(fields) != fieldCount {
+		return portSpan{}, fmt.Errorf("%w: %s holds %q", errPortRange, path, content)
+	}
+
+	first, firstErr := strconv.ParseUint(fields[0], 10, 16)
+	last, lastErr := strconv.ParseUint(fields[1], 10, 16)
+
+	if firstErr != nil || lastErr != nil || first > last {
+		return portSpan{}, fmt.Errorf("%w: %s holds %q", errPortRange, path, content)
+	}
+
+	return portSpan{first: uint16(first), last: uint16(last)}, nil
 }
 
 // interfaceAddresses lists the addresses on this machine's interfaces.
@@ -96,7 +178,7 @@ func (s system) serve(ctx context.Context, spec Spec, stdout, stderr io.Writer) 
 
 	relayed := &server{spec: spec, self: self, cancel: cancel, conns: make(map[net.Conn]struct{})}
 
-	if err := relayed.bind(ctx); err != nil {
+	if err := relayed.bind(ctx, s); err != nil {
 		relayed.shutdown()
 
 		return report(stderr, exitFailure, err)
@@ -137,18 +219,22 @@ type server struct {
 	cancel context.CancelFunc
 	// conns are every open connection, closed at shutdown so none outlives the relay.
 	conns map[net.Conn]struct{}
-	pipes []pipeListener
-	self  netip.Addr
-	spec  Spec
-	wg    sync.WaitGroup
-	mu    sync.Mutex
-	once  sync.Once
+	// catchAll is nil unless the spec has a catch-all listener.
+	catchAll *catchAll
+	pipes    []pipeListener
+	self     netip.Addr
+	// catchAllUpstream is where every catch-all connection is piped.
+	catchAllUpstream netip.AddrPort
+	spec             Spec
+	wg               sync.WaitGroup
+	mu               sync.Mutex
+	once             sync.Once
 	// closed refuses new connections once shutdown has begun.
 	closed bool
 }
 
 // bind opens every socket the spec asks for, on the relay's own address and nowhere else.
-func (s *server) bind(ctx context.Context) error {
+func (s *server) bind(ctx context.Context, sys system) error {
 	if s.spec.Signal.IsValid() {
 		return fmt.Errorf("%w: the DNS responder", errUnserved)
 	}
@@ -156,8 +242,10 @@ func (s *server) bind(ctx context.Context) error {
 	var config net.ListenConfig
 
 	for _, wanted := range s.spec.Listeners {
-		if wanted.Kind != Pipe {
-			return fmt.Errorf("%w: the catch-all", errUnserved)
+		if wanted.Kind == CatchAll {
+			s.catchAllUpstream = wanted.Upstream
+
+			continue
 		}
 
 		addr := netip.AddrPortFrom(s.self, wanted.Port)
@@ -170,7 +258,18 @@ func (s *server) bind(ctx context.Context) error {
 		s.pipes = append(s.pipes, pipeListener{listener: listener, upstream: wanted.Upstream, port: wanted.Port})
 	}
 
-	return nil
+	if !s.catchAllUpstream.IsValid() {
+		return nil
+	}
+
+	ports, err := sys.catchAllPorts(s.spec)
+	if err != nil {
+		return err
+	}
+
+	s.catchAll, err = openCatchAll(s.self, ports)
+
+	return err
 }
 
 // start accepts on every bound socket.
@@ -178,6 +277,19 @@ func (s *server) start(ctx context.Context) {
 	for _, pipe := range s.pipes {
 		s.wg.Go(func() { s.accept(ctx, pipe) })
 	}
+
+	if s.catchAll == nil {
+		return
+	}
+
+	s.wg.Go(func() {
+		err := s.catchAll.serve(func(client net.Conn, port uint16) {
+			s.wg.Go(func() { s.relay(ctx, client, s.catchAllUpstream, port) })
+		})
+		if err != nil && ctx.Err() == nil {
+			s.fail(err)
+		}
+	})
 }
 
 // accept hands each connection on one pipe listener to its own goroutine.
@@ -308,5 +420,14 @@ func (s *server) shutdown() {
 		_ = conn.Close()
 	}
 
+	if s.catchAll != nil {
+		s.catchAll.wake()
+	}
+
 	s.wg.Wait()
+
+	// Only once its loop has returned: the loop waits on these descriptors.
+	if s.catchAll != nil {
+		s.catchAll.close()
+	}
 }
