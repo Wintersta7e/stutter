@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/Wintersta7e/stutter/internal/provision/rules"
 )
 
 // fatalTB is a real test whose Fatalf panics instead of ending the goroutine, so a test can assert
@@ -104,6 +106,53 @@ func TestADecoyNameThatExistsRefusesTheTest(t *testing.T) {
 
 	if after := docker.calls.Load(); after != before {
 		t.Fatalf("refusing the reserved names made %d docker calls; want 0", after-before)
+	}
+}
+
+// checkContainer creates, outside the helper's registry, a container labelled as a Stutter check's:
+// the stand-in for one the product created. It is removed by its exact ID when t ends.
+func checkContainer(t *testing.T, docker *Docker, checkID string) string {
+	t.Helper()
+
+	key, value := docker.engine.TestLabel()
+	id := docker.must(t, call{verb: verbCreate, args: []string{
+		"--label", rules.LabelCheck + "=" + checkID, "--label", key + "=" + value, "postgres:18-alpine", "true",
+	}})
+
+	t.Cleanup(func() {
+		if a := docker.run(t, call{verb: verbRemove, args: []string{id}}); a.exit != 0 {
+			t.Errorf("removing %s: %s", id, a.stderr)
+		}
+	})
+
+	return id
+}
+
+func TestKillRefusesAContainerOfAnUnregisteredCheck(t *testing.T) {
+	t.Parallel()
+
+	engine := Require(t)
+	docker := engine.Docker(t)
+	checkID := randomID(t, 16)
+	id := checkContainer(t, docker, checkID)
+
+	docker.OwnCheck(t, randomID(t, 16))
+
+	before := docker.calls.Load()
+
+	message := refused(t, func(f *fatalTB) { docker.Kill(f, id) })
+	if !strings.Contains(message, "refusing to kill") {
+		t.Fatalf("a container of an unregistered check was killed: %q", message)
+	}
+
+	if calls := docker.calls.Load() - before; calls != 1 {
+		t.Fatalf("the refused kill made %d docker calls; want 1, its inspect", calls)
+	}
+
+	docker.OwnCheck(t, checkID)
+
+	if message := refused(t, func(f *fatalTB) { docker.Kill(f, id) }); message != "" {
+		t.Fatalf("a container of a registered check was refused: %q", message)
 	}
 }
 
