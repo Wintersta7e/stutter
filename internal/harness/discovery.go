@@ -190,8 +190,12 @@ func (b *bare) quiet() time.Duration {
 }
 
 // discard ends the start. The service goes first, because the proxies wait for its connections; the
-// script is aborted, never committed.
+// script is aborted, never committed. The teardown point is marked before the service goes: a
+// connection it closes as it is removed hid nothing, and without the mark a TLS connection held open
+// without a request would read as a client that could not talk to the stub.
 func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
+	b.observed.markTeardown()
+
 	exit, err := b.service.Close(ctx)
 	if err != nil {
 		err = fmt.Errorf("close the service under test: %w", err)
