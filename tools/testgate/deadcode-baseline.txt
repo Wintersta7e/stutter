@@ -28,27 +28,14 @@ github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
 # The invocation listener set and its endpoint keys: opened by the compose path once per check.
 github.com/Wintersta7e/stutter/internal/harness.EndpointKey
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.accept
 github.com/Wintersta7e/stutter/internal/harness.ListenerSet.acceptance
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.admit
 github.com/Wintersta7e/stutter/internal/harness.ListenerSet.advertised
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.current
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.forget
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.open
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.track
 github.com/Wintersta7e/stutter/internal/harness.OpenListeners
-github.com/Wintersta7e/stutter/internal/harness.attachment.fail
-github.com/Wintersta7e/stutter/internal/harness.attachment.take
-github.com/Wintersta7e/stutter/internal/harness.handover.offer
 github.com/Wintersta7e/stutter/internal/harness.ParseEndpointKey
 github.com/Wintersta7e/stutter/internal/harness.catchAllPort
 github.com/Wintersta7e/stutter/internal/harness.validateBus
 github.com/Wintersta7e/stutter/internal/harness.validateKeys
 github.com/Wintersta7e/stutter/internal/harness.validateListeners
-# The host side of the relay framing: called by the invocation listener set the compose path opens.
-github.com/Wintersta7e/stutter/internal/relay.Accept
-github.com/Wintersta7e/stutter/internal/relay.ReadQuery
-github.com/Wintersta7e/stutter/internal/relay.WriteAck
 # The relay token and argv: written by the compose path when it creates the relay containers.
 github.com/Wintersta7e/stutter/internal/relay.NewToken
 github.com/Wintersta7e/stutter/internal/relay.Spec.Args

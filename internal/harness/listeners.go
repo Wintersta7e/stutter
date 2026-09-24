@@ -13,8 +13,19 @@ import (
 	"github.com/Wintersta7e/stutter/internal/relay"
 )
 
-// errListenerConfig means the invocation listeners were asked for with something missing or unusable.
-var errListenerConfig = errors.New("invalid invocation listener configuration")
+var (
+	// errListenerConfig means the invocation listeners were asked for with something missing or
+	// unusable.
+	errListenerConfig = errors.New("invalid invocation listener configuration")
+	// errSRV means the service looked up an SRV record: it names a service and port Stutter cannot stand
+	// in for, and the connection that follows would go unseen.
+	errSRV = errors.New("the service looked up an SRV record")
+	// errSeedBusOpen means the seed bus was opened twice.
+	errSeedBusOpen = errors.New("the seed bus is already open")
+)
+
+// srvQuery is the DNS query type of an SRV lookup.
+const srvQuery uint16 = 33
 
 // UpstreamSource returns, for one start, where each endpoint the listener set serves really is: every
 // restored dependency's address and the bus's, keyed like the listeners. It is read once per start,
@@ -75,6 +86,14 @@ type ListenerSet struct {
 	endpoints map[string]*endpoint
 	// conns are the connections whose preamble is still being read, closed with the set.
 	conns map[net.Conn]struct{}
+	// seedBus pipes the seed phase's jobs to the bus; seedHandover feeds it. Both nil outside the
+	// seed phase.
+	seedBus      *pipe
+	seedHandover *handover
+	// signals are the stub relays' signal connections, held for the set's life.
+	signals []net.Conn
+	// queries are every signal record, in arrival order.
+	queries []relay.Query
 	// advertise is the address containers dial the listeners at, once verified.
 	advertise  netip.Addr
 	cfg        ListenerConfig
@@ -234,6 +253,82 @@ func (s *ListenerSet) Mode() Mode {
 	return s.cfg.Mode
 }
 
+// Queries are every DNS query the stub relay signalled, in the order they arrived.
+func (s *ListenerSet) Queries() []relay.Query {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.queries)
+}
+
+// OpenSeedBus opens the seed bus's listener for the seed phase: jobs reach the bus through it, never
+// recorded and never attached to a start. A connection for the monitoring port is piped to monitor,
+// one for a bus client port to client. It returns the listener's port.
+//
+// The addresses are the caller's to give once, because the bus does not restart during the seed phase.
+func (s *ListenerSet) OpenSeedBus(ctx context.Context, client, monitor netip.AddrPort) (uint16, error) {
+	seed := newHandover(nil)
+	bus := &pipe{listener: seed, route: func(conn net.Conn) string {
+		if relayed, ok := conn.(*relay.Conn); ok && relayed.DestinationPort() == MonitorPort {
+			return monitor.String()
+		}
+
+		return client.String()
+	}}
+
+	s.mu.Lock()
+
+	if s.seedHandover != nil {
+		s.mu.Unlock()
+
+		return 0, errSeedBusOpen
+	}
+
+	s.seedHandover, s.seedBus = seed, bus
+	s.mu.Unlock()
+
+	s.wg.Go(func() {
+		_ = bus.serve(ctx) //nolint:errcheck // its failure is read, and named, by CloseSeedBus.
+	})
+
+	accepts := func(port uint16) bool { return port == MonitorPort || slices.Contains(s.cfg.Bus, port) }
+
+	if err := s.open(ctx, KeySeedBus, accepts); err != nil {
+		return 0, errors.Join(err, s.CloseSeedBus())
+	}
+
+	port, _ := s.Port(KeySeedBus)
+
+	return port, nil
+}
+
+// CloseSeedBus closes the seed bus's listener and waits for its pipes. It returns the first pipe that
+// could not reach the bus, naming the address it tried.
+func (s *ListenerSet) CloseSeedBus() error {
+	s.mu.Lock()
+	opened := s.endpoints[KeySeedBus]
+	delete(s.endpoints, KeySeedBus)
+	bus := s.seedBus
+	s.seedBus, s.seedHandover = nil, nil
+	s.mu.Unlock()
+
+	if opened != nil {
+		_ = opened.listener.Close()
+	}
+
+	if bus == nil {
+		return nil
+	}
+
+	bus.stop()
+
+	if failure := bus.failure(); failure != nil {
+		return fmt.Errorf("the seed bus: %w", failure)
+	}
+
+	return nil
+}
+
 // Close closes every listener and every connection still being read, and waits for their goroutines
 // until ctx ends. The relays must be gone first: a listener's close waits for in-flight connections.
 func (s *ListenerSet) Close(ctx context.Context) error {
@@ -245,10 +340,12 @@ func (s *ListenerSet) Close(ctx context.Context) error {
 		listeners = append(listeners, opened.listener)
 	}
 
-	conns := make([]net.Conn, 0, len(s.conns))
+	conns := make([]net.Conn, 0, len(s.conns)+len(s.signals))
 	for conn := range s.conns {
 		conns = append(conns, conn)
 	}
+
+	conns = append(conns, s.signals...)
 	s.mu.Unlock()
 
 	for _, listener := range listeners {
@@ -258,6 +355,9 @@ func (s *ListenerSet) Close(ctx context.Context) error {
 	for _, conn := range conns {
 		_ = conn.Close()
 	}
+
+	// Closed with the rest if the seed phase never ended; its dial failures are the seed phase's.
+	_ = s.CloseSeedBus() //nolint:errcheck // see above.
 
 	done := make(chan struct{})
 
@@ -360,7 +460,16 @@ func (s *ListenerSet) admit(opened *endpoint, conn net.Conn) {
 	case opened.key == KeyVerify:
 		// The probe is judged by its answer; one that goes astray is the verifier's to report.
 		_ = relay.WriteAck(relayed) //nolint:errcheck // see above.
-	case attached != nil && opened.key != KeyDNSSignal:
+	case opened.key == KeyDNSSignal:
+		// Held across starts: a stub relay opens it once, before any start attaches.
+		s.holdSignal(relayed)
+
+		return
+	case opened.key == KeySeedBus:
+		s.offerSeed(relayed)
+
+		return
+	case attached != nil:
 		attached.take(opened.key, relayed)
 
 		return
@@ -369,6 +478,68 @@ func (s *ListenerSet) admit(opened *endpoint, conn net.Conn) {
 	}
 
 	_ = conn.Close()
+}
+
+// holdSignal reads a stub relay's signal records until the connection ends. The relay outlives every
+// start, so the connection does too; a record is attributed to whichever start is attached when it
+// arrives.
+func (s *ListenerSet) holdSignal(conn *relay.Conn) {
+	s.mu.Lock()
+
+	if s.closed {
+		s.mu.Unlock()
+
+		_ = conn.Close()
+
+		return
+	}
+
+	s.signals = append(s.signals, conn)
+	s.mu.Unlock()
+
+	for {
+		query, err := relay.ReadQuery(conn)
+		if err != nil {
+			// The relay is gone; its liveness check reports that, not the signal.
+			_ = conn.Close()
+
+			return
+		}
+
+		s.signalled(query)
+	}
+}
+
+// signalled records one query. Attached, it counts on the start, and an SRV lookup stops it: the
+// record names a service Stutter cannot stand in for. Between starts it is counted Unattached.
+func (s *ListenerSet) signalled(query relay.Query) {
+	s.mu.Lock()
+	s.queries = append(s.queries, query)
+	attached := s.attached
+	s.mu.Unlock()
+
+	if attached == nil {
+		s.unattached.Add(1)
+
+		return
+	}
+
+	attached.signalled.Add(1)
+
+	if query.Type == srvQuery {
+		attached.fail(fmt.Errorf("%w: %s", errSRV, query.Name))
+	}
+}
+
+// offerSeed hands a seed-phase connection to the seed bus's pipe, or refuses it outside the seed phase.
+func (s *ListenerSet) offerSeed(conn *relay.Conn) {
+	s.mu.Lock()
+	seed := s.seedHandover
+	s.mu.Unlock()
+
+	if seed == nil || !seed.offer(conn) {
+		_ = conn.Abort() //nolint:errcheck // the seed phase is over; nothing serves the connection.
+	}
 }
 
 // track registers a connection whose preamble is being read, or closes it when the set is closing.

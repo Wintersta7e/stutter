@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
@@ -91,9 +92,11 @@ type attachment struct {
 	failure  chan error
 	detached chan struct{}
 	// handovers are the endpoints this start serves; tracked are the connections handed over on each.
-	handovers  map[string]*handover
-	tracked    map[string][]*relay.Conn
-	upstreams  map[string]netip.AddrPort
+	handovers map[string]*handover
+	tracked   map[string][]*relay.Conn
+	upstreams map[string]netip.AddrPort
+	// signalled counts the DNS signal records that arrived while this start was attached.
+	signalled  atomic.Int64
 	failOnce   sync.Once
 	detachOnce sync.Once
 	mu         sync.Mutex
@@ -380,7 +383,10 @@ func (s *Sandbox) serveRelayed(
 	busProxy := natsproxy.New(attached.listener(KeyBus), attached.upstream(KeyBus), sink, bus)
 	observed.start(ctx, KeyBus, ignoringContext(busProxy.Close), busProxy.Serve)
 
-	monitor := &pipe{listener: attached.listener(KeyBusMonitor), route: attached.upstreams[KeyBusMonitor].String}
+	monitor := &pipe{
+		listener: attached.listener(KeyBusMonitor),
+		route:    func(net.Conn) string { return attached.upstream(KeyBusMonitor) },
+	}
 	observed.start(ctx, KeyBusMonitor, monitor.close, monitor.serve)
 
 	for _, key := range s.cfg.Listeners.cfg.Postgres {
@@ -413,7 +419,7 @@ func (s *Sandbox) serveRelayed(
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type pipe struct {
 	listener net.Listener
-	route    func() string
+	route    func(conn net.Conn) string
 	failed   error
 	wg       sync.WaitGroup
 	once     sync.Once
@@ -433,7 +439,7 @@ func (p *pipe) serve(ctx context.Context) error {
 }
 
 func (p *pipe) splice(ctx context.Context, conn net.Conn) {
-	upstream := p.route()
+	upstream := p.route(conn)
 
 	var dialer net.Dialer
 
@@ -464,13 +470,18 @@ func (p *pipe) failure() error {
 	return p.failed
 }
 
-// close stops the pipe and waits for its connections.
+// close stops the pipe and waits for its connections: an entry's closer.
 func (p *pipe) close(context.Context) error {
+	p.stop()
+
+	return nil
+}
+
+// stop closes the pipe's listener and waits for its connections.
+func (p *pipe) stop() {
 	_ = p.listener.Close()
 
 	p.wg.Wait()
-
-	return nil
 }
 
 // abort closes a connection so its far end reads a reset.

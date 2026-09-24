@@ -112,9 +112,10 @@ func (r *running) exit() int {
 	return r.code
 }
 
-// ports hands each test in this package its own ports, from [63000, 65000): above the kernel's
+// ports hands each test in this package its own ports, from [63000, 64900): above the kernel's
 // source-port range (32768–60999), and above the range the package's internal tests use — both run in
-// one test binary.
+// one test binary. The ports above 64900 are other packages' tests', which run in processes of their
+// own.
 var ports struct {
 	next uint16
 	mu   sync.Mutex
@@ -138,7 +139,7 @@ func freePort(t *testing.T) uint16 {
 
 	var config net.ListenConfig
 
-	for ; ports.next < 65000; ports.next++ {
+	for ; ports.next < 64900; ports.next++ {
 		listener, err := config.Listen(t.Context(), "tcp4", netip.AddrPortFrom(localhost, ports.next).String())
 		if err != nil {
 			continue
@@ -151,7 +152,7 @@ func freePort(t *testing.T) uint16 {
 		return port
 	}
 
-	t.Fatal("no free port in [63000, 65000)")
+	t.Fatal("no free port in [63000, 64900)")
 
 	return 0
 }
