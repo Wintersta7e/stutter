@@ -157,6 +157,22 @@ func (a *authority) coverUnnamed(template *x509.Certificate, local netip.Addr) {
 	}
 }
 
+// setAdvertise records the host the service is told to dial, once it is known — after the authority
+// was minted, on the listener set. A leaf already minted for a client without a server name did not
+// cover it, so those are minted again.
+func (a *authority) setAdvertise(host string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.advertise = host
+
+	for key := range a.leaves {
+		if strings.HasPrefix(key, noServerName) {
+			delete(a.leaves, key)
+		}
+	}
+}
+
 // cover adds a name to a leaf, once: as an IP address when it is one, else as a DNS name.
 func cover(template *x509.Certificate, name string) {
 	address, err := netip.ParseAddr(name)

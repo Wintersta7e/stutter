@@ -212,12 +212,14 @@ func (s *ListenerSet) Port(key string) (uint16, bool) {
 	return opened.port, true
 }
 
-// SetAdvertise records the verified address containers dial the listeners at.
+// SetAdvertise records the verified address containers dial the listeners at. The CA's leaf for a
+// client that sends no server name covers it from then on, because such a client verifies it.
 func (s *ListenerSet) SetAdvertise(host netip.Addr) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	s.advertise = host
+	s.mu.Unlock()
+
+	s.authority.setAdvertise(host.String())
 }
 
 // CAPEM is the check's certificate authority, which the service must trust to reach the TLS stub.

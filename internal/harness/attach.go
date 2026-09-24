@@ -374,9 +374,10 @@ func (s *Sandbox) observeRelayed(ctx context.Context, sink *effect.Recorder, bus
 }
 
 // relayedEntries is how many Serve goroutines a relayed start has, and so how many results its close
-// drains: the attachment, the bus, its monitoring pipe, and a proxy per database and unparsed key.
+// drains: the attachment, the bus, its monitoring pipe, the HTTP stub, and a proxy per database and
+// unparsed key.
 func (s *Sandbox) relayedEntries() int {
-	const alwaysRelayed = 3
+	const alwaysRelayed = 4
 
 	return alwaysRelayed + len(s.cfg.Listeners.cfg.Postgres) + len(s.cfg.Listeners.cfg.Opaque)
 }
@@ -410,14 +411,7 @@ func (s *Sandbox) serveRelayed(
 		observed.start(ctx, key, ignoringContext(dependency.Close), dependency.Serve)
 	}
 
-	httpRun, err := s.httpScript.Begin()
-	if err != nil {
-		return fmt.Errorf("start the HTTP response script: %w", err)
-	}
-
-	observed.httpRun = httpRun
-
-	return nil
+	return s.serveStub(ctx, sink, observed, attached)
 }
 
 // pipe splices every connection it is handed to an upstream, byte for byte and unrecorded. route picks

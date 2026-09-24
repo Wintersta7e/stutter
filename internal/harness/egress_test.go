@@ -1,16 +1,19 @@
 package harness_test
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -18,6 +21,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +29,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/harness"
 	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
+	"github.com/Wintersta7e/stutter/internal/relay"
 	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/toy"
 )
@@ -545,5 +550,244 @@ func TestHTTPTLSIsGone(t *testing.T) {
 
 	if searched == 0 || matches > 0 {
 		t.Errorf("files searched: %d matches: %d, want files searched and no match", searched, matches)
+	}
+}
+
+// throughRelay is a service's call to an external name, as the stub relay delivers it: a connection to
+// the listener set's key, opened with the check's preamble for the port the service dialled, carrying
+// request — over TLS when secure is set — and its answer read.
+func (r relayedRig) throughRelay(
+	ctx context.Context,
+	key string,
+	port uint16,
+	secure *tls.Config,
+	request string,
+) error {
+	listener, open := r.set.Port(key)
+	if !open {
+		return fmt.Errorf("the set has no %s listener", key)
+	}
+
+	conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "tcp4",
+		netip.AddrPortFrom(localhost, listener).String())
+	if err != nil {
+		return fmt.Errorf("dial the %s listener: %w", key, err)
+	}
+
+	defer func() { _ = conn.Close() }()
+
+	if preambleErr := relay.WritePreamble(conn, r.token, port); preambleErr != nil {
+		return fmt.Errorf("write the preamble: %w", preambleErr)
+	}
+
+	if secure != nil {
+		conn = tls.Client(conn, secure)
+	}
+
+	if deadlineErr := conn.SetDeadline(time.Now().Add(5 * time.Second)); deadlineErr != nil {
+		return fmt.Errorf("bound the call: %w", deadlineErr)
+	}
+
+	if _, writeErr := io.WriteString(conn, request); writeErr != nil {
+		return fmt.Errorf("write the request: %w", writeErr)
+	}
+
+	response, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return fmt.Errorf("read the answer: %w", err)
+	}
+
+	return response.Body.Close()
+}
+
+// stubbedSandbox is a sandbox on the rig's listener set around a pulling service that, while handling
+// the first message of each start, runs calls. tune, when set, adjusts the configuration.
+func (r relayedRig) stubbedSandbox(
+	t *testing.T,
+	calls func(ctx context.Context, start int) error,
+	tune func(*harness.Config),
+) *harness.Sandbox {
+	t.Helper()
+
+	key := make([]byte, hashKeyLen)
+	if _, err := rand.Read(key); err != nil {
+		t.Fatalf("generate hash key: %v", err)
+	}
+
+	config := observedConfig()
+	config.FilterSubjects = []string{toy.SubjectOrderCreated}
+
+	var starts atomic.Int32
+
+	settings := harness.Config{
+		Corpus:    r.store,
+		Listeners: r.set,
+		HashKey:   key,
+		Policy:    config,
+		Quiesce:   toy.DefaultQuiesce,
+		Start: func(ctx context.Context, _ harness.Addresses) (harness.Consumer, error) {
+			start := int(starts.Add(1))
+
+			var once sync.Once
+
+			handled := func() {
+				once.Do(func() {
+					if err := calls(ctx, start); err != nil {
+						t.Errorf("start %d: %v", start, err)
+					}
+				})
+			}
+
+			return startPulling(ctx, harness.Addresses{
+				Opaque: map[string]string{opaqueCache: r.cacheAt.String()},
+				NATS:   "nats://" + r.busAt.String(),
+			}, config, quirks{onHandled: handled})
+		},
+	}
+
+	if tune != nil {
+		tune(&settings)
+	}
+
+	built, err := harness.New(settings)
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	return built
+}
+
+// shared takes the rig's corpus out of its stream and checkpoints the bus once, so several sandboxes on
+// the one corpus restore the same starting point.
+func (r relayedRig) shared(t *testing.T) func(*harness.Config) {
+	t.Helper()
+
+	recorded, err := r.store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+
+	if clearErr := r.store.Clear(t.Context()); clearErr != nil {
+		t.Fatalf("Clear() error = %v", clearErr)
+	}
+
+	baseline, err := r.store.Checkpoint(t.Context(), filepath.Join(filepath.Dir(r.store.StoreDir()), "shared"))
+	if err != nil {
+		t.Fatalf("Checkpoint() error = %v", err)
+	}
+
+	return func(settings *harness.Config) {
+		settings.Recorded, settings.Baseline = recorded, &baseline
+	}
+}
+
+// trustingSet is a TLS configuration that trusts only the set's CA, asking for name.
+func trustingSet(t *testing.T, set *harness.ListenerSet, name string) *tls.Config {
+	t.Helper()
+
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(set.CAPEM()) {
+		t.Fatal("the set's CA PEM holds no certificate")
+	}
+
+	return &tls.Config{RootCAs: roots, ServerName: name, MinVersion: tls.VersionTLS12}
+}
+
+// httpEffects are a run's HTTP effects, as rendered.
+func httpEffects(result replay.Result) []string {
+	var rendered []string
+
+	for _, observed := range result.Effects {
+		if observed.Kind == effect.KindHTTP {
+			rendered = append(rendered, observed.Printable)
+		}
+	}
+
+	return rendered
+}
+
+// TestTheStubServesTheListenerSetsEntries: a provisioned service reaches the stub through the stub
+// relay on 80, 443 and any other port, and the run's stub serves all three from the check's listeners.
+func TestTheStubServesTheListenerSetsEntries(t *testing.T) {
+	t.Parallel()
+
+	rig := startRig(t)
+	secure := trustingSet(t, rig.set, "rates.example.test")
+
+	built := rig.stubbedSandbox(t, func(ctx context.Context, _ int) error {
+		return errors.Join(
+			rig.throughRelay(ctx, harness.KeyHTTP, harness.HTTPPort, nil,
+				"GET /plain HTTP/1.1\r\nHost: 172.18.0.5\r\n\r\n"),
+			rig.throughRelay(ctx, harness.KeyHTTPS, harness.HTTPSPort, secure,
+				"GET /secure HTTP/1.1\r\nHost: rates.example.test\r\n\r\n"),
+			rig.throughRelay(ctx, harness.KeyCatchAll, 8080, nil,
+				"GET /other HTTP/1.1\r\nHost: api.example.test:8080\r\n\r\n"),
+		)
+	}, nil)
+
+	rendered := httpEffects(cleanRun(t, built, "clean"))
+
+	for _, want := range []string{
+		"GET dependency.invalid/plain", "GET rates.example.test/secure", "GET api.example.test:8080/other",
+	} {
+		if !slices.ContainsFunc(rendered, func(effect string) bool { return strings.HasPrefix(effect, want) }) {
+			t.Errorf("HTTP effects = %q, want one beginning %q", rendered, want)
+		}
+	}
+}
+
+// TestEveryConsumerCheckPresentsTheChecksCA: the CA file is written once per check, so every consumer
+// check's stub presents leaves from the one CA in it.
+func TestEveryConsumerCheckPresentsTheChecksCA(t *testing.T) {
+	t.Parallel()
+
+	rig := startRig(t)
+	secure := trustingSet(t, rig.set, "rates.example.test")
+	call := func(ctx context.Context, _ int) error {
+		return rig.throughRelay(ctx, harness.KeyHTTPS, harness.HTTPSPort, secure,
+			"GET /secure HTTP/1.1\r\nHost: rates.example.test\r\n\r\n")
+	}
+
+	shared := rig.shared(t)
+
+	checks := []*harness.Sandbox{rig.stubbedSandbox(t, call, shared), rig.stubbedSandbox(t, call, shared)}
+
+	for check, built := range checks {
+		result, err := built.Run(t.Context(), "clean", replay.Clean{}, nil)
+		if err != nil || result.Stopped != "" {
+			t.Errorf("consumer check %d: Run() = stopped %q, %v; want its stub to present the check's CA",
+				check, result.Stopped, err)
+		}
+	}
+}
+
+// TestAStopClosesOnlyTheRunsStub: a stop ends the run it happened in and closes that run's stub, never
+// the check's listeners, so the next run is served on the same ports.
+func TestAStopClosesOnlyTheRunsStub(t *testing.T) {
+	t.Parallel()
+
+	rig := startRig(t)
+
+	built := rig.stubbedSandbox(t, func(ctx context.Context, start int) error {
+		if start == 1 {
+			//nolint:errcheck // the stub hangs up on a CONNECT; the stop is what the test reads.
+			_ = rig.throughRelay(ctx, harness.KeyHTTP, harness.HTTPPort, nil,
+				"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+
+			return nil
+		}
+
+		return rig.throughRelay(ctx, harness.KeyHTTP, harness.HTTPPort, nil,
+			"GET /after HTTP/1.1\r\nHost: 172.18.0.5\r\n\r\n")
+	}, nil)
+
+	stopped := cleanRun(t, built, "stopped")
+	if !strings.Contains(stopped.Stopped, "egress stop connect") {
+		t.Fatalf("Stopped = %q, want the CONNECT's stop", stopped.Stopped)
+	}
+
+	after := httpEffects(cleanRun(t, built, "after"))
+	if len(after) != 1 || !strings.HasPrefix(after[0], "GET dependency.invalid/after") {
+		t.Errorf("HTTP effects after the stop = %q, want the one call served", after)
 	}
 }

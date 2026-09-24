@@ -30,6 +30,7 @@ import (
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	opaqueproxy "github.com/Wintersta7e/stutter/internal/proxy/opaque"
 	"github.com/Wintersta7e/stutter/internal/proxy/pg"
+	"github.com/Wintersta7e/stutter/internal/relay"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
@@ -608,6 +609,39 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 	observed.at.HTTP = "http://" + s.advertise(cleartext.Addr().String())
 	observed.at.HTTPS = "https://" + s.advertise(secure.Addr().String())
 	observed.at.HTTPCACert = s.certificates.pem
+
+	return nil
+}
+
+// A connection the listener set hands over carries the port its client dialled, which is how the stub's
+// catch-all learns it.
+var _ httpproxy.Tagged = (*relay.Conn)(nil)
+
+// serveStub stands the run's HTTP stub on the listener set's three stub keys: what the stub relay
+// receives on 80, on 443, and on every other port. It binds nothing, and presents the check's CA, so
+// every consumer check's stub is trusted through the one CA file. A stop closes this stub and the
+// start's hand-overs, never the set's listeners.
+func (s *Sandbox) serveStub(ctx context.Context, sink *effect.Recorder, observed *egress, attached *attachment) error {
+	httpRun, err := s.httpScript.Begin()
+	if err != nil {
+		return fmt.Errorf("start the HTTP response script: %w", err)
+	}
+
+	observed.httpRun = httpRun
+
+	entries := httpproxy.Entries{
+		Cleartext: attached.listener(KeyHTTP),
+		TLS:       attached.listener(KeyHTTPS),
+		CatchAll:  attached.listener(KeyCatchAll),
+	}
+
+	stub, err := httpproxy.New(entries, s.cfg.HTTPHost, sink, s.httpScript, s.certificates.certificate)
+	if err != nil {
+		return fmt.Errorf("build the HTTP stub: %w", err)
+	}
+
+	observed.stub = stub
+	observed.start(ctx, KeyHTTP, stub.CloseContext, stub.Serve)
 
 	return nil
 }

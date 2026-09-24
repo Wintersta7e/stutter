@@ -325,33 +325,73 @@ func TestAnOmittedUpstreamKeyIsASetupError(t *testing.T) {
 	}
 }
 
-// TestAnUnservedStubKeyStopsTheStart fails the start loudly when the set is handed a connection nobody
-// serves, rather than resetting it quietly: a quiet reset reads as a dependency the service never used.
-func TestAnUnservedStubKeyStopsTheStart(t *testing.T) {
+// TestAnUnservedKeyStopsTheStart fails the start loudly when it is handed a connection nobody serves,
+// rather than resetting it quietly: a quiet reset reads as a dependency the service never used. Every
+// key the set opens is served by a start, so the connection is handed over directly.
+func TestAnUnservedKeyStopsTheStart(t *testing.T) {
 	t.Parallel()
+
+	const unserved = "unserved:7"
 
 	cache := startLineServer(t, "+OK\n")
 	fixture := attachFixture(t, map[string]netip.AddrPort{
 		cacheKey: cache.address, KeyBus: cache.address, KeyBusMonitor: cache.address,
 	})
 
-	dialKey(t, fixture.set, KeyHTTP, fixture.cfg.Token, HTTPPort)
+	fixture.observed.attached.take(unserved, relayedConn(t, fixture.cfg.Token))
 
 	select {
 	case err := <-fixture.observed.served:
 		// Put back for the close below, which drains one result per entry.
 		fixture.observed.served <- err
 
-		if err == nil || !strings.Contains(err.Error(), keyListeners+":") || !strings.Contains(err.Error(), KeyHTTP) {
-			t.Errorf("the listeners entry ended with %v, want an error naming %s", err, KeyHTTP)
+		if err == nil || !strings.Contains(err.Error(), keyListeners+":") || !strings.Contains(err.Error(), unserved) {
+			t.Errorf("the listeners entry ended with %v, want an error naming %s", err, unserved)
 		}
 	case <-time.After(setWait):
 		t.Fatal("a connection on an unserved key did not stop the start")
 	}
 
-	if err := fixture.observed.close(t.Context()); err == nil || !strings.Contains(err.Error(), KeyHTTP) {
+	if err := fixture.observed.close(t.Context()); err == nil || !strings.Contains(err.Error(), unserved) {
 		t.Errorf("close() = %v, want the unserved key named", err)
 	}
+}
+
+// relayedConn is a loopback connection opened with the check's preamble, as the set hands one over.
+func relayedConn(t *testing.T, token relay.Token) *relay.Conn {
+	t.Helper()
+
+	var config net.ListenConfig
+
+	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+
+	defer func() { _ = listener.Close() }()
+
+	dialled, err := (&net.Dialer{}).DialContext(t.Context(), "tcp4", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+
+	t.Cleanup(func() { _ = dialled.Close() })
+
+	if preambleErr := relay.WritePreamble(dialled, token, 7); preambleErr != nil {
+		t.Fatalf("write the preamble: %v", preambleErr)
+	}
+
+	accepted, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+
+	conn, err := relay.Accept(accepted, token)
+	if err != nil {
+		t.Fatalf("read the preamble: %v", err)
+	}
+
+	return conn
 }
 
 // TestDetachIsBounded keeps a stuck proxy from hanging the check: past the drain bound its connections

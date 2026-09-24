@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 )
@@ -130,5 +131,25 @@ func TestTheCAPEMIsOneCertificateBlock(t *testing.T) {
 	if block == nil || block.Type != "CERTIFICATE" || len(bytes.TrimSpace(rest)) != 0 {
 		t.Errorf("pem = one %v block and %d bytes more, want one CERTIFICATE block and nothing else",
 			block != nil && block.Type == "CERTIFICATE", len(rest))
+	}
+}
+
+// TestTheSetsAdvertisedAddressReachesTheNoSNILeaf: the check's CA is minted before the address
+// containers dial is known, and a client without a server name verifies that address, so the leaf for
+// such a client covers it once the set learns it.
+func TestTheSetsAdvertisedAddressReachesTheNoSNILeaf(t *testing.T) {
+	t.Parallel()
+
+	set := openTestSet(t, testListenerConfig(t))
+	hello := &tls.ClientHelloInfo{Conn: localConn{}}
+
+	if err := verify(set.authority, mintedFor(t, set.authority, hello), "192.0.2.20", time.Now()); err == nil {
+		t.Fatal("the no-SNI leaf covers an address the set was never told")
+	}
+
+	set.SetAdvertise(netip.MustParseAddr("192.0.2.20"))
+
+	if err := verify(set.authority, mintedFor(t, set.authority, hello), "192.0.2.20", time.Now()); err != nil {
+		t.Errorf("after SetAdvertise the no-SNI leaf does not verify for the advertised address: %v", err)
 	}
 }
