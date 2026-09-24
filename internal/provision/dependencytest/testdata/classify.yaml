@@ -1,0 +1,22 @@
+# A Postgres dependency that listens on a port its image does not advertise, and exposes one nothing
+# serves: the static evidence leaves both opaque, and only the handshake can tell them apart.
+name: classify
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+    depends_on:
+      db:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  db:
+    image: postgres:18-alpine
+    command: ["postgres", "-p", "6000"]
+    expose: ["6000", "7000"]
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust

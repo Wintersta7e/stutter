@@ -3,6 +3,7 @@ package provision
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path"
 	"slices"
 	"strconv"
@@ -294,4 +295,14 @@ func healthcheckOf(check compose.Healthcheck, set bool) *Healthcheck {
 			Inherit: len(check.Test) == 0,
 		}
 	}
+}
+
+// isHostDir reports whether a host path is a directory, without following a final symlink.
+func isHostDir(p string) (bool, error) {
+	info, err := os.Lstat(p)
+	if err != nil {
+		return false, fmt.Errorf("%w: %w", errStorage, err)
+	}
+
+	return info.IsDir(), nil
 }
