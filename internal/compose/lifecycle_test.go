@@ -25,9 +25,13 @@ func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 				Interval: 5 * time.Second, Timeout: 3 * time.Second, Retries: 4,
 				StartPeriod: 10 * time.Second, StartInterval: time.Second,
 			}},
-			{service: "cache", set: true, want: compose.Healthcheck{Test: []string{"CMD-SHELL", "redis-cli ping"}}},
+			{
+				service: cacheService,
+				set:     true,
+				want:    compose.Healthcheck{Test: []string{"CMD-SHELL", "redis-cli ping"}},
+			},
 			{service: "worker", set: true, want: compose.Healthcheck{Disabled: true}},
-			{service: "migrate", set: true, want: compose.Healthcheck{Test: []string{"NONE"}, Disabled: true}},
+			{service: jobService, set: true, want: compose.Healthcheck{Test: []string{"NONE"}, Disabled: true}},
 			{service: toolsService},
 			{service: target},
 		}
@@ -77,7 +81,7 @@ func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 			{service: "db", want: compose.Stop{
 				Signal: "SIGINT", Grace: 90 * time.Second, SignalSet: true, GraceSet: true,
 			}},
-			{service: "cache", want: compose.Stop{Signal: "SIGTERM", SignalSet: true}},
+			{service: cacheService, want: compose.Stop{Signal: "SIGTERM", SignalSet: true}},
 			{service: "worker"},
 		}
 

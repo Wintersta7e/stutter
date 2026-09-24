@@ -74,6 +74,9 @@ const (
 	// resolvedEnvironment is compose's resolved environment for every model modelFrom parses: the
 	// two variables the kitchen model's environment-sourced config and secret read.
 	resolvedEnvironment = "HOME=/home/x\nCONFIG_VALUE=config-value\nSECRET_VALUE=secret-value\n"
+	// cacheService and jobService are dependencies several models share.
+	cacheService = "cache"
+	jobService   = "migrate"
 	// absentService is a service no model has.
 	absentService = "ghost"
 	// pidKey, ipcKey and utsKey are namespace keys several tests name.
