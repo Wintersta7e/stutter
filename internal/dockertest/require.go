@@ -130,10 +130,12 @@ func decide(r reporter, value string, probe func() (provision.Identity, error)) 
 	return Engine{identity: identity}
 }
 
-// Main runs a Docker test package's tests. A package whose tests build the product calls it from
-// its TestMain.
+// Main runs a Docker test package's tests and then removes the binaries Binary built for them. A
+// package whose tests build the product calls it from its TestMain; Go exits with m.Run's code.
 func Main(m *testing.M) {
 	mainInstalled.Store(true)
+
+	defer processBuilder.remove()
 
 	m.Run()
 }
