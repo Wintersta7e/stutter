@@ -71,6 +71,12 @@ const (
 	target = "api"
 	// toolsService is a profile-gated service.
 	toolsService = "tools"
+	// absentService is a service no model has.
+	absentService = "ghost"
+	// pidKey, ipcKey and utsKey are namespace keys several tests name.
+	pidKey = "pid"
+	ipcKey = "ipc"
+	utsKey = "uts"
 )
 
 // project writes a compose file into a fresh project directory and returns its absolute path.

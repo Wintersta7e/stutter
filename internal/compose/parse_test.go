@@ -140,8 +140,8 @@ func TestAServiceAbsentEvenWithItsProfilesIsRefused(t *testing.T) {
 		narrow: func(string) ([]byte, error) { return nil, &exitError{text: "no such service", code: 1} },
 	}
 
-	_, err := compose.Parse(t.Context(), run.run, compose.Inputs{Service: "ghost", Files: []string{file}})
-	if !errors.Is(err, compose.ErrModel) || !strings.Contains(err.Error(), "ghost") {
+	_, err := compose.Parse(t.Context(), run.run, compose.Inputs{Service: absentService, Files: []string{file}})
+	if !errors.Is(err, compose.ErrModel) || !strings.Contains(err.Error(), absentService) {
 		t.Fatalf("Parse = %v, want ErrModel naming the service", err)
 	}
 

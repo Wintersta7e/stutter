@@ -147,7 +147,7 @@ var serviceKeys = []keyRule{
 	{path: "stop_signal", verdict: VerdictReplace},
 	{path: "stop_grace_period", verdict: VerdictReplace},
 	// Refused whatever the value.
-	{path: "devices", verdict: VerdictRefuse, class: K5, subtree: true},
+	{path: keyDevices, verdict: VerdictRefuse, class: K5, subtree: true},
 	{path: "device_cgroup_rules", verdict: VerdictRefuse, class: K5},
 	{path: "gpus", verdict: VerdictRefuse, class: K5, subtree: true},
 	{path: "deploy.resources.reservations.devices", verdict: VerdictRefuse, class: K5, subtree: true},
@@ -157,7 +157,7 @@ var serviceKeys = []keyRule{
 	{path: "credential_spec", verdict: VerdictRefuse, class: K6, subtree: true},
 	{path: "volumes_from", verdict: VerdictRefuse, class: K7},
 	{path: "provider", verdict: VerdictRefuse, class: K7, subtree: true},
-	{path: "models", verdict: VerdictRefuse, class: K7, subtree: true},
+	{path: keyModels, verdict: VerdictRefuse, class: K7, subtree: true},
 	{path: "pre_start", verdict: VerdictRefuse, class: K8, subtree: true},
 	{path: "post_start", verdict: VerdictRefuse, class: K8, subtree: true},
 	{path: "pre_stop", verdict: VerdictRefuse, class: K8, subtree: true},

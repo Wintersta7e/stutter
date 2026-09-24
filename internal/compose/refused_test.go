@@ -41,14 +41,14 @@ func TestASharedNamespaceIsNamed(t *testing.T) {
 		{name: "defaults"},
 		{name: "private ipc and cgroup", ipc: "private", cgroup: "private"},
 		{name: "shareable ipc", ipc: "shareable"},
-		{name: "pid host", pid: host, key: "pid", shared: true},
-		{name: "pid of a service", pid: "service:db", key: "pid", shared: true},
-		{name: "ipc host", ipc: host, key: "ipc", shared: true},
-		{name: "ipc of a container", ipc: "container:x", key: "ipc", shared: true},
-		{name: "uts host", uts: host, key: "uts", shared: true},
+		{name: "pid host", pid: host, key: pidKey, shared: true},
+		{name: "pid of a service", pid: "service:db", key: pidKey, shared: true},
+		{name: "ipc host", ipc: host, key: ipcKey, shared: true},
+		{name: "ipc of a container", ipc: "container:x", key: ipcKey, shared: true},
+		{name: "uts host", uts: host, key: utsKey, shared: true},
 		{name: "userns host", userns: host, key: "userns_mode", shared: true},
 		{name: "cgroup host", cgroup: host, key: "cgroup", shared: true},
-		{name: "first shared key wins", uts: host, cgroup: host, key: "uts", shared: true},
+		{name: "first shared key wins", uts: host, cgroup: host, key: utsKey, shared: true},
 	}
 
 	for _, tc := range cases {

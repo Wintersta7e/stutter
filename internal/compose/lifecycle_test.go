@@ -46,7 +46,7 @@ func TestHealthcheckIsReadAsComposeWroteIt(t *testing.T) {
 			}
 		}
 
-		if _, _, err := model.Healthcheck("ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		if _, _, err := model.Healthcheck(absentService); err == nil || !strings.Contains(err.Error(), absentService) {
 			t.Errorf("compose %s: Healthcheck(ghost) = %v, want an error naming the service", release, err)
 		}
 	}
@@ -88,7 +88,7 @@ func TestStopSignalAndGraceAreReadWhenSet(t *testing.T) {
 			}
 		}
 
-		if _, err := model.Stop("ghost"); err == nil || !strings.Contains(err.Error(), "ghost") {
+		if _, err := model.Stop(absentService); err == nil || !strings.Contains(err.Error(), absentService) {
 			t.Errorf("compose %s: Stop(ghost) = %v, want an error naming the service", release, err)
 		}
 	}
