@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -170,9 +171,9 @@ func (p *Proxy) dialFailure() error {
 	return p.dialFailed
 }
 
-// abort closes a client so it reads a reset, never EOF: the upstream could not be reached, and a clean
-// close would tell the client the dependency hung up on it. A relayed connection aborts itself, which
-// carries the reset back through the relay.
+// abort closes a connection so its peer reads a reset, never EOF: a clean close would tell the peer the
+// other side finished, which is not what happened. A relayed connection aborts itself, which carries
+// the reset back through the relay; a connection that can do neither is closed.
 func abort(conn net.Conn) {
 	if aborter, ok := conn.(interface{ Abort() error }); ok {
 		_ = aborter.Abort() //nolint:errcheck // the connection is being refused either way.
@@ -206,18 +207,22 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	current := &session{sink: p.sink, name: p.name}
 
+	// A reset on either leg resets both, once: the far end of each must read what the near end did.
+	var once sync.Once
+
+	resetBoth := func() {
+		once.Do(func() {
+			abort(client)
+			abort(upstream)
+		})
+	}
+
 	var pumps sync.WaitGroup
 
-	pumps.Go(func() {
-		pump(upstream, client, current.answered)
-		// Closing the far side unblocks the other direction's Read, so one peer hanging up ends the
-		// whole connection instead of leaving a pump parked until the run is torn down.
-		_ = client.Close()
-	})
+	pumps.Go(func() { pump(upstream, client, current.answered, resetBoth) })
+	pump(client, upstream, current.requested, resetBoth)
 
-	pump(client, upstream, current.requested)
-	_ = upstream.Close()
-
+	// Both directions have ended; the deferred closes finish a connection both peers finished.
 	pumps.Wait()
 
 	// A request the dependency never answered is still a request. Emitting it at close keeps a
@@ -225,8 +230,13 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 	current.flush()
 }
 
-// pump forwards src to dst, showing every chunk to observe on the way past.
-func pump(src, dst net.Conn, observe func([]byte)) {
+// pump forwards src to dst, showing every chunk to observe on the way past, until src ends.
+//
+// EOF is a half-close, passed on as one: dst's write side is shut and the other direction keeps
+// flowing, because a client that shuts its write side still waits for the reply. Any other read error,
+// or any write error, is a reset, passed on as one to both legs. Turning either ending into the other
+// would hand the service a behaviour its real dependency never had.
+func pump(src, dst net.Conn, observe func([]byte), resetBoth func()) {
 	buffer := make([]byte, copyBuffer)
 
 	for {
@@ -235,14 +245,34 @@ func pump(src, dst net.Conn, observe func([]byte)) {
 			observe(buffer[:read])
 
 			if _, writeErr := dst.Write(buffer[:read]); writeErr != nil {
+				resetBoth()
+
 				return
 			}
 		}
 
-		if err != nil {
+		if err == nil {
+			continue
+		}
+
+		if errors.Is(err, io.EOF) && closeWrite(dst) == nil {
 			return
 		}
+
+		resetBoth()
+
+		return
 	}
+}
+
+// closeWrite shuts a connection's write side. Both production connections can — a TCP connection on
+// the Go-caller path, a relayed connection on the compose path — and one that cannot is closed whole.
+func closeWrite(conn net.Conn) error {
+	if half, ok := conn.(interface{ CloseWrite() error }); ok {
+		return half.CloseWrite() //nolint:wrapcheck // the caller only asks whether it worked.
+	}
+
+	return conn.Close() //nolint:wrapcheck // as above.
 }
 
 // session accumulates one connection's requests. Both directions touch it, so it is guarded.
