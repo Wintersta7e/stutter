@@ -87,6 +87,9 @@ const (
 	StatusWarn Status = "WARN"
 	// StatusFail means a divergence was observed with nothing holding it back. It sets exit code 1.
 	StatusFail Status = "FAIL"
+	// StatusHeld means the gates held and no fault was injected, so nothing was found because nothing
+	// was tried. It is never a PASS: a pass claims the service survived the faults, and none ran.
+	StatusHeld Status = "HELD"
 )
 
 // Confidence qualifies how far a finding can be trusted.
@@ -257,6 +260,9 @@ type Report struct {
 	// Silenced counts divergences a declared invariant classified as acceptable. Counted rather
 	// than dropped silently, so a run that silenced everything does not read as a clean one.
 	Silenced int
+	// GatesOnly means the check stopped after the gates and injected nothing. Its closing line then
+	// says so instead of PASS.
+	GatesOnly bool
 }
 
 // New rules on a completed run.
@@ -534,7 +540,7 @@ func rank(status Status) int {
 		return rankFail
 	case StatusWarn:
 		return rankWarn
-	case StatusPass:
+	case StatusPass, StatusHeld:
 		return rankPass
 	default:
 		return rankUnknown

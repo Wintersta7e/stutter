@@ -291,7 +291,15 @@ func appendDetail(lines []string, label, value string) []string {
 
 // passLine closes the report with the consumers nothing was found against, and reports whether it
 // is worth printing at all.
+//
+// Gate mode injects nothing, so nothing it did can have been survived: its closing line says the gates
+// held and never says PASS.
 func (r Report) passLine() (string, bool) {
+	if r.GatesOnly {
+		return pad(string(StatusHeld), statusColumn) + plural(r.Scan.Consumers, "consumer") +
+			": the gates held and no fault was injected", true
+	}
+
 	passed := max(r.Scan.Consumers-flaggedConsumers(r.Findings), 0)
 	if passed == 0 && r.Silenced == 0 {
 		return "", false

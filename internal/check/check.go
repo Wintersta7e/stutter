@@ -164,6 +164,7 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 	// would be noise, and a caveated finding list is worse than none.
 	gated := report.New(scan, gates, nil)
 	gated.Health = &health
+	gated.GatesOnly = c.opts.GatesOnly
 
 	if len(gated.Violations()) > 0 || c.opts.GatesOnly {
 		return gated, nil

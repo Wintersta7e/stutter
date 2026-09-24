@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/Wintersta7e/stutter/internal/cli"
+	"github.com/Wintersta7e/stutter/internal/report"
 )
 
 const envPostgres = "STUTTER_TEST_POSTGRES"
@@ -157,5 +158,22 @@ func TestGateAgainstAReferenceConsumer(t *testing.T) {
 
 	if strings.Contains(got.stdout, "FAIL") {
 		t.Errorf("gates-only mode reported a finding, so it injected a fault:\n%s", got.stdout)
+	}
+
+	// Nothing was injected, so nothing was survived: a PASS here is a verdict no fault earned.
+	held := 0
+
+	for line := range strings.Lines(got.stdout) {
+		if strings.HasPrefix(line, string(report.StatusPass)) {
+			t.Errorf("gates-only mode rendered a PASS line: %q", line)
+		}
+
+		if strings.HasPrefix(line, string(report.StatusHeld)) {
+			held++
+		}
+	}
+
+	if held != 1 {
+		t.Errorf("%d lines open with %q, want exactly one:\n%s", held, report.StatusHeld, got.stdout)
 	}
 }

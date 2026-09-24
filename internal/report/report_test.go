@@ -749,6 +749,42 @@ func TestAnUnobservedRunIsNeverAPass(t *testing.T) {
 	}
 }
 
+// TestGatesOnlyNeverRendersPass: gate mode injects nothing, so a PASS beside it is a verdict no fault
+// ever earned. Measured: `stutter gate` against a stable service printed "PASS  1 consumer".
+func TestGatesOnlyNeverRendersPass(t *testing.T) {
+	t.Parallel()
+
+	// Built the way a gates-only check builds it: every gate held, no fault attempted, no divergence.
+	built := withHealth(
+		report.New(report.Scan{Consumers: 1, Messages: 3}, heldGates(), nil),
+		report.Health{Messages: 3, Delivered: 3, Effects: 3},
+	)
+	built.GatesOnly = true
+
+	rendered := built.String()
+	held := 0
+
+	for line := range strings.Lines(rendered) {
+		if strings.HasPrefix(line, string(report.StatusPass)) {
+			t.Errorf("gate mode rendered a PASS line: %q", line)
+		}
+
+		if strings.HasPrefix(line, string(report.StatusHeld)) {
+			held++
+		}
+	}
+
+	if held != 1 {
+		t.Errorf("%d lines open with %q, want exactly one saying the gates held and nothing was injected:\n%s",
+			held, report.StatusHeld, rendered)
+	}
+
+	if got := built.ExitCode(); got != report.ExitPass {
+		t.Errorf("ExitCode() = %d, want %d — gate mode's exit code is unchanged when the gates hold",
+			got, report.ExitPass)
+	}
+}
+
 // TestAnUnobservedRunSaysWhereToLook: never connecting, never consuming and never writing are three
 // different fixes, and the health counts are what tell them apart.
 func TestAnUnobservedRunSaysWhereToLook(t *testing.T) {
