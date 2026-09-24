@@ -125,7 +125,7 @@ func privilegeRefusals(svc *composeService) []*Refusal {
 
 	if mode := svc.NetworkMode; mode == "none" || mode == "host" ||
 		strings.HasPrefix(mode, "container:") || strings.HasPrefix(mode, "service:") {
-		found = append(found, &Refusal{Key: "network_mode", Class: K3})
+		found = append(found, &Refusal{Key: keyNetworkMode, Class: K3})
 	}
 
 	if key, shared := SharedNamespace(svc.Pid, svc.IPC, svc.UTS, svc.UsernsMode, svc.Cgroup); shared {
@@ -147,12 +147,6 @@ func privilegeRefusals(svc *composeService) []*Refusal {
 	return found
 }
 
-// Keys named by both the verdict table and the refusals.
-const (
-	keyDevices = "devices"
-	keyModels  = "models"
-)
-
 // refusedWhenSet are the keys refused whatever they are set to, by their path in the model.
 //
 //nolint:gochecknoglobals // a fixed table, not mutable state.
@@ -163,8 +157,8 @@ var refusedWhenSet = []struct {
 	{path: []string{keyDevices}, class: K5},
 	{path: []string{"device_cgroup_rules"}, class: K5},
 	{path: []string{"gpus"}, class: K5},
-	{path: []string{"deploy", "resources", "reservations", keyDevices}, class: K5},
-	{path: []string{"deploy", "resources", "reservations", "generic_resources"}, class: K5},
+	{path: []string{keyDeploy, "resources", "reservations", keyDevices}, class: K5},
+	{path: []string{keyDeploy, "resources", "reservations", "generic_resources"}, class: K5},
 	{path: []string{"credential_spec"}, class: K6},
 	{path: []string{"volumes_from"}, class: K7},
 	{path: []string{"provider"}, class: K7},

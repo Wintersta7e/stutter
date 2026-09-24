@@ -20,6 +20,15 @@ const (
 	VerdictConditional
 )
 
+// Compose keys named in more than one table.
+const (
+	keyDeploy      = "deploy"
+	keyDevices     = "devices"
+	keyModels      = "models"
+	keyNetworks    = "networks"
+	keyNetworkMode = "network_mode"
+)
+
 // keyRule is one row of the verdict table. A path is dotted; list elements share their parent's
 // path, and `*` stands for a user-named map key. A subtree rule classifies every path beneath it.
 type keyRule struct {
@@ -125,7 +134,7 @@ var serviceKeys = []keyRule{
 	{path: "deploy.restart_policy", verdict: VerdictReplace, subtree: true},
 	{path: "healthcheck", verdict: VerdictReplace, subtree: true},
 	{path: "logging", verdict: VerdictReplace, subtree: true},
-	{path: "networks", verdict: VerdictReplace},
+	{path: keyNetworks, verdict: VerdictReplace},
 	{path: "networks.*", verdict: VerdictReplace},
 	{path: "networks.*.aliases", verdict: VerdictModel},
 	{path: "networks.*.ipv4_address", verdict: VerdictReplace},
@@ -136,7 +145,7 @@ var serviceKeys = []keyRule{
 	{path: "networks.*.priority", verdict: VerdictReplace},
 	{path: "networks.*.gw_priority", verdict: VerdictReplace},
 	{path: "networks.*.interface_name", verdict: VerdictReplace},
-	{path: "network_mode", verdict: VerdictConditional, class: K3},
+	{path: keyNetworkMode, verdict: VerdictConditional, class: K3},
 	{path: "dns", verdict: VerdictReplace},
 	{path: "dns_search", verdict: VerdictReplace},
 	{path: "dns_opt", verdict: VerdictReplace},
