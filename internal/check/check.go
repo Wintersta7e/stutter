@@ -271,6 +271,7 @@ func (c *check) health(reference, repeat replay.Result, compared []effect.Effect
 		ClosedAfterInfo: reference.ClosedAfterInfo,
 		Owed:            reference.Owed,
 		Exhausted:       reference.Exhausted,
+		DeliveryCap:     reference.DeliveryCap,
 		Exit:            cmp.Or(exited(reference.Exit), exited(repeat.Exit)),
 	}
 }

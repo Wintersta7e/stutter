@@ -201,6 +201,9 @@ type Health struct {
 	// Exhausted counts the messages that reached the delivery cap without an acknowledgement, where the
 	// consumer itself allows more deliveries (E31).
 	Exhausted int
+	// DeliveryCap is the most deliveries of one message the clean run allowed: the cap Exhausted counts
+	// against.
+	DeliveryCap int
 }
 
 // Divergence is one mutated run that behaved differently from the reference run.

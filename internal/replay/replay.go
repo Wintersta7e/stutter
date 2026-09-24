@@ -251,6 +251,9 @@ type Result struct {
 	// where the consumer itself allows more deliveries: what the service did with the ones the cap cut
 	// off was not observed. Zero on a driven run.
 	Exhausted int
+	// DeliveryCap is the most deliveries of one message the run allowed. Zero on a driven run, and on an
+	// observed run that never published.
+	DeliveryCap int
 	// Late counts effects that arrived after their attribution window closed.
 	Late int
 	// Setup counts effects observed before the first delivery. When a run saw nothing else, it is

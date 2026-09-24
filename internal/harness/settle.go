@@ -153,8 +153,10 @@ type settlement struct {
 	final time.Duration
 	// longestNak is the longest redelivery delay any NAK asked for.
 	longestNak time.Duration
-	// capped is the most deliveries of a message the run allows.
-	capped uint64
+	// capped is the most deliveries of a message the run allows, as the server counts attempts;
+	// reported is the same cap as the run reports it.
+	capped   uint64
+	reported int
 	// beyond says the consumer itself would deliver a message more times than the run allows.
 	beyond bool
 	mu     sync.Mutex
@@ -166,10 +168,11 @@ func newSettlement(config policy.Config, admitted []uint64) *settlement {
 	capped := config.EffectiveCap(DeliveryCap)
 
 	ledger := &settlement{
-		entries: make(map[uint64]*attempt, len(admitted)),
-		final:   config.Deadline(capped),
-		capped:  uint64(max(capped, 0)),
-		beyond:  config.MaxDeliver <= 0 || config.MaxDeliver > capped,
+		entries:  make(map[uint64]*attempt, len(admitted)),
+		final:    config.Deadline(capped),
+		capped:   uint64(max(capped, 0)),
+		reported: capped,
+		beyond:   config.MaxDeliver <= 0 || config.MaxDeliver > capped,
 	}
 
 	ledger.admit(admitted)
@@ -271,6 +274,11 @@ func (l *settlement) exhausted(now time.Duration) int {
 	}
 
 	return exhausted
+}
+
+// deliveryCap is the most deliveries of one message the run allows.
+func (l *settlement) deliveryCap() int {
+	return l.reported
 }
 
 // limit is how long the run waits in silence for messages still owed: the static part, or longer when
