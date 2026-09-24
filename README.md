@@ -74,8 +74,10 @@ outside that will be poor.
 **Implemented:**
 - Corpus stored as a real JetStream stream, so replay uses real consumers and
   real acknowledgements — a duplicate is an actual server redelivery, not a model
-- Faults: `duplicate`, `crash-before-ack`, `delay`, `reorder`, each injected only
-  where the recorded consumer configuration permits it
+- Faults: `duplicate`, `crash-before-ack` (a crash loop: the first two deliveries
+  do the work and die before acknowledging, the third succeeds), `delay`,
+  `reorder`, each injected only where the recorded consumer configuration
+  permits it
 - A legality table read off the consumer's own config, including the backoff
   curve that overrides the declared ack wait
 - Effect observation for **every** kind of egress — the database, the bus,
@@ -122,7 +124,10 @@ outside that will be poor.
   answers an empty JSON object. A service that rejects the stub's certificate —
   during the handshake, or by hanging up before its first request — or that
   offers only HTTP/2 stops the run loudly; it is never recorded as a handler that
-  did nothing
+  did nothing. The exception: once one connection to a host has been served, a
+  later connection to that host that only completes a handshake is taken for an
+  HTTP client's unused pooled connection and ignored, so a second client in the
+  same service that pins certificates for that host goes unseen
 - The differential re-keying gate is designed but not built; it arrives with the
   redaction pipeline
 - `concurrent` delivery is refused rather than injected — it needs per-connection

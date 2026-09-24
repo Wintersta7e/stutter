@@ -306,7 +306,7 @@ func appendDetail(lines []string, label, value string) []string {
 func (r Report) passLine() (string, bool) {
 	if r.GatesOnly {
 		return pad(string(StatusHeld), statusColumn) + plural(r.Scan.Consumers, "consumer") +
-			": the gates held and no fault was injected", true
+			": the gates held; gate mode injects no faults, so this is not a pass", true
 	}
 
 	passed := max(r.Scan.Consumers-flaggedConsumers(r.Findings), 0)
