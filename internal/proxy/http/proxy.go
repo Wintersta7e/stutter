@@ -29,25 +29,29 @@ const (
 	maxRequestHeader      = 1 << 20
 	initialHeaderCapacity = 1024
 	tlsRecord             = 0x16
+	// cleartextPort and tlsPort are the ports the service dials the stub's two entries on. A stop names
+	// them, never the listener's own kernel-assigned port.
+	cleartextPort uint16 = 80
+	tlsPort       uint16 = 443
 	// headerBound is how long a connection has to deliver its first request header: from accept in
 	// cleartext, from handshake completion behind TLS. net/http's handshake timeout derives from it.
 	headerBound = time.Second
+	// http2Preface opens every HTTP/2 connection made with prior knowledge.
+	http2Preface = "PRI * HTTP/2.0\r\n"
 )
 
 var (
 	errActiveRun       = errors.New("HTTP script already has an active run")
 	errServerLog       = errors.New("the HTTP stub could not serve a connection")
 	errEncrypted       = errors.New("client used TLS with the HTTP stub; cleartext HTTP/1.1 is required")
-	errHandshake       = errors.New("TLS handshake with the HTTP stub failed")
 	errInactiveRun     = errors.New("HTTP script run is not active")
 	errMissingHost     = errors.New("HTTP proxy requires a stable logical host")
 	errMissingScript   = errors.New("HTTP proxy requires a script")
 	errMissingSink     = errors.New("HTTP proxy requires an effect sink")
 	errOversizeRequest = errors.New("HTTP request body exceeds configured limit")
 	errUnparseable     = errors.New("client traffic is not parseable HTTP/1.1; effects cannot be observed")
-	errNoRequest       = errors.New("the client completed a TLS handshake and sent no request, and no " +
-		"earlier connection to this host did either: it likely pins certificates or speaks a protocol the " +
-		"stub does not serve")
+	errPreface         = errors.New("client sent the HTTP/2 connection preface")
+	errNoRequest       = errors.New(detailNoRequest)
 )
 
 // Sink receives the effects the stub observes and supplies the run canonical form used as a
@@ -285,7 +289,7 @@ func (l checkedListener) Accept() (net.Conn, error) {
 	if err != nil {
 		_ = connection.Close()
 
-		return nil, err
+		return nil, asStop(err, cleartextPort, "")
 	}
 
 	return checked, nil
@@ -318,6 +322,8 @@ type tunnel struct {
 	failure    error
 	proxy      *Proxy
 	serverName string
+	// offered are the application protocols the client's hello listed, sorted.
+	offered []string
 }
 
 // HandshakeContext stops the run on a failed handshake, naming the server name the client asked
@@ -325,14 +331,20 @@ type tunnel struct {
 func (t *tunnel) HandshakeContext(ctx context.Context) error {
 	err := t.Conn.HandshakeContext(context.WithValue(ctx, tunnelKey{}, t))
 	if err != nil {
-		// A stop's text is compared between runs, so the connection's addresses — an ephemeral port
-		// on every run — are dropped and only the cause is kept.
-		cause := err
-		if network, isNetwork := errors.AsType[*net.OpError](err); isNetwork {
-			cause = network.Err
+		// A stop's text is compared between runs, so it says why in fixed words and never carries the
+		// connection's addresses — an ephemeral port on every run.
+		stop := &EgressStop{
+			Name:   t.serverName,
+			Detail: handshakeDetail(t.serverName, err),
+			Class:  StopHandshake,
+			Port:   tlsPort,
 		}
 
-		t.proxy.fail(t.named(fmt.Errorf("%w: %w", errHandshake, cause)))
+		if refusesHTTP1(t.offered) {
+			stop.Class, stop.Detail = StopALPN, alpnDetail(t.offered)
+		}
+
+		t.proxy.fail(stop)
 	}
 
 	return err //nolint:wrapcheck // net/http type-checks this error to answer a cleartext client.
@@ -354,7 +366,7 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 			// certificates never gets a first connection through, so it still stops the run.
 			t.failure = io.EOF
 		default:
-			t.failure = t.named(t.failure)
+			t.failure = asStop(t.failure, tlsPort, t.serverName)
 			t.proxy.fail(t.failure)
 		}
 	}
@@ -366,24 +378,18 @@ func (t *tunnel) Read(buffer []byte) (int, error) {
 	return t.checked.Read(buffer) //nolint:wrapcheck // Preserve io.Reader byte-count and error semantics.
 }
 
-func (t *tunnel) named(err error) error {
-	if t.serverName == "" {
-		return fmt.Errorf("TLS connection without SNI: %w", err)
-	}
-
-	return fmt.Errorf("TLS connection for %q: %w", t.serverName, err)
-}
-
 // tunnelKey carries a tunnel through its own handshake, so the one TLS config every connection
 // shares can tell which tunnel a ClientHello belongs to. A config per connection would give each its
 // own session ticket keys, and no client could resume a session.
 type tunnelKey struct{}
 
-// recordServerName hands each tunnel the server name its client asked for. It runs on the
-// ClientHello, before ALPN can fail the handshake, which is the only point every stop can name it.
+// recordServerName hands each tunnel the server name its client asked for, and the protocols it
+// offered. It runs on the ClientHello, before ALPN can fail the handshake, which is the only point
+// every stop can name it.
 func recordServerName(hello *tls.ClientHelloInfo) (*tls.Config, error) {
 	if current, ok := hello.Context().Value(tunnelKey{}).(*tunnel); ok {
 		current.serverName = hello.ServerName
+		current.offered = slices.Sorted(slices.Values(hello.SupportedProtos))
 	}
 
 	return nil, nil //nolint:nilnil // A nil config keeps the listener's own, as crypto/tls documents.
@@ -422,6 +428,10 @@ func checkConnection(connection net.Conn, timeout time.Duration, noRequest error
 		return nil, errUnparseable
 	}
 
+	if bytes.HasPrefix(header, []byte(http2Preface)) {
+		return nil, errPreface
+	}
+
 	request, err := nethttp.ReadRequest(bufio.NewReader(bytes.NewReader(header)))
 	if err != nil || request.ProtoMajor != 1 {
 		return nil, errUnparseable
@@ -432,6 +442,27 @@ func checkConnection(connection net.Conn, timeout time.Duration, noRequest error
 	}
 
 	return &replayConn{Conn: connection, reader: io.MultiReader(bytes.NewReader(header), reader)}, nil
+}
+
+// asStop turns checkConnection's verdict on a connection to the entry at port into the stop it is.
+// name is the server name a TLS client asked for, empty in cleartext.
+func asStop(err error, port uint16, name string) error {
+	stop := &EgressStop{Name: name, Port: port}
+
+	switch {
+	case errors.Is(err, errEncrypted) && port == cleartextPort:
+		stop.Class = StopTLSOnCleartext
+	case errors.Is(err, errNoRequest):
+		stop.Class = StopNoRequest
+	case errors.Is(err, errPreface):
+		stop.Class, stop.Detail = StopNotHTTP, detailPreface
+	case errors.Is(err, errEncrypted), errors.Is(err, errUnparseable):
+		stop.Class = StopNotHTTP
+	default:
+		return err
+	}
+
+	return stop
 }
 
 func readRequestHeader(reader *bufio.Reader) ([]byte, error) {

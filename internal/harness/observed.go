@@ -150,6 +150,7 @@ func (s *Sandbox) runObserved(
 	}
 
 	result.Exit = exit
+	result.Stopped = observed.halted
 
 	return result, nil
 }
@@ -167,6 +168,11 @@ func (s *Sandbox) watch(
 	ended, runErr := s.begin(ctx, observed, service.Exited(), run, recorder, messages)
 	if runErr == nil && ended == finished {
 		ended, runErr = s.drain(ctx, observed, service.Exited(), run)
+	}
+
+	// Recorded before the window closes, so the stop lands with the message whose handling raised it.
+	if ended == proxyStopped {
+		runErr = observed.halt(runErr, recorder)
 	}
 
 	if runErr == nil {

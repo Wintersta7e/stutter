@@ -43,7 +43,7 @@ func TestTLSStubStopsOnSilentOutcomes(t *testing.T) {
 	}{
 		{
 			name: "h2-only ALPN",
-			want: "unsupported application protocols",
+			want: "offered [h2]; only http/1.1 is served",
 			client: func(t *testing.T, address string, trust *x509.CertPool) net.Conn {
 				t.Helper()
 

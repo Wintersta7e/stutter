@@ -385,7 +385,9 @@ type egress struct {
 	// attached is the start's hold on the invocation listeners; nil on the Go-caller path.
 	attached *attachment
 	at       Addresses
-	closers  []entryCloser
+	// halted is the egress-policy stop the run ended on, in the stub's own words; empty otherwise.
+	halted  string
+	closers []entryCloser
 	// taken counts the Serve results a wait took before teardown: the proxies that stopped early.
 	taken int
 }
@@ -421,13 +423,13 @@ func (e *egress) start(
 
 // settle tears the proxies down and decides the run's fate.
 //
-// The captured HTTP replies are frozen only when the run actually finished: a failed run saw part of
-// a clean run at best, and freezing that would pin later runs to answers the service never really
-// settled on.
+// The captured HTTP replies are frozen only when the run actually finished: a failed run, or one an
+// egress stop ended, saw part of a clean run at best, and freezing that would pin later runs to answers
+// the service never really settled on.
 func (e *egress) settle(ctx context.Context, runErr error) error {
 	closeErr := e.close(ctx)
 
-	if runErr != nil {
+	if runErr != nil || e.halted != "" {
 		return errors.Join(runErr, closeErr, e.httpRun.Abort())
 	}
 
