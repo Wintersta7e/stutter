@@ -536,6 +536,18 @@ func (b *book) engineDone(confirmed map[int]bool) bool {
 	return true
 }
 
+// allRemoved reports whether every engine resource the ledger names is verified gone, with no
+// absent intent left to confirm.
+func (b *book) allRemoved() bool {
+	for _, rec := range b.all() {
+		if rec.typ != ResourceHostPath && rec.state != opRemoved {
+			return false
+		}
+	}
+
+	return true
+}
+
 // noteOnce appends a check-wide op unless the ledger already carries it.
 func (b *book) noteOnce(o op) error {
 	b.mu.Lock()

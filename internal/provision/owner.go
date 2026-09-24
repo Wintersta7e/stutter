@@ -437,6 +437,27 @@ func verifyRecorded(rec record, report identified, check string) error {
 	}
 }
 
+// killContainer stops a container b records with SIGKILL, after verifying it is still that one:
+// `stop --signal KILL` returns once it has stopped, and never waits on a SIGTERM the process may
+// ignore.
+func (e *Engine) killContainer(ctx context.Context, b *book, rec record) error {
+	var report identified
+
+	found, err := e.read(ctx, request{verb: verbInspect, args: []arg{{val: containerIDTemplate}, {val: rec.id}}},
+		&report)
+	if err != nil || !found {
+		return err
+	}
+
+	if mismatch := verifyRecorded(rec, report, b.check); mismatch != nil {
+		return mismatch
+	}
+
+	_, err = e.run.call(ctx, request{verb: verbKill, args: []arg{{val: rec.id}}})
+
+	return err
+}
+
 // failed records a removal that did not happen and returns why. Only the first stderr line of a
 // refusal is recorded.
 func (b *book) failed(rec record, cause error) error {

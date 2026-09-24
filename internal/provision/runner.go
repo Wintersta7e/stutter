@@ -41,6 +41,7 @@ const (
 	verbContainerList
 	verbVolumeList
 	verbImageList
+	verbKill
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -128,7 +129,7 @@ type verbSpec struct {
 
 // verbs returns the verb table: every call the runner can make.
 //
-//nolint:goconst,revive // one literal, every fixed token spelled out: it reads, and is audited, as the table.
+//nolint:goconst,funlen,revive // one literal, every fixed token spelled out: read, and audited, as the table.
 func verbs() [verbCount]verbSpec {
 	return [verbCount]verbSpec{
 		verbContext: {
@@ -207,6 +208,10 @@ func verbs() [verbCount]verbSpec {
 		verbImageList: {
 			name: "imageList", program: programDocker, prefix: []string{"images", "--no-trunc", "--format"},
 			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine,
+		},
+		verbKill: {
+			name: "kill", program: programDocker, prefix: []string{"stop", "--signal", "KILL"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
 		},
 	}
 }

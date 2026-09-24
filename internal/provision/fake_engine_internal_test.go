@@ -43,6 +43,8 @@ type fakeEngine struct {
 	objects map[ResourceType]map[string]*fakeObject
 	// afterCreate, when set, edits a network or volume as the engine reports it after create.
 	afterCreate func(typ ResourceType, obj *fakeObject)
+	// hang names verbs whose calls block until their context ends, as a hung engine does.
+	hang        map[string]bool
 	logCall     func(callLine)
 	ledgerPath  string
 	configDir   string
@@ -113,7 +115,7 @@ func (f *fakeEngine) verbCalls(name string) [][]string {
 	return out
 }
 
-func (f *fakeEngine) call(_ context.Context, req request) (result, error) {
+func (f *fakeEngine) call(ctx context.Context, req request) (result, error) {
 	spec := verbs()[req.verb]
 
 	typed, err := spec.tokens(req)
@@ -127,9 +129,22 @@ func (f *fakeEngine) call(_ context.Context, req request) (result, error) {
 	}
 
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	f.calls = append(f.calls, fakeCall{verb: spec.name, argv: argv, lastLedger: f.lastLedgerLine()})
+	hung := f.hang[spec.name]
+	f.mu.Unlock()
+
+	if hung {
+		<-ctx.Done()
+
+		return result{exit: -1}, fmt.Errorf("%w: %s call exceeded its deadline", ErrDeadline, spec.name)
+	}
+
+	if err := ctx.Err(); err != nil {
+		return result{exit: -1}, fmt.Errorf("%s call cancelled: %w", spec.name, err)
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	if f.unreachable {
 		return fail(spec, "Cannot connect to the Docker daemon")
@@ -166,6 +181,7 @@ func (f *fakeEngine) answer(v verb, spec verbSpec, rest []string) (result, error
 		verbContainerList: func() (result, error) { return f.list(ResourceContainer, rest) },
 		verbVolumeList:    func() (result, error) { return f.list(ResourceVolume, rest) },
 		verbImageList:     func() (result, error) { return f.list(ResourceImage, rest) },
+		verbKill:          func() (result, error) { return f.kill(spec, rest) },
 	}
 
 	if answer, ok := answers[v]; ok {
@@ -347,6 +363,17 @@ func (f *fakeEngine) remove(spec verbSpec, typ ResourceType, refs []string) (res
 	return result{}, nil
 }
 
+// kill stops a container; a stopped container stays, as the engine keeps it.
+func (f *fakeEngine) kill(spec verbSpec, refs []string) (result, error) {
+	for _, ref := range refs {
+		if f.find(ResourceContainer, ref) == nil {
+			return fail(spec, "No such container: "+ref)
+		}
+	}
+
+	return result{}, nil
+}
+
 // lastLedgerLine is the ledger's last line when a call arrives.
 func (f *fakeEngine) lastLedgerLine() string {
 	if f.ledgerPath == "" {
@@ -379,11 +406,29 @@ func openFakeEngineWith(t *testing.T, state string, fake *fakeEngine) *Engine {
 	return openFakeEngineHost(t, state, fake, defaultHostFS())
 }
 
+// openFakeEngineOpts opens an Engine over a fresh fake engine with the options given.
+func openFakeEngineOpts(t *testing.T, opts Options) (*Engine, *fakeEngine) {
+	t.Helper()
+
+	fake := newFakeEngine()
+	opts.StateDir = t.TempDir() + "/state"
+
+	return openFake(t, opts, fake, defaultHostFS()), fake
+}
+
 // openFakeEngineHost is openFakeEngineWith on a host the test stands in for.
 func openFakeEngineHost(t *testing.T, state string, fake *fakeEngine, host hostFS) *Engine {
 	t.Helper()
 
-	engine, err := openWith(t.Context(), Options{StateDir: state, TempDir: t.TempDir()}, openDeps{
+	return openFake(t, Options{StateDir: state}, fake, host)
+}
+
+func openFake(t *testing.T, opts Options, fake *fakeEngine, host hostFS) *Engine {
+	t.Helper()
+
+	opts.TempDir = t.TempDir()
+
+	engine, err := openWith(t.Context(), opts, openDeps{
 		admit: func(context.Context) (Identity, engineCaller, error) { return testIdentity(), fake, nil },
 		host:  host,
 	})

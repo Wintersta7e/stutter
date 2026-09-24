@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/Wintersta7e/stutter/internal/compose"
 )
@@ -46,11 +47,15 @@ type Engine struct {
 	id         string
 	private    string
 	host       hostFS
+	down       Teardown
 	swept      SweepResult
 	privateSeq int
-	mu         sync.Mutex
-	keep       bool
-	locks      bool
+	// teardownBound overrides teardown's bound when set; tests shorten it.
+	teardownBound time.Duration
+	closeOnce     sync.Once
+	mu            sync.Mutex
+	keep          bool
+	locks         bool
 }
 
 // Open accepts the engine, then gives the check its ledger and its private directory, in that
@@ -202,7 +207,16 @@ func (e *Engine) discard() error {
 	return errors.Join(append(errs, e.book.led.remove())...)
 }
 
-// release closes the invocation log and releases the ledger's lock, leaving both on disk.
+// release closes the invocation log and releases the ledger's lock, leaving both on disk. It stands
+// in for Close where a test wants the check's files left as a crash would leave them.
 func (e *Engine) release() error {
+	released := false
+
+	e.closeOnce.Do(func() { released = true })
+
+	if !released {
+		return nil
+	}
+
 	return errors.Join(e.log.close(), e.book.led.close())
 }
