@@ -202,7 +202,7 @@ func TestAnEditedLedgerEntryIsVerifiedBeforeRemoval(t *testing.T) {
 		t.Fatal("the decoy named by the edited ledger was removed")
 	}
 
-	if removes := fake.verbCalls("remove"); len(removes) != 0 {
+	if removes := fake.verbCalls(removeVerb); len(removes) != 0 {
 		t.Errorf("rm was issued: %v", removes)
 	}
 
@@ -279,7 +279,7 @@ func TestUnledgeredLabelledResourcesAreListedNeverRemoved(t *testing.T) {
 		t.Errorf("Unledgered[%s] = %+v; both resources must be listed and still present", orphan, listed)
 	}
 
-	for _, verb := range []string{"remove", "volumeRemove"} {
+	for _, verb := range []string{removeVerb, "volumeRemove"} {
 		if calls := fake.verbCalls(verb); len(calls) != 0 {
 			t.Errorf("%s was issued: %v", verb, calls)
 		}

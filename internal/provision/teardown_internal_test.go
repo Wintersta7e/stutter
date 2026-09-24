@@ -265,7 +265,7 @@ func TestTeardownOrderIsByType(t *testing.T) {
 
 	for _, c := range fake.calls {
 		switch c.verb {
-		case "remove", "networkRemove", "volumeRemove", "imageRemove":
+		case removeVerb, "networkRemove", "volumeRemove", "imageRemove":
 			order = append(order, c.verb+" "+c.argv[len(c.argv)-1])
 		default:
 		}

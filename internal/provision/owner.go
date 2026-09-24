@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"net/netip"
 	"os"
 	"path"
@@ -754,6 +755,12 @@ func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Cont
 		return nil, err
 	}
 
+	if oneName(spec.Kind) {
+		if heldErr := e.replaceHeld(ctx, containerName(e.id, spec.Kind, 0)); heldErr != nil {
+			return nil, heldErr
+		}
+	}
+
 	rec, err := e.intend(ResourceContainer, spec.Kind, spec.Service, func(seq int) string {
 		return containerName(e.id, spec.Kind, seq)
 	})
@@ -997,6 +1004,162 @@ func (e *Engine) CopyOut(ctx context.Context, c *Container, p string) (io.ReadCl
 	}
 
 	return io.NopCloser(bytes.NewReader(res.out)), nil
+}
+
+// errNotSeed means a graceful stop was asked of a container that is not a seed: every other stop
+// is SIGKILL, whose writes never enter a run as late effects.
+var errNotSeed = errors.New("only a seed container stops gracefully")
+
+// Start starts a container, then begins the wait whose end Exited reports. The wait begins only
+// once the container runs: a wait on a created container returns at once, which would read as an
+// exit.
+func (e *Engine) Start(ctx context.Context, c *Container) error {
+	if err := e.owns(c); err != nil {
+		return err
+	}
+
+	if _, err := e.run.call(ctx, request{verb: verbStart, args: []arg{{val: c.id}}}); err != nil {
+		return err
+	}
+
+	e.watchExit(ctx, c)
+
+	return nil
+}
+
+// Stop reads a container's state, kills it, and copies its log: a target's, a probe's, a
+// discovery's and a job's always, and any container's whose state shows it failed. The state is
+// read before the kill — afterwards every exit code is the kill's own.
+func (e *Engine) Stop(ctx context.Context, c *Container) (State, error) {
+	report, err := e.inspectContainer(ctx, c)
+	if err != nil {
+		return State{}, err
+	}
+
+	state := State{
+		ExitCode: report.ExitCode, RestartCount: report.RestartCount, Running: report.Running,
+		OOMKilled: report.OOMKilled,
+	}
+
+	rec, _ := e.book.record(c.seq)
+	if killErr := e.killContainer(ctx, e.book, rec); killErr != nil {
+		return state, killErr
+	}
+
+	if logWanted(c.kind, state) {
+		state.Log, err = e.CopyLog(ctx, c)
+	}
+
+	return state, err
+}
+
+// logWanted reports a container whose log outlives it.
+func logWanted(kind rules.Kind, s State) bool {
+	return failedRun(s) || slices.Contains([]rules.Kind{
+		rules.KindTarget, rules.KindProbe, rules.KindDiscovery, rules.KindJob,
+	}, kind)
+}
+
+// failedRun reports a container that exited non-zero, was killed for memory, or was restarted.
+func failedRun(s State) bool {
+	return !s.Running && s.ExitCode != 0 || s.OOMKilled || s.RestartCount > 0
+}
+
+// Graceful is how a seed is stopped: compose's stop_signal and stop_grace_period.
+type Graceful struct {
+	// Signal is the stop signal; empty is the image's.
+	Signal string
+	// Grace is how long the seed may take to stop before the engine kills it.
+	Grace time.Duration
+	// HasGrace reports that compose set a grace period; otherwise the engine's default applies.
+	HasGrace bool
+}
+
+// engineGrace is the engine's own stop timeout, the grace a seed gets when compose sets none.
+const engineGrace = 10 * time.Second
+
+// StopGracefully stops a seed with its compose signal and grace period, so a database flushes what
+// it seeded; every other container is refused before any call. A seed still running when the grace
+// period ends is killed by the engine, and the state says so.
+func (e *Engine) StopGracefully(ctx context.Context, c *Container, g Graceful) (State, error) {
+	if err := e.owns(c); err != nil {
+		return State{}, err
+	}
+
+	if c.kind != rules.KindSeed {
+		return State{}, fmt.Errorf("%w: %s is a %s", errNotSeed, c.name, c.kind)
+	}
+
+	req := request{verb: verbStopGraceful, grace: engineGrace}
+	if g.Signal != "" {
+		req.args = append(req.args, arg{val: "--signal"}, arg{val: g.Signal})
+	}
+
+	if g.HasGrace {
+		req.grace = g.Grace
+		req.args = append(req.args, arg{val: "--timeout"}, arg{val: strconv.Itoa(int(math.Ceil(g.Grace.Seconds())))})
+	}
+
+	req.args = append(req.args, arg{val: c.id})
+
+	if _, err := e.run.call(ctx, req); err != nil {
+		return State{}, err
+	}
+
+	state, err := e.Status(ctx, c)
+	state.Killed = state.ExitCode == killedExit || state.OOMKilled
+
+	return state, err
+}
+
+// killedExit is the exit code of a process ended by SIGKILL.
+const killedExit = 137
+
+// Retire ends a container's part in the check: it is stopped, then removed — except, under Keep,
+// the target, probe or discovery, which is held stopped until the next container of its name is
+// created, so the check's final one survives for the user.
+func (e *Engine) Retire(ctx context.Context, c *Container) (State, error) {
+	state, err := e.Stop(ctx, c)
+	if err != nil {
+		return state, err
+	}
+
+	if e.keep && oneName(c.kind) {
+		e.mu.Lock()
+		e.held[c.name] = c.seq
+		e.mu.Unlock()
+
+		return state, nil
+	}
+
+	return state, e.Remove(ctx, c)
+}
+
+// oneName reports a kind whose container keeps one name for the whole check.
+func oneName(kind rules.Kind) bool {
+	return kind == rules.KindTarget || kind == rules.KindProbe || kind == rules.KindDiscovery
+}
+
+// replaceHeld removes the held container of name, verified gone, before a successor takes its name.
+func (e *Engine) replaceHeld(ctx context.Context, name string) error {
+	e.mu.Lock()
+	seq, held := e.held[name]
+	e.mu.Unlock()
+
+	if !held {
+		return nil
+	}
+
+	rec, _ := e.book.record(seq)
+	if err := e.removeRecorded(ctx, e.book, rec); err != nil {
+		return fmt.Errorf("remove the held %s before its successor: %w", name, err)
+	}
+
+	e.mu.Lock()
+	delete(e.held, name)
+	e.mu.Unlock()
+
+	return nil
 }
 
 // killContainer stops a container b records with SIGKILL, after verifying it is still that one:

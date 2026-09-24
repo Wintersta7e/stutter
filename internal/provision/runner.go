@@ -49,6 +49,11 @@ const (
 	verbCreate
 	verbCopyIn
 	verbCopyOut
+	verbStart
+	verbStopGraceful
+	verbWait
+	verbLogs
+	verbLogsFollow
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -87,6 +92,10 @@ const (
 	deadlineShort deadline = iota
 	deadlineCopy
 	deadlineLong
+	// deadlineNone lives as long as the caller's context: a wait ends when its container does.
+	deadlineNone
+	// deadlineGrace is the request's grace period plus graceMargin.
+	deadlineGrace
 )
 
 // stderrPolicy is what a row keeps of its stderr. Control flow never reads it either way.
@@ -97,6 +106,8 @@ const (
 	stderrFirstLine stderrPolicy = iota
 	// stderrCount keeps only the number of lines: compose echoes interpolated values there.
 	stderrCount
+	// stderrOutput is a container's own output, never read as the CLI's error.
+	stderrOutput
 )
 
 const (
@@ -111,6 +122,8 @@ const (
 	waitDelay = 2 * time.Second
 	// pendingCap bounds the call lines kept for a log not yet attached.
 	pendingCap = 16
+	// graceMargin is how long past its grace period a graceful stop may take.
+	graceMargin = 30 * time.Second
 	// shellPath runs groupKiller.
 	shellPath = "/bin/sh"
 	// groupKiller runs its arguments as a background child with stdin passed through, and on
@@ -258,6 +271,26 @@ func verbs() [verbCount]verbSpec {
 			name: "copyOut", program: programDocker, prefix: []string{"cp"}, suffix: []string{"-"},
 			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine,
 		},
+		verbStart: {
+			name: "start", program: programDocker, prefix: []string{"start"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true,
+		},
+		verbStopGraceful: {
+			name: "stopGraceful", program: programDocker, prefix: []string{"stop"},
+			mode: modeConstructed, deadline: deadlineGrace, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbWait: {
+			name: "wait", program: programDocker, prefix: []string{"wait"},
+			mode: modeConstructed, deadline: deadlineNone, stderr: stderrFirstLine,
+		},
+		verbLogs: {
+			name: "logs", program: programDocker, prefix: []string{"logs"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrOutput,
+		},
+		verbLogsFollow: {
+			name: "logsFollow", program: programDocker, prefix: []string{"logs", "--follow"},
+			mode: modeConstructed, deadline: deadlineNone, stderr: stderrFirstLine,
+		},
 	}
 }
 
@@ -287,8 +320,10 @@ type request struct {
 	args     []arg
 	tail     []arg
 	extraEnv []string
-	verb     verb
-	alt      bool
+	// grace is a graceful stop's grace period; its deadline is grace plus graceMargin.
+	grace time.Duration
+	verb  verb
+	alt   bool
 }
 
 // tokens returns a call's whole argv after the program, as typed arguments: the row's fixed tokens
@@ -477,6 +512,10 @@ func (r *execRunner) run(ctx context.Context, spec verbSpec, req request) (resul
 	}
 
 	limit := r.limits[spec.deadline]
+	if spec.deadline == deadlineGrace {
+		limit = req.grace + graceMargin
+	}
+
 	callCtx, cancel := spec.bound(ctx, limit)
 
 	defer cancel()

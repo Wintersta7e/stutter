@@ -43,15 +43,21 @@ type Engine struct {
 	book         *book
 	pins         map[string]compose.Image
 	fingerprints map[string]compose.Prints
-	interfaces   func() ([]localAddr, error)
-	log          *invLog
-	identity     Identity
-	id           string
-	private      string
-	host         hostFS
-	down         Teardown
-	swept        SweepResult
-	privateSeq   int
+	// exited holds, per started container's seq, the channel its wait closes.
+	exited map[int]chan struct{}
+	// held maps a one-name container kept stopped under Keep to its seq, until its successor.
+	held map[string]int
+	// closing is closed when the check closes, ending every wait.
+	closing    chan struct{}
+	interfaces func() ([]localAddr, error)
+	log        *invLog
+	identity   Identity
+	id         string
+	private    string
+	host       hostFS
+	down       Teardown
+	swept      SweepResult
+	privateSeq int
 	// teardownBound overrides teardown's bound when set; tests shorten it.
 	teardownBound time.Duration
 	closeOnce     sync.Once
@@ -102,6 +108,7 @@ func openWith(ctx context.Context, opts Options, deps openDeps) (*Engine, error)
 	e := &Engine{
 		run: run, host: deps.host, identity: identity, id: id, keep: opts.Keep,
 		private: filepath.Join(temp, "stutter-"+id), interfaces: localAddrs,
+		exited: map[int]chan struct{}{}, held: map[string]int{}, closing: make(chan struct{}),
 	}
 
 	led, err := createLedger(state, deps.host, header{
@@ -214,7 +221,11 @@ func (e *Engine) discard() error {
 func (e *Engine) release() error {
 	released := false
 
-	e.closeOnce.Do(func() { released = true })
+	e.closeOnce.Do(func() {
+		released = true
+
+		close(e.closing)
+	})
 
 	if !released {
 		return nil

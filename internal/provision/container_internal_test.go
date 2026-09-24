@@ -317,7 +317,7 @@ func TestAContainerHoldingAnUnlabelledVolumeIsRemovedUnstarted(t *testing.T) {
 		t.Fatalf("CreateContainer = %v, want ErrUnlabelledVolume naming the path", err)
 	}
 
-	if removes := fake.verbCalls("remove"); len(removes) != 1 {
+	if removes := fake.verbCalls(removeVerb); len(removes) != 1 {
 		t.Errorf("rm calls = %v, want the container removed", removes)
 	}
 
@@ -396,7 +396,7 @@ func TestPostCreateVerificationChecksEveryProperty(t *testing.T) {
 			t.Errorf("%s: CreateContainer = %v, want a failure naming %q", tc.name, createErr, tc.want)
 		}
 
-		if removed := len(fake.verbCalls("remove")) > 0; removed != tc.removed {
+		if removed := len(fake.verbCalls(removeVerb)) > 0; removed != tc.removed {
 			t.Errorf("%s: removed = %v, want %v", tc.name, removed, tc.removed)
 		}
 	}

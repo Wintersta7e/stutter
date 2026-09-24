@@ -80,6 +80,8 @@ type Teardown struct {
 // and the private directory is reduced by r. It runs under its own bound whatever ctx says.
 func (e *Engine) Close(ctx context.Context, r Retention) Teardown {
 	e.closeOnce.Do(func() {
+		defer close(e.closing)
+
 		bound := e.teardownBound
 		if bound <= 0 {
 			bound = teardownBound
@@ -151,6 +153,8 @@ func (e *Engine) removeAll(ctx context.Context, r Retention) Teardown {
 func (e *Engine) removeEverything(ctx context.Context) error {
 	var errs []error
 
+	e.copyFailedLogs(ctx)
+
 	for _, typ := range []ResourceType{ResourceContainer, ResourceNetwork, ResourceVolume, ResourceImage} {
 		for _, rec := range e.book.newestFirst(typ) {
 			errs = append(errs, e.removeRecorded(ctx, e.book, rec))
@@ -158,6 +162,25 @@ func (e *Engine) removeEverything(ctx context.Context) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// copyFailedLogs copies the log of every container still present whose state shows it failed,
+// before anything removes it.
+func (e *Engine) copyFailedLogs(ctx context.Context) {
+	for _, rec := range e.book.newestFirst(ResourceContainer) {
+		if rec.id == "" || rec.state == opRemoved || rec.state == opAbsent {
+			continue
+		}
+
+		c := &Container{id: rec.id, name: rec.name, check: e.id, kind: rec.kind, seq: rec.seq}
+
+		if state, err := e.Status(ctx, c); err == nil && failedRun(state) {
+			// A log that cannot be copied does not stop the teardown; the container is still removed.
+			if _, err := e.CopyLog(ctx, c); err != nil {
+				continue
+			}
+		}
+	}
 }
 
 // audit lists everything the engine holds with this check's exact label, and every anonymous

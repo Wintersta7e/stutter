@@ -24,7 +24,12 @@ type fakeObject struct {
 	labels  map[string]string
 	volumes map[string]any
 	// inspect is a created container's whole inspect, in the container template's shape.
-	inspect  *containerReport
+	inspect *containerReport
+	// stopped is closed when a started container stops.
+	stopped chan struct{}
+	// output and stderr are what the container wrote to each stream.
+	output   string
+	stderr   string
 	env      []string
 	anon     []string
 	copied   []byte
@@ -71,6 +76,8 @@ type fakeEngine struct {
 	readOnly bool
 	// buildDropsLabels makes a build land images without the labels it was handed.
 	buildDropsLabels bool
+	// gracefulExit is the exit code a graceful stop leaves: 137 when the grace period ran out.
+	gracefulExit int
 }
 
 func newFakeEngine() *fakeEngine {
@@ -174,6 +181,10 @@ func (f *fakeEngine) call(ctx context.Context, req request) (result, error) {
 		return result{exit: -1}, fmt.Errorf("%w: %s call exceeded its deadline", ErrDeadline, spec.name)
 	}
 
+	if req.verb == verbWait {
+		return f.wait(ctx, argv[len(argv)-1])
+	}
+
 	if err := ctx.Err(); err != nil {
 		return result{exit: -1}, fmt.Errorf("%s call cancelled: %w", spec.name, err)
 	}
@@ -209,6 +220,10 @@ func (f *fakeEngine) imageAnswers(req request, spec verbSpec, rest []string) (fu
 		verbCreate:       func() (result, error) { return f.create(req, rest) },
 		verbCopyIn:       func() (result, error) { return f.copyIn(spec, req.stdin, rest) },
 		verbCopyOut:      func() (result, error) { return f.copyOut(spec, rest) },
+		verbStart:        func() (result, error) { return f.start(spec, rest) },
+		verbStopGraceful: func() (result, error) { return f.stopGraceful(spec, rest) },
+		verbLogs:         func() (result, error) { return f.logs(spec, req, rest) },
+		verbLogsFollow:   func() (result, error) { return f.logs(spec, req, rest) },
 	}
 
 	answer, ok := answers[req.verb]
@@ -537,8 +552,96 @@ func (f *fakeEngine) remove(spec verbSpec, typ ResourceType, refs []string) (res
 // kill stops a container; a stopped container stays, as the engine keeps it.
 func (f *fakeEngine) kill(spec verbSpec, refs []string) (result, error) {
 	for _, ref := range refs {
-		if f.find(ResourceContainer, ref) == nil {
+		container := f.find(ResourceContainer, ref)
+		if container == nil {
 			return fail(spec, "No such container: "+ref)
+		}
+
+		stopContainer(container, killedExit)
+	}
+
+	return result{}, nil
+}
+
+// removeVerb is the verb that removes a container.
+const removeVerb = "remove"
+
+// stopContainer ends a running container with exit, and releases its wait.
+func stopContainer(container *fakeObject, exit int) {
+	if container.inspect == nil || !container.inspect.Running {
+		return
+	}
+
+	container.inspect.Running, container.inspect.ExitCode = false, exit
+
+	if container.stopped != nil {
+		close(container.stopped)
+		container.stopped = nil
+	}
+}
+
+// start runs a created container.
+func (f *fakeEngine) start(spec verbSpec, rest []string) (result, error) {
+	container := f.find(ResourceContainer, rest[len(rest)-1])
+	if container == nil || container.inspect == nil {
+		return fail(spec, "No such container")
+	}
+
+	container.inspect.Running, container.stopped = true, make(chan struct{})
+
+	return result{}, nil
+}
+
+// stopGraceful stops a container as its stop signal would, leaving gracefulExit.
+func (f *fakeEngine) stopGraceful(spec verbSpec, rest []string) (result, error) {
+	container := f.find(ResourceContainer, rest[len(rest)-1])
+	if container == nil || container.inspect == nil {
+		return fail(spec, "No such container")
+	}
+
+	container.inspect.Running = true
+	stopContainer(container, f.gracefulExit)
+
+	return result{}, nil
+}
+
+// wait returns when the container stops, at once when it is not running, as the engine's does.
+func (f *fakeEngine) wait(ctx context.Context, id string) (result, error) {
+	f.mu.Lock()
+	container := f.find(ResourceContainer, id)
+
+	var stopped chan struct{}
+	if container != nil {
+		stopped = container.stopped
+	}
+	f.mu.Unlock()
+
+	if stopped != nil {
+		select {
+		case <-stopped:
+		case <-ctx.Done():
+			return result{exit: -1}, fmt.Errorf("wait call cancelled: %w", ctx.Err())
+		}
+	}
+
+	return result{out: []byte("0\n")}, nil
+}
+
+// logs writes what the container wrote, each stream to its own writer.
+func (f *fakeEngine) logs(spec verbSpec, req request, rest []string) (result, error) {
+	container := f.find(ResourceContainer, rest[len(rest)-1])
+	if container == nil {
+		return fail(spec, "No such container")
+	}
+
+	for _, stream := range []struct {
+		to   io.Writer
+		text string
+	}{{req.stdout, container.output}, {req.stderr, container.stderr}} {
+		if stream.to != nil {
+			if _, err := io.WriteString(stream.to, stream.text); err != nil {
+				return result{}, err
+			}
 		}
 	}
 
