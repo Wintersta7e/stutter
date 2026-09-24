@@ -1,0 +1,31 @@
+# A dependency that leaves a named pipe in its volume: no copy may carry one.
+name: fifo
+
+x-stutter:
+  roles:
+    tree: other
+  endpoints:
+    tree:
+      "5432": opaque
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+    depends_on:
+      tree:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  tree:
+    image: postgres:18-alpine
+    init: true
+    entrypoint: ["sh", "-c", "mkfifo /t/pipe; exec sleep 3600"]
+    volumes:
+      - pipes:/t
+
+volumes:
+  pipes:

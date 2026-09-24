@@ -34,9 +34,12 @@ func snapshotted(t *testing.T, composeFile string, waits provision.Waits) (*fixt
 func TestSnapshotGuardRefusesDataOutsideTheLayer(t *testing.T) {
 	t.Parallel()
 
-	_, _, err := snapshotted(t, fixturePath(t, "guard-volume.yaml"), waitsForTests())
+	_, deps, err := snapshotted(t, fixturePath(t, "guard-volume.yaml"), waitsForTests())
 	if err == nil {
-		t.Fatal("snapshot guard did not refuse a cluster kept under the image's VOLUME")
+		// What the guard exists to stop: the restore comes up healthy, without the job's rows.
+		addrs, _ := restored(t, deps)
+		t.Fatalf("snapshot guard did not refuse; the first restore holds %d of the job's rows",
+			count(t, addrs["db2:5432"], "SELECT count(*) FROM pg_tables WHERE tablename = 'filled'"))
 	}
 
 	if !errors.Is(err, provision.ErrSnapshot) || !strings.Contains(err.Error(), "db2") ||
@@ -64,6 +67,11 @@ func TestDependencyGuardRefusesAnUncoveredVolume(t *testing.T) {
 
 	if db := record(t, deps, "db"); db.Killed {
 		t.Errorf("db's record says it was killed at its stop: %+v", db)
+	}
+
+	addrs, _ := restored(t, deps)
+	if n := count(t, addrs["cache:5432"], "SELECT count(*) FROM seeded"); n != 1 {
+		t.Errorf("cache's first restore holds %d of the job's rows, want 1: its VOLUME was not snapshotted", n)
 	}
 }
 

@@ -17,8 +17,9 @@ import (
 // whatever lives on a volume, and a SIGKILLed postmaster leaves a stale pid file: either restores
 // healthy, runs its init again, and has lost every row the jobs wrote.
 
-// errGuard means a stopped seed failed a snapshot proof.
-var errGuard = errors.New("the seed failed a snapshot proof")
+// errGuard means a dependency's container failed a proof of its storage: a stopped seed before its
+// snapshot, or a restore before its start.
+var errGuard = errors.New("a storage proof failed")
 
 // The files of a Postgres data directory the guard reads.
 const (

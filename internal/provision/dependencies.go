@@ -116,8 +116,12 @@ type dependency struct {
 	health *Healthcheck
 	// seed is the seed container, until the snapshot removes it.
 	seed *Container
+	// restore is the current start's restore container, until the next start replaces it.
+	restore *Container
 	// templates back plan.templates, one each, in order.
 	templates []*Volume
+	// perRun are the current restore's volumes, filled from templates.
+	perRun []*Volume
 	// awaitSet are the ports the seed answered on before its snapshot: every restore waits for them.
 	awaitSet []uint16
 	// seedStarted is when the seed started, on the monotonic clock.
@@ -135,6 +139,8 @@ type dependency struct {
 	identity uint64
 	// healthy reports a service_healthy condition naming the service.
 	healthy bool
+	// restored reports the snapshot restored once: a Postgres restore's identity is proven the first time.
+	restored bool
 }
 
 // Dependencies are the dependencies a check starts: each seeded once, snapshotted, and restored before

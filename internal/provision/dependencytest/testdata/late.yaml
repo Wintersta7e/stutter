@@ -1,0 +1,31 @@
+# A dependency that listens two seconds after it starts, and exposes a port it never serves: every
+# restore waits for the first and never for the second.
+name: late
+
+x-stutter:
+  roles:
+    slow: other
+  endpoints:
+    slow:
+      "5432": opaque
+      "7000": opaque
+
+services:
+  app:
+    image: example.test/app:1
+    environment:
+      NATS_URL: nats://bus:4222
+      SLOW_ADDR: slow:5432
+    depends_on:
+      slow:
+        condition: service_started
+
+  bus:
+    image: nats:2.14-alpine
+
+  slow:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_HOST_AUTH_METHOD: trust
+    expose: ["7000"]
+    entrypoint: ["sh", "-c", "sleep 2; exec docker-entrypoint.sh postgres"]

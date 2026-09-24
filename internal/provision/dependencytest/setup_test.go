@@ -329,8 +329,6 @@ func (f *fixture) volumesOfKind(t *testing.T, kind rules.Kind) map[string]bool {
 }
 
 // serviceContainer is the one container of kind the engine holds for service in this check.
-//
-//nolint:unparam // the restore tests ask for the restore kind.
 func (f *fixture) serviceContainer(t *testing.T, kind rules.Kind, service string) map[string]any {
 	t.Helper()
 

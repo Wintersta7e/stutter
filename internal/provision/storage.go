@@ -169,6 +169,18 @@ func classificationPlan(in storageInput) (storagePlan, error) {
 	return plan, nil
 }
 
+// restorePlan is a restore's storage: the seed's tmpfs and read-only binds again, and one per-run
+// volume per template, mounted without the image's content so the template is its only source.
+func restorePlan(seed storagePlan) storagePlan {
+	plan := storagePlan{mounts: slices.Clone(seed.mounts), pgdata: seed.pgdata}
+
+	for _, tmpl := range seed.templates {
+		plan.templates = append(plan.templates, templateMount{target: tmpl.target, volume: tmpl.volume, noCopy: true})
+	}
+
+	return plan
+}
+
 // jobVolumes mounts a job's model volume that a started dependency holds as a template as that
 // template, at the job's own target: what the job writes there is what the snapshot holds. Every other
 // mount keeps its verdict.
