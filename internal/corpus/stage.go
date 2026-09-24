@@ -18,9 +18,20 @@ import (
 // pause but the next restore, which returns the consumer to how the checkpoint holds it.
 const pauseHorizon = 24 * time.Hour
 
+const (
+	// fillWindow is how many of Fill's publishes may await their acknowledgement at once.
+	fillWindow = 256
+	// fillAckLimit bounds the wait for one acknowledgement when the caller set no deadline: nats.go's
+	// default JetStream API timeout, the wait a publish made alone had.
+	fillAckLimit = 5 * time.Second
+)
+
 // ErrFill means the corpus could not be staged exactly as numbered: a publish was refused, the bus
 // took a message for a duplicate, or a message landed somewhere other than where it was numbered.
 var ErrFill = errors.New("the corpus could not be staged as numbered")
+
+// errNoAck means the bus never acknowledged a publish.
+var errNoAck = errors.New("the bus did not acknowledge the publish")
 
 // errTooManyPending means a consumer's pending count is past anything a corpus could stage.
 var errTooManyPending = errors.New("pending count out of range")
@@ -207,35 +218,86 @@ func Numbering(messages []Message, first uint64) []Staged {
 
 // Fill publishes messages into the bound stream in order, headers included, the first at first.
 //
-// Each publish waits for the bus's acknowledgement. A message the bus took for a duplicate, or one
-// landing anywhere but where Numbering said, is an error rather than a detail: the corpus would be
-// missing a message, or something else published into the stream, and every fault aimed by sequence
-// would hit the wrong message.
+// Every acknowledgement is checked, in order. A message the bus took for a duplicate, or one landing
+// anywhere but where Numbering said, is an error rather than a detail: the corpus would be missing a
+// message, or something else published into the stream, and every fault aimed by sequence would hit
+// the wrong message.
+//
+// Up to fillWindow publishes await their acknowledgement at once. One at a time, each paid a full
+// round trip, and a loaded machine stretched 500 messages past the 500 ms that deliveries may be held
+// while they are published.
 func (c *Corpus) Fill(ctx context.Context, messages []Message, first uint64) error {
-	for at, message := range messages {
-		msg := nats.NewMsg(message.Subject)
-		msg.Data = message.Payload
+	futures := make([]jetstream.PubAckFuture, len(messages))
+	checked := 0
 
-		for name, values := range message.Header {
-			msg.Header[name] = slices.Clone(values)
+	for at, message := range messages {
+		for ; at-checked >= fillWindow; checked++ {
+			if err := landed(ctx, futures[checked], messages, checked, first); err != nil {
+				return err
+			}
 		}
 
-		ack, err := c.stream.PublishMsg(ctx, msg)
+		future, err := c.stream.PublishMsgAsync(staged(message))
 		if err != nil {
 			return &FillError{Err: fmt.Errorf("publish: %w", err), Seq: message.Seq}
 		}
 
-		want := first + uint64(at)
+		futures[at] = future
+	}
 
-		switch {
-		case ack.Duplicate:
-			return &FillError{Seq: message.Seq, Other: filled(messages[:at], first, ack.Sequence), duplicate: true}
-		case ack.Sequence != want:
-			return &FillError{Seq: message.Seq, Landed: ack.Sequence, want: want}
+	for ; checked < len(messages); checked++ {
+		if err := landed(ctx, futures[checked], messages, checked, first); err != nil {
+			return err
 		}
 	}
 
 	return nil
+}
+
+// staged is the bus message a corpus message is published as.
+func staged(message Message) *nats.Msg {
+	msg := nats.NewMsg(message.Subject)
+	msg.Data = message.Payload
+
+	for name, values := range message.Header {
+		msg.Header[name] = slices.Clone(values)
+	}
+
+	return msg
+}
+
+// landed waits for the acknowledgement of messages[at] and checks it landed where it was numbered.
+//
+// The wait is bounded by ctx, and by fillAckLimit when ctx has no deadline, as a publish waiting
+// alone was.
+func landed(ctx context.Context, future jetstream.PubAckFuture, messages []Message, at int, first uint64) error {
+	message := messages[at]
+
+	limit := time.NewTimer(fillAckLimit)
+	defer limit.Stop()
+
+	var ack *jetstream.PubAck
+
+	select {
+	case ack = <-future.Ok():
+	case err := <-future.Err():
+		return &FillError{Err: fmt.Errorf("publish: %w", err), Seq: message.Seq}
+	case <-ctx.Done():
+		return &FillError{Err: fmt.Errorf("publish: %w", context.Cause(ctx)), Seq: message.Seq}
+	case <-limit.C:
+		return &FillError{Err: fmt.Errorf("publish: %w", errNoAck), Seq: message.Seq}
+	}
+
+	want := first + uint64(at) //nolint:gosec // at indexes messages, so it is never negative.
+
+	switch {
+	case ack.Duplicate:
+		return &FillError{Seq: message.Seq, Other: filled(messages[:at], first, ack.Sequence), duplicate: true}
+	case ack.Sequence != want:
+		return &FillError{Seq: message.Seq, Landed: ack.Sequence, want: want}
+	default:
+		return nil
+	}
 }
 
 // filled names the corpus message already published at a stream sequence, or zero when none of

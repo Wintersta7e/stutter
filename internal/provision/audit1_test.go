@@ -536,6 +536,9 @@ var (
 	pruneAPIPath  = regexp.MustCompile(`(^|/)prune($|[/?])`)
 	dockerCommand = regexp.MustCompile(`\bdocker\s+([a-z][a-z0-9-]*)`)
 	pruneToken    = regexp.MustCompile(`(^|[^\w-])prune\b`)
+	// unselectedPort is a publish whose host port Stutter did not select: a constant one
+	// ("127.0.0.1:8080:", "8080:80/tcp") or one left to the engine ("127.0.0.1::").
+	unselectedPort = regexp.MustCompile(`\d{1,3}(\.\d{1,3}){3}:\d{0,5}:|^\d{1,5}:\d{1,5}(/(tcp|udp|sctp))?$`)
 	// composeRun is the compose plugin given an argument: run, not a file named by a download,
 	// checksum or move.
 	composeRun = regexp.MustCompile(`docker-compose"?[ \t]+[^\s|;&<>\\"'` + "`" + `)]`)
@@ -587,8 +590,8 @@ func textInvocations(texts []textSource) []string {
 	return violations
 }
 
-// ipamFlags finds a production literal that would let the engine pick an address; --subnet is the
-// caller's, set once, in the network builder.
+// ipamFlags finds a production literal that would let the engine pick an address, or that publishes
+// on a host port Stutter did not select; --subnet is the caller's, set once, in the network builder.
 func ipamFlags(files []goSource) []string {
 	var violations []string
 
@@ -604,6 +607,8 @@ func ipamFlags(files []goSource) []string {
 			case slices.Contains([]string{"--ip", "--ip6", "--ip-range", "--gateway"}, text),
 				strings.HasPrefix(text, "--ipv6") && text != "--ipv6=false":
 				violations = append(violations, "item 5a: "+f.path+" carries "+text)
+			case unselectedPort.MatchString(text):
+				violations = append(violations, "item 5b: "+f.path+" publishes on a host port it did not select: "+text)
 			case text == "--subnet":
 				subnets++
 
@@ -896,6 +901,19 @@ func diffRows(t *testing.T, got, want []string) {
 }
 
 // Every detector catches the break it exists for, over files made for the purpose.
+// itemOf keeps the violations of one audit item.
+func itemOf(item string, violations []string) []string {
+	var kept []string
+
+	for _, v := range violations {
+		if strings.HasPrefix(v, item+":") {
+			kept = append(kept, v)
+		}
+	}
+
+	return kept
+}
+
 func TestAuditOneCatchesEachBreak(t *testing.T) {
 	t.Parallel()
 
@@ -937,6 +955,16 @@ func TestAuditOneCatchesEachBreak(t *testing.T) {
 			}
 
 			return []string{"table differs"}
+		}},
+		{name: "a constant host port", detect: func() []string {
+			src := "package provision\n\nvar x = []string{\"-p\", \"127.0.0.1:8080:80/tcp\"}\n"
+
+			return itemOf("item 5b", ipamFlags([]goSource{parseGo(t, argvFile, []byte(src))}))
+		}},
+		{name: "a host port left to the engine", detect: func() []string {
+			src := "package provision\n\nvar x = \"127.0.0.1::\" + \"80/tcp\"\n"
+
+			return itemOf("item 5b", ipamFlags([]goSource{parseGo(t, argvFile, []byte(src))}))
 		}},
 		{name: "an exported RemoveByID(id string)", detect: func() []string {
 			src := "package provision\n\nimport \"context\"\n\n" +
