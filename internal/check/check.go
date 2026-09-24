@@ -124,10 +124,13 @@ func Run(ctx context.Context, session Session, opts Options) (report.Report, err
 	return run.execute(ctx)
 }
 
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type check struct {
 	session  Session
 	comparer *gate.Comparer
-	opts     Options
+	// unexpressed are the faults the session refused to express, each skipped after its first refusal.
+	unexpressed []policy.Fault
+	opts        Options
 	// passes counts every replay, including the reference pair and shrink candidates. It only names
 	// consumers uniquely.
 	passes int
@@ -230,23 +233,55 @@ func (c *check) hunt(ctx context.Context, reference replay.Result) ([]report.Div
 			continue
 		}
 
-		for _, seq := range c.opts.Messages {
-			if c.opts.MaxRuns > 0 && c.injected >= c.opts.MaxRuns {
-				return found, nil
-			}
+		diverged, spent, err := c.huntFault(ctx, reference, fault)
+		if err != nil {
+			return nil, err
+		}
 
-			divergence, diverged, err := c.attempt(ctx, reference, fault, seq)
-			if err != nil {
-				return nil, err
-			}
+		found = append(found, diverged...)
 
-			if diverged {
-				found = append(found, divergence)
-			}
+		if spent {
+			break
 		}
 	}
 
 	return found, nil
+}
+
+// huntFault injects one fault against every message, and reports whether the run budget ran out.
+//
+// A fault the session cannot express is refused alike for every message, and each attempt costs a
+// reset before the refusal: after the first, the fault is skipped for the rest of the consumer's
+// messages and noted as unexpressed, so it is paid for once and never once per message.
+func (c *check) huntFault(
+	ctx context.Context,
+	reference replay.Result,
+	fault policy.Fault,
+) ([]report.Divergence, bool, error) {
+	var found []report.Divergence
+
+	for _, seq := range c.opts.Messages {
+		if c.opts.MaxRuns > 0 && c.injected >= c.opts.MaxRuns {
+			return found, true, nil
+		}
+
+		divergence, diverged, err := c.attempt(ctx, reference, fault, seq)
+		if errors.Is(err, replay.ErrUnsupported) {
+			c.unexpressed = append(c.unexpressed, fault)
+
+			return found, false, nil
+		}
+
+		if err != nil {
+			return nil, false, err
+		}
+
+		if diverged {
+			found = append(found, divergence)
+		}
+	}
+
+	return found, false, nil
 }
 
 // attempt runs one fault against one message and, if it diverged, shrinks it to a minimal repro.
@@ -261,16 +296,12 @@ func (c *check) attempt(
 		return report.Divergence{}, false, nil
 	}
 
-	mutated, err := c.pass(ctx, string(fault), mutation, nil)
-
 	// A session may be unable to express a fault against the service it is driving: a run watched on
 	// the wire has no way to hold a delivery back before a service that pulls for itself has already
-	// been handed it. Skipping matches how a fault with no mutation at all is treated, and injecting
-	// something weaker under the same name would be worse than injecting nothing.
-	if errors.Is(err, replay.ErrUnsupported) {
-		return report.Divergence{}, false, nil
-	}
-
+	// been handed it. The refusal is returned as it came, and hunt skips the fault — once per consumer
+	// — as it skips a fault with no mutation at all; injecting something weaker under the same name
+	// would be worse than injecting nothing.
+	mutated, err := c.pass(ctx, string(fault), mutation, nil)
 	if err != nil {
 		return report.Divergence{}, false, err
 	}

@@ -572,6 +572,44 @@ func TestAnInexpressibleFaultIsSkippedNotFatal(t *testing.T) {
 	}
 }
 
+// TestAnInexpressibleFaultCostsOneReset: a session refuses a fault it cannot express for every message
+// alike, and each attempt costs a reset before it is refused. Paying that once per message multiplies a
+// check's setup cost by its corpus size for nothing; once per consumer is enough to learn it.
+func TestAnInexpressibleFaultCostsOneReset(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.messages = []uint64{1, 2, 3, 4, 5}
+	scripted.nonIdempotent = map[uint64]bool{}
+	scripted.refuses = map[policy.Fault]bool{policy.FaultDelay: true, policy.FaultReorder: true}
+
+	opts := options(scripted)
+	opts.Config.MaxAckPending = 10
+
+	if !opts.Config.Permits(policy.FaultReorder).Permitted {
+		t.Fatal("reorder is not licensed, so its refusal is never paid for")
+	}
+
+	if _, err := check.Run(t.Context(), scripted, opts); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	injected := 0
+
+	for _, name := range scripted.names {
+		if !strings.HasPrefix(name, "clean") {
+			injected++
+		}
+	}
+
+	t.Logf("resets %d, injected %d, messages %d", scripted.resets, injected, len(scripted.messages))
+
+	if want := 2 + injected + 2; scripted.resets != want {
+		t.Errorf("resets = %d, want %d: two clean runs, %d injected, one refusal each for delay and reorder",
+			scripted.resets, want, injected)
+	}
+}
+
 // TestAnInvariantSilencesADivergence is the answer to work that repeats harmlessly.
 //
 // A doubled audit row is a real duplicated write and Stutter is right to see it, but whether it
