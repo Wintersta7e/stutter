@@ -15,6 +15,7 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/effect"
+	"github.com/Wintersta7e/stutter/internal/policy"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
@@ -292,13 +293,17 @@ func (s *Sandbox) begin(
 	}
 
 	// One message in flight, whatever batch the service asks for: across two connections, the order the
-	// proxy sees an acknowledgement and the next message's write is not the order they happened in. A
-	// named target exists by now; an empty one means the service created no consumer at all, and scope
-	// then refuses whatever consumer it creates later.
+	// proxy sees an acknowledgement and the next message's write is not the order they happened in. The
+	// same call caps deliveries, so a message the service refuses forever still ends. A named target
+	// exists by now; an empty one means the service created no consumer at all, and scope then refuses
+	// whatever consumer it creates later.
 	if target != "" {
-		if err := s.cfg.Corpus.Serialise(ctx, target); err != nil {
+		discovered, err := s.cfg.Corpus.Serialise(ctx, target, DeliveryCap)
+		if err != nil {
 			return finished, fmt.Errorf("serialise the consumer under test: %w", err)
 		}
+
+		run.discovered = discovered
 	}
 
 	run.scope(target, s.startupLimit())
@@ -484,6 +489,9 @@ type observedRun struct {
 	staged atomic.Pointer[map[string]struct{}]
 	// core counts, by subject, staged messages handed to a core subscription.
 	core map[string]int
+	// discovered is the consumer under test as Serialise read it, before the rewrite: the configuration
+	// the service created, with the server's defaults filled in. Zero when no consumer was named.
+	discovered policy.Config
 	// recorded translates a sequence the stream is using back to the one the message was recorded
 	// under. Installed by stage before the corpus is published, and read from the proxy's goroutines.
 	recorded atomic.Pointer[map[uint64]uint64]

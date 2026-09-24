@@ -4,7 +4,19 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/Wintersta7e/stutter/internal/policy"
 )
+
+// serviceRetries is how many deliveries of a message a run allows beyond the crash loop's: one. A
+// handler that loses an optimistic-concurrency race on the redelivery, NAKs, re-reads and writes again
+// is the read-modify-write bug class, and a cap one lower hides it.
+const serviceRetries = 1
+
+// DeliveryCap is the most deliveries of one message any run allows: the first, the ones the crash loop
+// withholds, and one retry of the service's own. It is the same for every run of a check, because a
+// bound that differed between the runs it compares would itself manufacture a divergence.
+const DeliveryCap = 1 + policy.CrashLoopWithheld + serviceRetries
 
 // interruption is what ended a wait: its own condition, or something that made the condition moot.
 type interruption uint8

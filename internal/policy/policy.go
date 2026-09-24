@@ -100,6 +100,17 @@ func (c Config) Deadline(attempt int) time.Duration {
 	return c.BackOff[index]
 }
 
+// EffectiveCap is how many deliveries of one message a run allows: the smaller of MaxDeliver and
+// deliveryCap, a non-positive MaxDeliver being unlimited — the same reading describeLimit gives it. A
+// run capped below what the consumer allows only loses deliveries; it never gains one.
+func (c Config) EffectiveCap(deliveryCap int) int {
+	if c.MaxDeliver <= 0 {
+		return deliveryCap
+	}
+
+	return min(c.MaxDeliver, deliveryCap)
+}
+
 // Permits reports whether the recorded configuration allows a fault.
 func (c Config) Permits(fault Fault) Verdict {
 	switch fault {

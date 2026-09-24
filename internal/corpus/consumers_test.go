@@ -12,6 +12,9 @@ import (
 	"github.com/Wintersta7e/stutter/internal/policy"
 )
 
+// curvedConsumer is the consumer the tests that need a backoff curve create.
+const curvedConsumer = "curved"
+
 // corpusConsumers names the consumers on the bound stream.
 func corpusConsumers(ctx context.Context, store *corpus.Corpus) ([]string, error) {
 	listing, err := store.Consumers(ctx)
@@ -54,7 +57,7 @@ func TestPolicyReadsTheServersDefaults(t *testing.T) {
 	}
 
 	curved := create(jetstream.ConsumerConfig{
-		Name:    "curved",
+		Name:    curvedConsumer,
 		AckWait: 2 * time.Minute,
 		BackOff: []time.Duration{time.Second, 5 * time.Second},
 	})
