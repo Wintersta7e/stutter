@@ -1,0 +1,147 @@
+# Every key shape the compose model decoder reads. Rendered by two compose releases into
+# kitchen-2.29.7.json and kitchen-5.5.1.json (see provenance.txt); the tests read the JSON.
+name: kitchen
+
+x-stutter:
+  roles:
+    cache: other
+  endpoints:
+    db:
+      "5432": pg
+
+services:
+  api:
+    image: example.test/api:1
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        TOKEN: build-arg
+      tags:
+        - example.test/api:dev
+      cache_to:
+        - type=inline
+      platforms:
+        - linux/amd64
+      labels:
+        com.example.test.kind: app
+    entrypoint: ["/bin/app", "--serve"]
+    command: ["--port", "8080"]
+    working_dir: /srv
+    user: "1000:1000"
+    environment:
+      PASS: pa$$word
+      PLAIN: plain
+      UNSET_VAR: null
+      NATS_URL: nats://bus:4222
+    volumes:
+      - ./conf:/etc/app:ro
+      - type: bind
+        source: ./data
+        target: /data
+      - cache-vol:/var/cache
+      - /scratch
+      - type: tmpfs
+        target: /run/tmp
+        tmpfs:
+          size: 1048576
+          mode: 01777
+    tmpfs:
+      - /tmp
+    configs:
+      - source: c_content
+        target: /etc/app/content.conf
+      - source: c_file
+        target: /etc/app/file.conf
+      - source: c_env
+        target: /etc/app/env.conf
+        uid: "1000"
+        gid: "1000"
+        mode: 0400
+    secrets:
+      - source: s_env
+        target: /run/secrets/token
+        uid: "1000"
+        mode: 0400
+    mem_limit: 512m
+    shm_size: 64m
+    cpus: 0.5
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 2048
+      nproc: 512
+    ports:
+      - "8080:80"
+      - target: 9000
+        published: "9001"
+        protocol: udp
+    expose:
+      - "7000-7002"
+      - "5353/udp"
+    links:
+      - db:database
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  db:
+    image: example.test/pg:18
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "x"]
+      interval: 5s
+      timeout: 3s
+      retries: 4
+      start_period: 10s
+      start_interval: 1s
+    stop_signal: SIGINT
+    stop_grace_period: 1m30s
+
+  cache:
+    image: example.test/cache:8
+    healthcheck:
+      test: redis-cli ping
+    stop_signal: SIGTERM
+
+  worker:
+    image: example.test/api:1
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+          pids: 100
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+  migrate:
+    image: example.test/api:1
+    command: ["migrate"]
+    healthcheck:
+      test: ["NONE"]
+
+  tools:
+    image: example.test/tools:1
+    profiles:
+      - debug
+
+volumes:
+  cache-vol: {}
+
+configs:
+  c_content:
+    content: |
+      line one $$HOME
+  c_file:
+    file: ./conf/file.conf
+  c_env:
+    environment: CONFIG_VALUE
+
+secrets:
+  s_env:
+    environment: SECRET_VALUE

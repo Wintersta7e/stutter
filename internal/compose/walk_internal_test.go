@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// decodeModel decodes a model the way Parse does, numbers kept as json.Number.
-func decodeModel(t *testing.T, text string) map[string]any {
+// genericModel decodes a model the way Parse does, numbers kept as json.Number.
+func genericModel(t *testing.T, text string) map[string]any {
 	t.Helper()
 
 	decoder := json.NewDecoder(bytes.NewReader([]byte(text)))
@@ -75,12 +75,12 @@ func TestAnUnlistedKeyIsRefusedByName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			wantRefusal(t, walkModel(decodeModel(t, tc.model)), "api", tc.key)
+			wantRefusal(t, walkModel(genericModel(t, tc.model)), "api", tc.key)
 		})
 	}
 
 	accepted := `{"services": {"api": {"build": {"context": "/project", "future_sub": 1}}}}`
-	if err := walkModel(decodeModel(t, accepted)); err != nil {
+	if err := walkModel(genericModel(t, accepted)); err != nil {
 		t.Errorf("an unknown key under the build subtree = %v, want accepted", err)
 	}
 }
@@ -106,7 +106,7 @@ func TestAnXKeyAtDepthIsIgnored(t *testing.T) {
 		"networks": {"default": {"name": "p_default", "ipam": {}}}
 	}`
 
-	if err := walkModel(decodeModel(t, model)); err != nil {
+	if err := walkModel(genericModel(t, model)); err != nil {
 		t.Errorf("walkModel = %v, want every x- key ignored", err)
 	}
 }
@@ -114,8 +114,8 @@ func TestAnXKeyAtDepthIsIgnored(t *testing.T) {
 func TestAnUnknownTopLevelKeyIsRefused(t *testing.T) {
 	t.Parallel()
 
-	wantRefusal(t, walkModel(decodeModel(t, `{"services": {}, "future": 1}`)), "", "future")
-	wantRefusal(t, walkModel(decodeModel(t, `{"volumes": {"data": {"future": 1}}}`)), "", "volumes.data.future")
-	wantRefusal(t, walkModel(decodeModel(t, `{"configs": {"c": {"content": "x", "future": 1}}}`)), "",
+	wantRefusal(t, walkModel(genericModel(t, `{"services": {}, "future": 1}`)), "", "future")
+	wantRefusal(t, walkModel(genericModel(t, `{"volumes": {"data": {"future": 1}}}`)), "", "volumes.data.future")
+	wantRefusal(t, walkModel(genericModel(t, `{"configs": {"c": {"content": "x", "future": 1}}}`)), "",
 		"configs.c.future")
 }

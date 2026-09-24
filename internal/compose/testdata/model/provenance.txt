@@ -1,0 +1,16 @@
+kitchen-2.29.7.json and kitchen-5.5.1.json are kitchen.yaml as two compose releases render it: the
+oldest supported release and the newest. The tests read the JSON; the YAML is kept as its source.
+
+Binaries (the release asset docker-compose-linux-x86_64, checked against the release's .sha256):
+  v2.29.7  https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64
+           sha256 383ce6698cd5d5bbf958d2c8489ed75094e34a77d340404d9f32c4ae9e12baf0
+  v5.5.1   https://github.com/docker/compose/releases/download/v5.5.1/docker-compose-linux-x86_64
+           sha256 db1889184726840f75c4f9c001048430d4f25b3be3cb084d3ddd762bc0aed576
+
+Command, run 2026-09-24 in a temporary project root holding kitchen.yaml, app/Dockerfile and
+conf/file.conf, with an empty environment apart from PATH and HOME:
+  env -i PATH=/usr/bin:/bin HOME=<root>/home <binary> -f <root>/kitchen.yaml --profile debug config --format json
+
+Both exited 0 with no stderr. The temporary root was then replaced with /project in the output.
+The renderings differ only where the two releases do: a config or secret mode (256 vs "0400") and a
+short bind's options (create_host_path: true vs {}).

@@ -185,7 +185,7 @@ func TestEveryComposeKeyHasOneVerdict(t *testing.T) {
 				t.Errorf("%s table lists %s, which neither schema has", table.name, rule.path)
 			}
 
-			if rule.verdict == 0 || (rule.verdict == Refuse && rule.class == 0) {
+			if rule.verdict == 0 || (rule.verdict == VerdictRefuse && rule.class == 0) {
 				t.Errorf("%s table row %s has no verdict or no class", table.name, rule.path)
 			}
 		}
