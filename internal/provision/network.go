@@ -9,11 +9,13 @@ import (
 	"strings"
 )
 
-// networkTemplate reads a network as one snake_case JSON object.
+// networkTemplate reads a network as one snake_case JSON object. A network's inspect fails outright
+// on a key its JSON lacks, so an IPAM entry's keys are read with index: measured, a 28.0.4 engine
+// records no Gateway for a network created with --subnet alone, where 29.6.2 records one.
 const networkTemplate = `{"id":{{json .Id}},"name":{{json .Name}},"labels":{{json .Labels}},` +
 	`"internal":{{json .Internal}},"ipv6":{{json .EnableIPv6}},` +
-	`"subnets":[{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{json $c.Subnet}}{{end}}],` +
-	`"gateways":[{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{json $c.Gateway}}{{end}}],` +
+	`"subnets":[{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{json (index $c "Subnet")}}{{end}}],` +
+	`"gateways":[{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{json (index $c "Gateway")}}{{end}}],` +
 	`"members":[{{$first := true}}{{range $id, $c := .Containers}}{{if not $first}},{{end}}` +
 	`{{json $id}}{{$first = false}}{{end}}]}`
 
@@ -60,7 +62,8 @@ func (r networkReport) ipv4Subnets() []netip.Prefix {
 type NetworkState struct {
 	// Subnet is its one IPv4 subnet.
 	Subnet netip.Prefix
-	// Gateway is its IPv4 gateway address.
+	// Gateway is its IPv4 gateway address; the zero Addr when the engine records none, as 28.0.4
+	// does for a network created with --subnet alone.
 	Gateway netip.Addr
 	// Members are the IDs of the running containers attached to it.
 	Members []string

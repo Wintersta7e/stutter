@@ -11,7 +11,6 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/effect"
 	"github.com/Wintersta7e/stutter/internal/gate"
-	"github.com/Wintersta7e/stutter/internal/harness"
 	"github.com/Wintersta7e/stutter/internal/policy"
 	"github.com/Wintersta7e/stutter/internal/replay"
 	"github.com/Wintersta7e/stutter/internal/report"
@@ -1044,10 +1043,11 @@ func TestHealthNotesOwedExhaustedAndAnExit(t *testing.T) {
 			health: func(h report.Health) report.Health { h.Owed = 2; return h },
 		},
 		{
+			// The cap is the run's, carried in the health it rendered from: a value no other code states.
 			name: "exhausted",
-			want: "1 message reached the cap of " + strconv.Itoa(harness.DeliveryCap) + " deliveries",
+			want: "1 message reached the cap of 3 deliveries",
 			health: func(h report.Health) report.Health {
-				h.Exhausted = 1
+				h.Exhausted, h.DeliveryCap = 1, 3
 
 				return h
 			},

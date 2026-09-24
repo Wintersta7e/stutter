@@ -67,6 +67,11 @@ func TestAPoisonMessageStopsAtTheDeliveryCap(t *testing.T) {
 	if result.Exhausted != 1 {
 		t.Errorf("Exhausted = %d, want 1", result.Exhausted)
 	}
+
+	// The report renders the cap from the result, so the run says which cap it applied.
+	if result.DeliveryCap != harness.DeliveryCap {
+		t.Errorf("DeliveryCap = %d, want %d", result.DeliveryCap, harness.DeliveryCap)
+	}
 }
 
 // TestACleanRunOnALongCurveEndsOnSettlement: a run that waited for silence had to outlast the longest

@@ -60,8 +60,11 @@ type fakeEngine struct {
 	// afterCreate, when set, edits a network or volume as the engine reports it after create.
 	afterCreate func(typ ResourceType, obj *fakeObject)
 	// hang names verbs whose calls block until their context ends, as a hung engine does.
-	hang    map[string]bool
-	logCall func(callLine)
+	hang map[string]bool
+	// unreadable names templates whose inspect exits 1 on an object the engine holds, as a template
+	// naming a key the object's JSON lacks does.
+	unreadable map[string]bool
+	logCall    func(callLine)
 	// inspectHook, when set, edits every created container's inspect as the engine reports it.
 	inspectHook func(inspect *containerReport)
 	// registry holds the images a pull can land, by reference.
@@ -330,6 +333,11 @@ func (f *fakeEngine) answer(v verb, spec verbSpec, rest []string) (result, error
 	}
 
 	if typ, ok := reads[v]; ok {
+		if f.unreadable[rest[0]] && f.find(typ, rest[1]) != nil {
+			// The CLI prints a blank line before a template's error.
+			return fail(spec, "")
+		}
+
 		return f.inspect(spec, typ, rest[1:])
 	}
 

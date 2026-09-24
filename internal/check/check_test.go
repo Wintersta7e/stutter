@@ -164,6 +164,7 @@ func (s *session) Run(
 		FedBack:         s.bus.FedBack,
 		Elsewhere:       s.bus.Elsewhere,
 		ClosedAfterInfo: s.bus.ClosedAfterInfo,
+		DeliveryCap:     s.bus.DeliveryCap,
 		Exit:            ended.exit,
 		Owed:            ended.owed,
 		Stopped:         ended.stopped,
@@ -776,6 +777,7 @@ func TestCleanRunHealthCarriesTheBusCounts(t *testing.T) {
 		FedBack:         3,
 		Elsewhere:       4,
 		ClosedAfterInfo: 5,
+		DeliveryCap:     4,
 	}
 
 	result, err := check.Run(t.Context(), scripted, options(scripted))
@@ -792,9 +794,9 @@ func TestCleanRunHealthCarriesTheBusCounts(t *testing.T) {
 		t.Errorf("Refusals = %+v, want %+v", health.Refusals, scripted.bus.Refusals)
 	}
 
-	got := []int{health.NoResponders, health.FedBack, health.Elsewhere, health.ClosedAfterInfo}
-	if want := []int{2, 3, 4, 5}; !slices.Equal(got, want) {
-		t.Errorf("NoResponders, FedBack, Elsewhere, ClosedAfterInfo = %v, want %v", got, want)
+	got := []int{health.NoResponders, health.FedBack, health.Elsewhere, health.ClosedAfterInfo, health.DeliveryCap}
+	if want := []int{2, 3, 4, 5, 4}; !slices.Equal(got, want) {
+		t.Errorf("NoResponders, FedBack, Elsewhere, ClosedAfterInfo, DeliveryCap = %v, want %v", got, want)
 	}
 }
 

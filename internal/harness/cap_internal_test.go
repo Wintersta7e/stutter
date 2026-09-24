@@ -76,27 +76,37 @@ func TestTheDeliveryCapKeepsEveryDeadline(t *testing.T) {
 	want := []time.Duration{0, 200 * time.Millisecond, 700 * time.Millisecond, 1600 * time.Millisecond}
 	quiet := want[len(want)-1] + curve[DeliveryCap-1] + 500*time.Millisecond
 
-	offsets := deliveries(t, consumer, quiet)
-	t.Logf("deliveries at %v after the first, watched for %s", offsets, quiet)
+	offsets, lead := deliveries(t, consumer, quiet)
+	t.Logf("deliveries at %v after the first, which arrived %s after its pull was issued; watched for %s",
+		offsets, lead, quiet)
 
 	if len(offsets) != len(want) {
 		t.Fatalf("%d deliveries, want %d: the cap let through %v", len(offsets), len(want), offsets)
 	}
 
+	// The server sent the first delivery, and started its deadline, somewhere between the pull being
+	// issued and the delivery arriving. Measured from the pull, an attempt can only look later than it
+	// was; from the arrival, only earlier. Each bound uses the anchor that cannot flatter it.
 	for attempt, offset := range offsets {
-		if gap := (offset - want[attempt]).Abs(); gap > drainPoll {
-			t.Errorf("attempt %d landed at %s, want %s within %s", attempt+1, offset, want[attempt], drainPoll)
+		if early := want[attempt] - (offset + lead); early > drainPoll {
+			t.Errorf("attempt %d landed %s before %s", attempt+1, early, want[attempt])
+		}
+
+		if late := offset - want[attempt]; late > drainPoll {
+			t.Errorf("attempt %d landed %s after %s", attempt+1, late, want[attempt])
 		}
 	}
 }
 
-// deliveries fetches without ever acknowledging until quiet has passed since the first delivery, and
-// returns each delivery's offset from the first on the monotonic clock.
-func deliveries(t *testing.T, consumer jetstream.Consumer, quiet time.Duration) []time.Duration {
+// deliveries fetches without ever acknowledging until quiet has passed since the first delivery. It
+// returns each delivery's offset from the first on the monotonic clock, and how long after its pull
+// was issued the first one arrived.
+func deliveries(t *testing.T, consumer jetstream.Consumer, quiet time.Duration) ([]time.Duration, time.Duration) {
 	t.Helper()
 
 	var (
 		first   time.Time
+		lead    time.Duration
 		offsets []time.Duration
 	)
 
@@ -112,6 +122,8 @@ func deliveries(t *testing.T, consumer jetstream.Consumer, quiet time.Duration) 
 			wait = max(quiet-time.Since(first), time.Millisecond)
 		}
 
+		issued := time.Now()
+
 		batch, err := consumer.Fetch(1, jetstream.FetchMaxWait(wait))
 		if err != nil {
 			t.Fatalf("Fetch() error = %v", err)
@@ -120,11 +132,12 @@ func deliveries(t *testing.T, consumer jetstream.Consumer, quiet time.Duration) 
 		for range batch.Messages() {
 			if first.IsZero() {
 				first = time.Now()
+				lead = first.Sub(issued)
 			}
 
 			offsets = append(offsets, time.Since(first))
 		}
 	}
 
-	return offsets
+	return offsets, lead
 }

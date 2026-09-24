@@ -984,9 +984,9 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 			errFedBack, strings.Join(unstaged, ", "), worked)
 	}
 
-	var owed, exhausted int
+	var owed, exhausted, capped int
 	if ledger := r.ledger.Load(); ledger != nil {
-		owed, exhausted = ledger.owed(r.endedAt), ledger.exhausted(r.endedAt)
+		owed, exhausted, capped = ledger.owed(r.endedAt), ledger.exhausted(r.endedAt), ledger.deliveryCap()
 	}
 
 	var span time.Duration
@@ -1001,6 +1001,7 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		Failed:          int(r.failed.Load()),
 		Owed:            owed,
 		Exhausted:       exhausted,
+		DeliveryCap:     capped,
 		Late:            r.recorder.LateCount(),
 		Setup:           r.recorder.SetupCount(),
 		FedBack:         len(unstaged),

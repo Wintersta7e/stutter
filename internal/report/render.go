@@ -7,7 +7,6 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/Wintersta7e/stutter/internal/harness"
 	"github.com/Wintersta7e/stutter/internal/policy"
 )
 
@@ -278,7 +277,7 @@ func (h *Health) endNoteLines() []string {
 	if h.Exhausted > 0 {
 		lines = append(lines, "",
 			pad("NOTE", statusColumn)+plural(h.Exhausted, "message")+" reached the cap of "+
-				strconv.Itoa(harness.DeliveryCap)+" deliveries without an acknowledgement;",
+				strconv.Itoa(h.DeliveryCap)+" deliveries without an acknowledgement;",
 			detailIndent+"the consumer allows more, which were not observed.")
 	}
 
