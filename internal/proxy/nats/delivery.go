@@ -27,4 +27,8 @@ type Delivery struct {
 // timers, measured every run, and a hold past its bound stops the run.
 type Deliveries interface {
 	Delivered(delivery Delivery)
+	// CoreDelivered is told of a message handed to a core subscription rather than a consumer: one
+	// whose reply is no acknowledgement subject and that answers no request of the service's. A core
+	// subscriber on a subject the corpus is published to receives every staged message too.
+	CoreDelivered(subject string)
 }

@@ -203,3 +203,38 @@ func TestPullRequestsReportTheirTimers(t *testing.T) {
 		}
 	}
 }
+
+// TestACoreDeliveryIsReported: a message handed to a core subscription is not a consumer delivery,
+// yet it is reported, so a core subscriber on a corpus subject cannot go unseen.
+func TestACoreDeliveryIsReported(t *testing.T) {
+	t.Parallel()
+
+	bus := embeddedBus(t).Addr().String()
+	watched := &deliveries{}
+	_, addr := startWatched(t, bus, natsproxy.Options{Deliveries: watched})
+
+	subscriber := connect(t, addr)
+
+	sub, err := subscriber.SubscribeSync(subject)
+	if err != nil {
+		t.Fatalf("SubscribeSync() error = %v", err)
+	}
+
+	flush(t, subscriber)
+
+	if err := connect(t, bus).Publish(subject, []byte(payload)); err != nil {
+		t.Fatalf("Publish() error = %v", err)
+	}
+
+	if _, err := sub.NextMsg(startupTimeout); err != nil {
+		t.Fatalf("NextMsg() error = %v", err)
+	}
+
+	if got := watched.coreSubjects(); len(got) != 1 || got[0] != subject {
+		t.Errorf("core deliveries = %q, want exactly [%s]", got, subject)
+	}
+
+	if got := watched.observed(); len(got) != 0 {
+		t.Errorf("consumer deliveries = %d, want none: a core message is no consumer's", len(got))
+	}
+}

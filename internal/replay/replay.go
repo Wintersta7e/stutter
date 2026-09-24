@@ -242,6 +242,9 @@ type Result struct {
 	// handling did nothing observable — the service's own output fed back through the stream it
 	// consumes. They belong to no corpus message and are left out of the comparison.
 	FedBack int
+	// Elsewhere counts deliveries on another stream while a message's window was open: the service's
+	// own bus work, neither scoped nor checked.
+	Elsewhere int
 }
 
 // Options tunes a run. The zero value is usable and applies the package defaults.

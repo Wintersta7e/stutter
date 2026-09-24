@@ -107,7 +107,7 @@ func (s *Sandbox) publish(ctx context.Context, run *observedRun, target string, 
 		return fmt.Errorf("number the corpus: %w", err)
 	}
 
-	run.stage(corpus.Numbering(messages, first))
+	run.stage(messages, first)
 
 	if err := s.cfg.Corpus.Fill(ctx, messages, first); err != nil {
 		return fmt.Errorf("stage the corpus: %w", err)

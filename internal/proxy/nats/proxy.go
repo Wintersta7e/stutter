@@ -387,8 +387,11 @@ func (s *session) pumpServer() {
 
 		// Noted as it is read, forwarded once any hold is released: a delivery's window is open before
 		// the service can act on it, however long the hold.
-		s.judge(current)
-		s.noteDelivery(current)
+		// An answer to one of the service's own requests is nobody's delivery.
+		if !s.judge(current) {
+			s.noteDelivery(current)
+		}
+
 		s.opts.Hold.wait()
 
 		if !s.forwardClient(current.raw) {
@@ -402,28 +405,29 @@ func (s *session) pumpServer() {
 // Only a message addressed to an inbox the session is waiting on is an answer, so ordinary traffic
 // that happens to carry an error payload is never mistaken for one. A "no responders" status is not a
 // refusal — nothing was there to refuse — so the request stays an effect and the answer is counted.
-func (s *session) judge(current *frame) {
+// It reports whether the message was such an answer.
+func (s *session) judge(current *frame) bool {
 	if !isDelivery(current.op) {
-		return
+		return false
 	}
 
 	request, owed := s.awaited(current.args.subject)
 	if !owed {
-		return
+		return false
 	}
 
 	if noResponders(current.body[:current.args.headerLen]) {
 		s.sink.NoResponder()
 		s.sink.Answered(current.args.subject)
 
-		return
+		return true
 	}
 
 	answer, declined := apiRefusal(current.body[current.args.headerLen:])
 	if !declined {
 		s.sink.Answered(current.args.subject)
 
-		return
+		return true
 	}
 
 	s.sink.Reject(current.args.subject)
@@ -441,6 +445,8 @@ func (s *session) judge(current *frame) {
 			ErrCode:     answer.ErrCode,
 		})
 	}
+
+	return true
 }
 
 // noteDelivery reports a message the bus handed over, identified by the subject it will be
@@ -448,14 +454,17 @@ func (s *session) judge(current *frame) {
 //
 // A delivery whose reply subject is not an acknowledgement subject is ordinary pub/sub traffic, not
 // a consumer delivery, and opening a window for it would attribute effects to a message the service
-// was never working on.
+// was never working on. It is reported as a core delivery instead: a core subscriber on a corpus
+// subject is handed the corpus too.
 func (s *session) noteDelivery(current *frame) {
-	if !isDelivery(current.op) {
+	if !isDelivery(current.op) || s.opts.Deliveries == nil {
 		return
 	}
 
 	ack, parsed := parseAck(current.args.reply, nil)
 	if !parsed {
+		s.opts.Deliveries.CoreDelivered(current.args.subject)
+
 		return
 	}
 

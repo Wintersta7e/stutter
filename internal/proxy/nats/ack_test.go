@@ -42,6 +42,8 @@ func (s *swallowFirst) observed() []natsproxy.Ack {
 // attribution window on.
 type deliveries struct {
 	seen []natsproxy.Delivery
+	// core holds the subjects of messages handed to a core subscription.
+	core []string
 	mu   sync.Mutex
 }
 
@@ -50,6 +52,20 @@ func (d *deliveries) Delivered(delivery natsproxy.Delivery) {
 	defer d.mu.Unlock()
 
 	d.seen = append(d.seen, delivery)
+}
+
+func (d *deliveries) CoreDelivered(subject string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.core = append(d.core, subject)
+}
+
+func (d *deliveries) coreSubjects() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return append([]string(nil), d.core...)
 }
 
 func (d *deliveries) observed() []natsproxy.Delivery {

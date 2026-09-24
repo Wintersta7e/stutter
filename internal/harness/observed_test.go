@@ -57,7 +57,10 @@ type pulling struct {
 	dependency net.Conn
 	replies    *bufio.Reader
 	// seeded is the job-seeded bucket the handler writes to, under the seededKey quirk.
-	seeded  jetstream.KeyValue
+	seeded jetstream.KeyValue
+	// stream is the service's JetStream context, and side its consumer on its own stream.
+	stream  jetstream.JetStream
+	side    jetstream.Consumer
 	done    chan struct{}
 	stopped chan struct{}
 	quirks  quirks
@@ -99,7 +102,23 @@ type quirks struct {
 	audit bool
 	// pullExpires is how long each pull lives. Zero is fetchWait.
 	pullExpires time.Duration
+	// coreSubscribe makes the service also subscribe to the order subject with a core subscription,
+	// beside its consumer.
+	coreSubscribe bool
+	// sideStream makes the service keep a stream of its own, and for every order publish a note into
+	// it and fetch one message from it while handling the order.
+	sideStream bool
+	// ephemeral makes the service create its consumer with no name, so the client names it afresh on
+	// every start.
+	ephemeral bool
 }
+
+// The service's own stream, under the sideStream quirk.
+const (
+	sideStream   = "SIDE"
+	sideConsumer = "side"
+	sideSubject  = "side.note"
+)
 
 // auditSubject is where an auditing service notes each delivery: inside the stream it consumes, and
 // outside its own filter, so the note takes a stream sequence without ever being delivered to it.
@@ -118,7 +137,24 @@ const (
 type startups struct {
 	found     []bool
 	revisions []uint64
+	consumers []string
 	mu        sync.Mutex
+}
+
+// consumer notes the name a starting service's consumer was given.
+func (s *startups) consumer(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.consumers = append(s.consumers, name)
+}
+
+// consumerNames reports every start's consumer name, in order.
+func (s *startups) consumerNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return slices.Clone(s.consumers)
 }
 
 // bucketFound notes whether a starting service found its own bucket already there.
@@ -239,8 +275,13 @@ func startPulling(
 		return nil, startupErr
 	}
 
+	name := observedConsumer
+	if behaviour.ephemeral {
+		name = ""
+	}
+
 	service.consumer, err = stream.CreateOrUpdateConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
-		Name:          observedConsumer,
+		Name:          name,
 		FilterSubject: behaviour.filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       config.AckWait,
@@ -249,6 +290,16 @@ func startPulling(
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create the consumer: %w", err)
+	}
+
+	if behaviour.seen != nil {
+		behaviour.seen.consumer(service.consumer.CachedInfo().Name)
+	}
+
+	if behaviour.coreSubscribe {
+		if _, err := service.connection.Subscribe(toy.SubjectOrderCreated, func(*nats.Msg) {}); err != nil {
+			return nil, fmt.Errorf("subscribe to the order subject: %w", err)
+		}
 	}
 
 	if behaviour.tlsFirst {
@@ -320,6 +371,27 @@ func (p *pulling) startup(ctx context.Context, stream jetstream.JetStream) error
 		if _, err := own.Put(ctx, "state", []byte("started")); err != nil {
 			return fmt.Errorf("write the service bucket: %w", err)
 		}
+	}
+
+	p.stream = stream
+
+	if p.quirks.sideStream {
+		if _, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+			Name:     sideStream,
+			Subjects: []string{"side.>"},
+		}); err != nil {
+			return fmt.Errorf("create the side stream: %w", err)
+		}
+
+		side, err := stream.CreateOrUpdateConsumer(ctx, sideStream, jetstream.ConsumerConfig{
+			Durable:   sideConsumer,
+			AckPolicy: jetstream.AckExplicitPolicy,
+		})
+		if err != nil {
+			return fmt.Errorf("create the side consumer: %w", err)
+		}
+
+		p.side = side
 	}
 
 	if p.quirks.seededKey {
@@ -402,6 +474,10 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 			settle = msg.Nak
 		}
 
+		if p.side != nil && p.noteAside(ctx, msg.Data()) != nil {
+			settle = msg.Nak
+		}
+
 		if p.quirks.echo {
 			published, err := json.Marshal(echoNote{EchoOf: string(msg.Data())})
 			if err != nil || p.connection.Publish(echoSubject, published) != nil {
@@ -414,6 +490,27 @@ func (p *pulling) handle(ctx context.Context, msg jetstream.Msg) {
 	//nolint:errcheck // a settle that fails is the run ending underneath the service, and the proxy
 	// reports that; retrying it here would add a delivery the run never asked for.
 	_ = settle()
+}
+
+// noteAside publishes a note into the service's own stream and takes it straight back off it: bus work
+// on a stream other than the one under test, done while handling a message.
+func (p *pulling) noteAside(ctx context.Context, note []byte) error {
+	if _, err := p.stream.Publish(ctx, sideSubject, note); err != nil {
+		return fmt.Errorf("note aside: %w", err)
+	}
+
+	batch, err := p.side.Fetch(1, jetstream.FetchMaxWait(fetchWait))
+	if err != nil {
+		return fmt.Errorf("fetch the note back: %w", err)
+	}
+
+	for msg := range batch.Messages() {
+		if err := msg.Ack(); err != nil {
+			return fmt.Errorf("settle the note: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // call sends one line to the dependency and waits for its answer.

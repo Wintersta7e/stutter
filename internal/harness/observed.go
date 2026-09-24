@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -420,6 +421,10 @@ type observedRun struct {
 	policy   *replay.WirePolicy
 	windows  *windows
 	recorder *effect.Recorder
+	// staged is the set of subjects this run publishes. Installed by stage.
+	staged atomic.Pointer[map[string]struct{}]
+	// core counts, by subject, staged messages handed to a core subscription.
+	core map[string]int
 	// recorded translates a sequence the stream is using back to the one the message was recorded
 	// under. Installed by stage before the corpus is published, and read from the proxy's goroutines.
 	recorded atomic.Pointer[map[uint64]uint64]
@@ -450,6 +455,9 @@ type observedRun struct {
 	failed    atomic.Int64
 	// foreign counts deliveries to a consumer that is not under test.
 	foreign atomic.Int64
+	// elsewhere counts deliveries on another stream while a window was open.
+	elsewhere atomic.Int64
+	coreMu    sync.Mutex
 }
 
 func newObservedRun(
@@ -479,6 +487,11 @@ func newObservedRun(
 // this run's business.
 func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	if delivery.Ack.Stream != r.stream {
+		// Neither paused nor checked, but how much of it happened inside the run's windows is noted.
+		if r.windows.opened() {
+			r.elsewhere.Add(1)
+		}
+
 		return
 	}
 
@@ -499,6 +512,29 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	}
 
 	r.windows.open(seq, delivery.Payload)
+}
+
+// CoreDelivered counts a staged message handed to a core subscription. The subscriber receives the
+// corpus beside the consumer under test, and whatever it does lands in the consumer's windows with no
+// way to tell the two apart.
+func (r *observedRun) CoreDelivered(subject string) {
+	staged := r.staged.Load()
+	if staged == nil {
+		return
+	}
+
+	if _, isStaged := (*staged)[subject]; !isStaged {
+		return
+	}
+
+	r.coreMu.Lock()
+	defer r.coreMu.Unlock()
+
+	if r.core == nil {
+		r.core = make(map[string]int)
+	}
+
+	r.core[subject]++
 }
 
 // Pulled takes a pull request on the run's stream into account for the Fill hold's bound. A pull on
@@ -556,13 +592,19 @@ func (r *observedRun) options() natsproxy.Options {
 // stage installs the translation from the sequences this run's corpus lands at to the ones its
 // messages were recorded under. It runs before the first publish, because the proxy may report a
 // delivery before Fill has heard back where it landed.
-func (r *observedRun) stage(staged []corpus.Staged) {
-	recorded := make(map[uint64]uint64, len(staged))
-	for _, message := range staged {
+func (r *observedRun) stage(messages []corpus.Message, first uint64) {
+	recorded := make(map[uint64]uint64, len(messages))
+	for _, message := range corpus.Numbering(messages, first) {
 		recorded[message.Sequence] = message.Recorded
 	}
 
+	subjects := make(map[string]struct{}, len(messages))
+	for _, message := range messages {
+		subjects[message.Subject] = struct{}{}
+	}
+
 	r.recorded.Store(&recorded)
+	r.staged.Store(&subjects)
 }
 
 // awaitQuiet blocks until the bus has handed nothing over and settled nothing for the drain period.
@@ -627,6 +669,25 @@ func (r *observedRun) unscoped() error {
 		"most likely one created after the service had finished starting", errUnscoped, count)
 }
 
+// coreSubscribed fails a run in which a core subscription was handed staged messages, naming each
+// subject and how many.
+func (r *observedRun) coreSubscribed() error {
+	r.coreMu.Lock()
+	defer r.coreMu.Unlock()
+
+	if len(r.core) == 0 {
+		return nil
+	}
+
+	counts := make([]string, 0, len(r.core))
+	for _, subject := range slices.Sorted(maps.Keys(r.core)) {
+		counts = append(counts, fmt.Sprintf("%s (%d)", subject, r.core[subject]))
+	}
+
+	return fmt.Errorf("%w: a core subscription was handed staged messages on %s, "+
+		"and its work cannot be told apart from the consumer's", errUnscoped, strings.Join(counts, ", "))
+}
+
 // strangerNames lists the consumers that took deliveries without being under test, in name order.
 func (r *observedRun) strangerNames() string {
 	var names []string
@@ -654,6 +715,10 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		return replay.Result{}, err
 	}
 
+	if err := r.coreSubscribed(); err != nil {
+		return replay.Result{}, err
+	}
+
 	effects := r.recorder.Effects()
 	unstaged := r.unstagedSequences()
 
@@ -670,6 +735,7 @@ func (r *observedRun) result(clause string) (replay.Result, error) {
 		Late:      r.recorder.LateCount(),
 		Setup:     r.recorder.SetupCount(),
 		FedBack:   len(unstaged),
+		Elsewhere: int(r.elsewhere.Load()),
 	}, nil
 }
 
@@ -816,6 +882,14 @@ func (w *windows) finish() {
 		w.active = false
 		w.recorder.Close()
 	}
+}
+
+// opened reports whether a message's window is open.
+func (w *windows) opened() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	return w.active
 }
 
 // stop disarms a pending close. The caller holds the lock.
