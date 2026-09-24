@@ -136,9 +136,10 @@ type Config struct {
 	Policy policy.Config
 	// Quiesce is how long an attribution window stays open after a handler returns.
 	Quiesce time.Duration
-	// Drain is how long an observed run waits for the bus to stay silent before calling the corpus
-	// drained. Zero derives one from the recorded configuration's redelivery deadlines. It is unused
-	// when Stutter dispatches, because there the driver knows when it has stopped delivering.
+	// Drain lengthens how long an observed run waits in silence for messages still owed. Zero derives
+	// the floor from Policy's redelivery deadlines (DrainFloor); a value below the floor is refused, so
+	// the wait can only be lengthened. It is unused when Stutter dispatches, because there the driver
+	// knows when it has stopped delivering.
 	Drain time.Duration
 	// Startup is how long a service that consumes for itself may take to create a consumer on the
 	// corpus stream before the corpus is published regardless. Zero uses DefaultStartup.
@@ -173,6 +174,10 @@ type Sandbox struct {
 func New(cfg Config) (*Sandbox, error) {
 	if (cfg.Connect == nil) == (cfg.Start == nil) {
 		return nil, errNoService
+	}
+
+	if floor := DrainFloor(cfg.Policy, cfg.Quiesce); cfg.Start != nil && cfg.Drain > 0 && cfg.Drain < floor {
+		return nil, fmt.Errorf("%w: Drain %s is below the floor of %s", ErrDrainBelowFloor, cfg.Drain, floor)
 	}
 
 	var upstream string

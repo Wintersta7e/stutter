@@ -343,7 +343,6 @@ func TestANamedConsumerAbsentAtStartupStopsTheRun(t *testing.T) {
 		HashKey:  make([]byte, hashKeyLen),
 		Policy:   observedConfig(),
 		Quiesce:  toy.DefaultQuiesce,
-		Drain:    fetchWait,
 		Startup:  fetchWait,
 		Start:    func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
 	})

@@ -9,6 +9,7 @@ import (
 
 	"github.com/Wintersta7e/stutter/internal/policy"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
+	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
 // serviceRetries is how many deliveries of a message a run allows beyond the crash loop's: one. A
@@ -37,6 +38,23 @@ const (
 
 // errProxyStopped wraps a proxy's error that ended a wait before its teardown.
 var errProxyStopped = errors.New("a proxy stopped during the run")
+
+// ErrDrainBelowFloor means Config.Drain would have runs stop waiting for owed messages before the
+// longest redelivery their configuration allows could land.
+var ErrDrainBelowFloor = errors.New("the drain is shorter than the consumer's redeliveries need")
+
+// DrainFloor is the shortest owed-silence limit a run on config may be given: twice the longest
+// deadline any delivery the cap allows can wait for, plus the quiesce — zero or less being the default
+// one. A run that stopped waiting sooner would call a message owed whose redelivery was still coming,
+// so a drain below it is refused, by New and by a caller validating a drain for every consumer it will
+// check.
+func DrainFloor(config policy.Config, quiesce time.Duration) time.Duration {
+	if quiesce <= 0 {
+		quiesce = replay.DefaultQuiesce
+	}
+
+	return floor(config, quiesce)
+}
 
 // await is the one wait every start of the service under test goes through — a run's startup and its
 // end alike — so each ends by the same rules.

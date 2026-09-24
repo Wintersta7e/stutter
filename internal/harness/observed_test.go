@@ -1169,8 +1169,7 @@ func TestAServiceThatNeverConnectedIsNotPassed(t *testing.T) {
 		HashKey: make([]byte, hashKeyLen),
 		Policy:  config,
 		Quiesce: toy.DefaultQuiesce,
-		// Nothing will ever arrive, so waiting out the derived horizons proves nothing more.
-		Drain:   fetchWait,
+		// Nothing will ever consume, so waiting out the default startup limit proves nothing more.
 		Startup: fetchWait,
 		Start:   func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
 	})
