@@ -50,6 +50,10 @@ jobs:
         # The set must equal the committed baseline: a new name is a function nothing calls, and a
         # baseline name no longer reported was wired or deleted without the baseline following.
         run: make deadcode
+      - name: Local-only proofs
+        # Proofs tagged localproof run by hand on the engine they need and are recorded in the guard
+        # ledger; CI never compiles them. It lists them, and fails if a production file hides there.
+        run: make localproofs
       - name: Workflows are valid
         run: |
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"

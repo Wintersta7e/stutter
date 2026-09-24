@@ -7,6 +7,7 @@
 //	go test -json -run ... | testgate expect -test T -action pass|fail|skip [-reason P]
 //	go list -test -json ./... | testgate flakeset
 //	deadcode -json ./cmd/stutter | testgate deadcode <baseline file>
+//	git ls-files -z '*.go' | testgate localproofs
 package main
 
 import (
@@ -42,7 +43,7 @@ func main() {
 // run dispatches one subcommand and returns the process's exit code.
 func run(args []string, s streams) int {
 	if len(args) == 0 {
-		fmt.Fprintln(s.stderr, "usage: testgate builddef|count|expect|flakeset|deadcode ...")
+		fmt.Fprintln(s.stderr, "usage: testgate builddef|count|expect|flakeset|deadcode|localproofs ...")
 
 		return exitUsage
 	}
@@ -58,6 +59,8 @@ func run(args []string, s streams) int {
 		return flakeset(s)
 	case "deadcode":
 		return deadcode(args[1:], s)
+	case "localproofs":
+		return localproofs(s)
 	default:
 		fmt.Fprintf(s.stderr, "testgate: unknown subcommand %q\n", args[0])
 

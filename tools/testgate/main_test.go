@@ -178,3 +178,32 @@ func TestDeadcodeComparesWithTheBaselineFile(t *testing.T) {
 		t.Fatalf("no baseline: exit %d, want %d", got.code, exitUsage)
 	}
 }
+
+func TestLocalproofsListsTaggedTests(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	proof := filepath.Join(dir, "p_test.go")
+	hidden := filepath.Join(dir, "h.go")
+
+	bodies := map[string]string{
+		proof:  "//go:build localproof\n\npackage p_test\n",
+		hidden: "//go:build localproof\n\npackage p\n",
+	}
+
+	for path, body := range bodies {
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := runWith([]string{"localproofs"}, proof+"\x00", nil)
+	if got.code != exitPass || !strings.HasPrefix(got.stdout, "local-only proofs files=1\nrule: ") ||
+		!strings.HasSuffix(got.stdout, proof+"\n") {
+		t.Fatalf("exit %d, stdout %q", got.code, got.stdout)
+	}
+
+	if got := runWith([]string{"localproofs"}, proof+"\x00"+hidden+"\x00", nil); got.code != exitFail {
+		t.Fatalf("a hidden production file: exit %d, want %d", got.code, exitFail)
+	}
+}
