@@ -27,6 +27,8 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Wintersta7e/stutter/internal/effect"
@@ -41,6 +43,16 @@ const (
 	// deleteByte is DEL, the one control character that sits above the printable range.
 	deleteByte = 0x7f
 )
+
+// DialHold is how long after its dial an upstream that ends without a byte counts as a dial failure,
+// and how long a readiness check holds a connection open before calling a port dialable. Measured on
+// the engine's port forwarder: it accepts for a port nothing serves and ends that connection with zero
+// bytes 0.2 to 0.7 ms later; a listening server keeps it open.
+const DialHold = 100 * time.Millisecond
+
+// ErrUpstreamClosed means the dependency ended a connection within DialHold of its dial without
+// sending a byte: the forwarder refusing on its behalf.
+var ErrUpstreamClosed = errors.New("the dependency ended the connection before answering it")
 
 var (
 	errMissingName     = errors.New("opaque proxy requires a logical dependency name")
@@ -205,38 +217,58 @@ func (p *Proxy) handle(ctx context.Context, client net.Conn) {
 
 	defer func() { _ = upstream.Close() }()
 
-	current := &session{sink: p.sink, name: p.name}
-
-	// A reset on either leg resets both, once: the far end of each must read what the near end did.
-	var once sync.Once
-
-	resetBoth := func() {
-		once.Do(func() {
-			abort(client)
-			abort(upstream)
-		})
+	current := &link{
+		ctx: ctx, proxy: p, client: client, upstream: upstream, dialled: time.Now(),
+		session: &session{sink: p.sink, name: p.name},
 	}
 
 	var pumps sync.WaitGroup
 
-	pumps.Go(func() { pump(upstream, client, current.answered, resetBoth) })
-	pump(client, upstream, current.requested, resetBoth)
+	pumps.Go(func() { current.ended(pump(upstream, client, current.answered), true) })
+	current.ended(pump(client, upstream, current.session.requested), false)
 
 	// Both directions have ended; the deferred closes finish a connection both peers finished.
 	pumps.Wait()
 
-	// A request the dependency never answered is still a request. Emitting it at close keeps a
-	// fire-and-forget protocol visible.
-	current.flush()
+	// A request the dependency never answered is still a request: emitting it at close keeps a
+	// fire-and-forget protocol visible. One sent to a dependency that ended before its first byte
+	// never reached one, and was discarded with the dial failure.
+	current.session.flush()
 }
 
-// pump forwards src to dst, showing every chunk to observe on the way past, until src ends.
+// link is one proxied connection: its two legs, and what decides how each direction's end is passed on.
 //
-// EOF is a half-close, passed on as one: dst's write side is shut and the other direction keeps
-// flowing, because a client that shuts its write side still waits for the reply. Any other read error,
-// or any write error, is a reset, passed on as one to both legs. Turning either ending into the other
-// would hand the service a behaviour its real dependency never had.
-func pump(src, dst net.Conn, observe func([]byte), resetBoth func()) {
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type link struct {
+	ctx      context.Context //nolint:containedctx // the start's context, read when a direction ends.
+	proxy    *Proxy
+	client   net.Conn
+	upstream net.Conn
+	session  *session
+	// dialled is when the upstream dial returned, on the monotonic clock.
+	dialled time.Time
+	once    sync.Once
+	// heard reports that the upstream sent a byte; clientDone that the client's write side ended.
+	heard      atomic.Bool
+	clientDone atomic.Bool
+}
+
+// answered is what the upstream sent: it closes the request it answers.
+func (l *link) answered(chunk []byte) {
+	l.heard.Store(true)
+	l.session.answered(chunk)
+}
+
+// ending is how one direction of a connection ended.
+type ending struct {
+	err error
+	// write reports an error writing the destination, not reading the source.
+	write bool
+}
+
+// pump forwards src to dst, showing every chunk to observe on the way past, until a read or a write
+// fails.
+func pump(src, dst net.Conn, observe func([]byte)) ending {
 	buffer := make([]byte, copyBuffer)
 
 	for {
@@ -245,24 +277,76 @@ func pump(src, dst net.Conn, observe func([]byte), resetBoth func()) {
 			observe(buffer[:read])
 
 			if _, writeErr := dst.Write(buffer[:read]); writeErr != nil {
-				resetBoth()
-
-				return
+				return ending{err: writeErr, write: true}
 			}
 		}
 
-		if err == nil {
-			continue
+		if err != nil {
+			return ending{err: err}
 		}
+	}
+}
 
-		if errors.Is(err, io.EOF) && closeWrite(dst) == nil {
-			return
-		}
-
-		resetBoth()
+// ended passes on how one direction ended. EOF is a half-close, passed on as one: the other leg's write
+// side is shut and the reverse direction keeps flowing, because a client that shuts its write side
+// still waits for the reply. Any other read error, or any write error, is a reset, passed on as one
+// to both legs. Turning either ending into the other would hand the service a behaviour its real
+// dependency never had. An upstream that ended before its first byte, within the dial hold, is none of
+// these: it is a dial failure.
+func (l *link) ended(end ending, fromUpstream bool) {
+	if l.refused(end, fromUpstream) {
+		l.failDial(end.err)
 
 		return
 	}
+
+	if !end.write && errors.Is(end.err, io.EOF) {
+		dst := l.client
+		if !fromUpstream {
+			// Marked before the upstream can see the half-close: its close in answer is then no refusal.
+			l.clientDone.Store(true)
+
+			dst = l.upstream
+		}
+
+		if closeWrite(dst) == nil {
+			return
+		}
+	}
+
+	l.resetBoth()
+}
+
+// refused reports the upstream leg ending — its read, or a write to it — within DialHold of the dial
+// with no byte from it. A reset or any other error is a refusal; a clean EOF is one unless the client
+// had already finished, when the upstream's close answers the client's. The proxy's own close is not.
+func (l *link) refused(end ending, fromUpstream bool) bool {
+	if l.heard.Load() || time.Since(l.dialled) > DialHold || l.ctx.Err() != nil {
+		return false
+	}
+
+	if fromUpstream == end.write || errors.Is(end.err, net.ErrClosed) {
+		return false
+	}
+
+	return !errors.Is(end.err, io.EOF) || !l.clientDone.Load()
+}
+
+// failDial stops the run on an upstream that ended before its first byte. The request it was sent is
+// discarded, and the failure recorded before the client is reset, so the start sees it first.
+func (l *link) failDial(cause error) {
+	l.session.discard()
+	l.proxy.failDial(fmt.Errorf("%w: upstream %s ended %s after the dial: %w", ErrUpstreamClosed,
+		l.proxy.upstream, time.Since(l.dialled).Round(time.Microsecond), cause))
+	l.resetBoth()
+}
+
+// resetBoth resets both legs, once: the far end of each must read what the near end did.
+func (l *link) resetBoth() {
+	l.once.Do(func() {
+		abort(l.client)
+		abort(l.upstream)
+	})
 }
 
 // closeWrite shuts a connection's write side. Both production connections can — a TCP connection on
@@ -281,11 +365,17 @@ type session struct {
 	name    string
 	pending []byte
 	mu      sync.Mutex
+	// discarded is a connection whose requests never reached a dependency: nothing more is recorded.
+	discarded bool
 }
 
 func (s *session) requested(chunk []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.discarded {
+		return
+	}
 
 	s.pending = append(s.pending, chunk...)
 
@@ -310,6 +400,14 @@ func (s *session) flush() {
 	defer s.mu.Unlock()
 
 	s.emit()
+}
+
+// discard drops the pending request and everything after it.
+func (s *session) discard() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.pending, s.discarded = nil, true
 }
 
 func (s *session) emit() {

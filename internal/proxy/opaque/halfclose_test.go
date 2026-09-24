@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	opaqueproxy "github.com/Wintersta7e/stutter/internal/proxy/opaque"
 )
 
 // tcp is the TCP connection under a test's net.Conn: half-close and reset need it.
@@ -130,11 +132,14 @@ func TestResetIsPropagatedAsReset(t *testing.T) {
 	t.Run("upstream resets", func(t *testing.T) {
 		t.Parallel()
 
+		// Past the dial hold: a dependency that resets inside it without a byte never answered at all,
+		// which is a dial failure instead.
 		upstream := startUpstream(t, func(conn net.Conn) {
 			if _, err := conn.Read(make([]byte, 64)); err != nil {
 				return
 			}
 
+			time.Sleep(2 * opaqueproxy.DialHold)
 			resetConn(tcp(t, conn))
 		})
 		proxy, done := startProxy(t, upstream, &sink{})
