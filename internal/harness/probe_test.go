@@ -269,3 +269,38 @@ func TestADoubledProbeStartAppliesDiscoveryRows(t *testing.T) {
 		t.Fatalf("ProbeStart() error = %v, want %v", err, harness.ErrExitedBeforeConsumer)
 	}
 }
+
+// TestADoubledProbeStartAlsoJudgesNameStability: a probe start that became discovery judges consumer
+// names as discovery does, from its own checkpoint, where the service makes the stream again.
+func TestADoubledProbeStartAlsoJudgesNameStability(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t)
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		if createOrders(ctx, js) != nil || createUnnamed(ctx, js, "ORDERS") != nil {
+			return 2
+		}
+
+		return idle(ctx)
+	}
+
+	probed, err := harness.ProbeStart(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("ProbeStart() error = %v", err)
+	}
+
+	t.Logf("starts: %d", service.starts.Load())
+
+	if probed.Discovery == nil || len(probed.Discovery.Consumers) != 1 {
+		t.Fatalf("probe = %+v, want a discovery of one consumer", probed)
+	}
+
+	if !probed.Discovery.Consumers[0].Unstable {
+		t.Errorf("%s: stable, want unstable", probed.Discovery.Consumers[0].Name)
+	}
+
+	if got := service.starts.Load(); got != 2 {
+		t.Errorf("starts: %d, want 2", got)
+	}
+}

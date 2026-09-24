@@ -246,6 +246,11 @@ func idle(ctx context.Context) int {
 	return 0
 }
 
+// silent is a service that connects and does nothing until it is stopped.
+func silent(ctx context.Context, _ jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+	return idle(ctx)
+}
+
 // createDurable is a fake service creating a durable pull consumer on stream, as its startup does.
 func createDurable(ctx context.Context, js jetstream.JetStream, stream, name string) error {
 	_, err := js.CreateOrUpdateConsumer(ctx, stream, jetstream.ConsumerConfig{
@@ -431,11 +436,7 @@ func TestDiscoveryWithNoConsumerGivesUpAtTheStartupLimit(t *testing.T) {
 	t.Parallel()
 
 	store, checkpoint := newBus(t, withOrders(t))
-	service := &fakeService{script: func(ctx context.Context, _ jetstream.JetStream, _ *nats.Conn,
-		_ harness.Addresses,
-	) int {
-		return idle(ctx)
-	}}
+	service := &fakeService{script: silent}
 
 	const limit = 600 * time.Millisecond
 
@@ -914,5 +915,142 @@ func TestAFailedServiceRemovalIsASetupError(t *testing.T) {
 	if _, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service)); !errors.Is(
 		err, errRemovalFailed) {
 		t.Fatalf("Discover() error = %v, want it to wrap %v", err, errRemovalFailed)
+	}
+}
+
+// createUnnamed is a service creating a consumer on stream with neither a name nor a durable name, so
+// every start gives it a new one.
+func createUnnamed(ctx context.Context, js jetstream.JetStream, stream string) error {
+	_, err := js.CreateConsumer(ctx, stream, jetstream.ConsumerConfig{AckPolicy: jetstream.AckExplicitPolicy})
+
+	return err
+}
+
+// unnamedBeside creates one unnamed consumer on ORDERS and each named durable, then idles.
+func unnamedBeside(durables ...string) script {
+	return func(ctx context.Context, js jetstream.JetStream, conn *nats.Conn, at harness.Addresses) int {
+		if createUnnamed(ctx, js, "ORDERS") != nil {
+			return 2
+		}
+
+		return idleAfter(durables...)(ctx, js, conn, at)
+	}
+}
+
+// TestAServerNamedConsumerIsMarkedUnstable: a consumer whose name a start makes up cannot be found by
+// name on the next start, so no run can be scoped to it by name; it is marked, sole or not.
+func TestAServerNamedConsumerIsMarkedUnstable(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string][]string{"sole": nil, "beside-a-durable": {reserve}}
+
+	for name, durables := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store, checkpoint := newBus(t, withOrders(t))
+			service := &fakeService{script: unnamedBeside(durables...)}
+
+			found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+			if err != nil {
+				t.Fatalf("Discover() error = %v", err)
+			}
+
+			t.Logf("starts: %d", service.starts.Load())
+
+			if len(found.Consumers) != 1+len(durables) {
+				t.Fatalf("consumers = %q, want one unnamed beside %q", names(found.Consumers), durables)
+			}
+
+			for _, consumer := range found.Consumers {
+				if want := !slices.Contains(durables, consumer.Name); consumer.Unstable != want {
+					t.Errorf("%s: unstable %t, want %t", consumer.Name, consumer.Unstable, want)
+				}
+			}
+
+			if got := service.starts.Load(); got != 2 {
+				t.Errorf("starts: %d, want 2", got)
+			}
+		})
+	}
+}
+
+// TestANameOnlyConsumerIsStable: a consumer the service names without making it durable reads back
+// with no durable name yet keeps its name from one start to the next; the second look proves it.
+func TestANameOnlyConsumerIsStable(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, conn *nats.Conn, at harness.Addresses) int {
+		if _, err := js.CreateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+			Name:      "named",
+			AckPolicy: jetstream.AckExplicitPolicy,
+		}); err != nil {
+			return 2
+		}
+
+		return idleAfter(reserve)(ctx, js, conn, at)
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	t.Logf("starts: %d", service.starts.Load())
+
+	for _, consumer := range found.Consumers {
+		if consumer.Unstable {
+			t.Errorf("%s: unstable, want stable", consumer.Name)
+		}
+	}
+
+	if got := names(found.Consumers); !slices.Equal(got, []string{"named", reserve}) {
+		t.Errorf("consumers = %q, want [named reserve]", got)
+	}
+
+	if got := service.starts.Load(); got != 2 {
+		t.Errorf("starts: %d, want 2 (named has no durable name, so it needed the second look)", got)
+	}
+}
+
+// TestAStartIsAddedOnlyForADurableLessName: a service whose every consumer is durable under its own
+// name costs no second start, and neither does one with no consumer on the corpus stream.
+func TestAStartIsAddedOnlyForADurableLessName(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]script{
+		"all-durable":    idleAfter("alpha", "beta"),
+		"no-consumer":    silent,
+		"elsewhere-only": auditOnly,
+	}
+
+	for name, current := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			store, checkpoint := newBus(t, withOrders(t))
+			service := &fakeService{script: current}
+			cfg := startConfig(store, checkpoint, service)
+			cfg.Startup = 600 * time.Millisecond
+
+			found, err := harness.Discover(startContext(t), cfg)
+			if err != nil && !errors.Is(err, harness.ErrConsumesElsewhere) {
+				t.Fatalf("Discover() error = %v", err)
+			}
+
+			t.Logf("starts: %d", service.starts.Load())
+
+			if got := service.starts.Load(); got != 1 {
+				t.Errorf("starts: %d, want 1", got)
+			}
+
+			for _, consumer := range found.Consumers {
+				if consumer.Unstable {
+					t.Errorf("%s: unstable, want stable", consumer.Name)
+				}
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -204,31 +205,90 @@ func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
 // Every read happens before the service is removed: a consumer with no durable name is deleted once
 // its client has gone idle, and a read after the removal could find it gone.
 func (s *Sandbox) settleDiscovery(ctx context.Context, start *bare) (Discovery, error) {
+	listing, ended, err := s.awaitDiscovery(ctx, start)
+
+	var (
+		found       Discovery
+		durableLess []string
+	)
+
+	if err == nil {
+		found, durableLess, err = s.readDiscovered(ctx, listing)
+	}
+
+	found, err = start.conclude(ctx, found, ended, err)
+	if err != nil || len(durableLess) == 0 {
+		return found, err
+	}
+
+	return s.judgeNames(ctx, start.stage, found, durableLess)
+}
+
+// awaitDiscovery waits a start out under discovery's rule and returns the consumers at its end.
+func (s *Sandbox) awaitDiscovery(ctx context.Context, start *bare) (corpus.Listing, interruption, error) {
 	var listing corpus.Listing
 
 	ended, err := start.observed.await(ctx, start.service.Exited(), s.discoverySettled(start, &listing))
 
 	// The listing the wait last read can predate the exit.
 	if err == nil && ended == targetExited {
-		listing, err = s.cfg.Corpus.Consumers(ctx)
+		if listing, err = s.cfg.Corpus.Consumers(ctx); err != nil {
+			err = fmt.Errorf("list the consumers: %w", err)
+		}
 	}
 
-	var found Discovery
-	if err == nil {
-		found, err = s.readDiscovered(ctx, listing)
-	}
+	return listing, ended, err
+}
 
-	exit, discardErr := start.discard(ctx)
+// conclude discards the start and completes what it found with how the start ended, what the bus
+// refused it, and its exit row. err is what went wrong before the discard, if anything.
+func (b *bare) conclude(ctx context.Context, found Discovery, ended interruption, err error) (Discovery, error) {
+	exit, discardErr := b.discard(ctx)
 	if err = errors.Join(err, discardErr); err != nil {
-		return Discovery{}, fmt.Errorf("%s: %w", start.stage, err)
+		return Discovery{}, fmt.Errorf("%s: %w", b.stage, err)
 	}
 
 	exit.Exited = exit.Exited || ended == targetExited
-	found.Exit, found.Setup = exit, start.recorder.SetupCount()
-	found.Refusals, found.ClosedAfterInfo = start.recorder.Refusals(), start.recorder.ClosedAfterInfoCount()
+	found.Exit, found.Setup = exit, b.recorder.SetupCount()
+	found.Refusals, found.ClosedAfterInfo = b.recorder.Refusals(), b.recorder.ClosedAfterInfoCount()
 
 	if err := found.verdict(ended); err != nil {
-		return found, fmt.Errorf("%s: %w", start.stage, err)
+		return found, fmt.Errorf("%s: %w", b.stage, err)
+	}
+
+	return found, nil
+}
+
+// judgeNames tells a consumer name that survives a start from one each start makes up. A name durable
+// under itself survives by construction; each of the others is looked for again after one more start
+// from the same checkpoint, run and ended exactly as the first. Only its listing is read: the first
+// start's reads stand.
+func (s *Sandbox) judgeNames(
+	ctx context.Context,
+	stage string,
+	found Discovery,
+	durableLess []string,
+) (Discovery, error) {
+	again, err := s.bareStart(ctx, stage+" (second start)")
+	if err != nil {
+		return Discovery{}, err
+	}
+
+	listing, ended, err := s.awaitDiscovery(ctx, again)
+
+	listed := make([]Found, 0, len(listing.Corpus))
+	for _, name := range listing.Corpus {
+		listed = append(listed, Found{Name: name})
+	}
+
+	second, err := again.conclude(ctx, Discovery{Consumers: listed, Elsewhere: listing.Elsewhere}, ended, err)
+	if err != nil {
+		return second, err
+	}
+
+	unstable := corpus.Unstable(durableLess, listing.Corpus)
+	for index := range found.Consumers {
+		found.Consumers[index].Unstable = slices.Contains(unstable, found.Consumers[index].Name)
 	}
 
 	return found, nil
@@ -270,21 +330,33 @@ func (d Discovery) diagnosis() string {
 }
 
 // readDiscovered reads every consumer on the corpus stream as the server holds it, on Stutter's own
-// connection. Nothing is serialised: the read-back is the one legality input, and a rewrite read back
-// would license faults against a contract the service never had.
-func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (Discovery, error) {
+// connection, and names those with no durable name of their own. Nothing is serialised: the read-back
+// is the one legality input, and a rewrite read back would license faults against a contract the
+// service never had.
+func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (Discovery, []string, error) {
 	consumers := make([]Found, 0, len(listing.Corpus))
+
+	var durableLess []string
 
 	for _, name := range listing.Corpus {
 		found, err := s.readConsumer(ctx, name)
 		if err != nil {
-			return Discovery{}, err
+			return Discovery{}, nil, err
+		}
+
+		durable, err := s.cfg.Corpus.Durable(ctx, name)
+		if err != nil {
+			return Discovery{}, nil, fmt.Errorf("read consumer %q: %w", name, err)
+		}
+
+		if !durable {
+			durableLess = append(durableLess, name)
 		}
 
 		consumers = append(consumers, found)
 	}
 
-	return Discovery{Consumers: consumers, Elsewhere: listing.Elsewhere}, nil
+	return Discovery{Consumers: consumers, Elsewhere: listing.Elsewhere}, durableLess, nil
 }
 
 // readConsumer reads one consumer: what kind it is, and its configuration. A kind that cannot be a
