@@ -26,6 +26,27 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.unsupportedTransport
 github.com/Wintersta7e/stutter/internal/proxy/pg.Handshake
 github.com/Wintersta7e/stutter/internal/proxy/pg.checkAddress
 github.com/Wintersta7e/stutter/internal/proxy/pg.handshakeOnce
+# The probe start and discovery: called by the compose path before the first consumer check.
+github.com/Wintersta7e/stutter/internal/harness.Discover
+github.com/Wintersta7e/stutter/internal/harness.Discovery.diagnosis
+github.com/Wintersta7e/stutter/internal/harness.Discovery.verdict
+github.com/Wintersta7e/stutter/internal/harness.ProbeStart
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.awaitDiscovery
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.bareStart
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.discover
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.discoverySettled
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.judgeNames
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.probe
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.probeEnded
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.readConsumer
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.readDiscovered
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.settleDiscovery
+github.com/Wintersta7e/stutter/internal/harness.Sandbox.streamExists
+github.com/Wintersta7e/stutter/internal/harness.bare.conclude
+github.com/Wintersta7e/stutter/internal/harness.bare.discard
+github.com/Wintersta7e/stutter/internal/harness.bare.quiet
+github.com/Wintersta7e/stutter/internal/harness.bare.quietSinceRequest
+github.com/Wintersta7e/stutter/internal/harness.startOnly
 # The invocation listener set and its endpoint keys: opened by the compose path once per check.
 github.com/Wintersta7e/stutter/internal/harness.EndpointKey
 github.com/Wintersta7e/stutter/internal/harness.ListenerSet.acceptance
