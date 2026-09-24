@@ -118,15 +118,21 @@ type dependency struct {
 	seed *Container
 	// templates back plan.templates, one each, in order.
 	templates []*Volume
+	// awaitSet are the ports the seed answered on before its snapshot: every restore waits for them.
+	awaitSet []uint16
 	// seedStarted is when the seed started, on the monotonic clock.
 	seedStarted time.Time
-	image       compose.Image
-	dep         compose.Dependency
-	record      SeedRecord
+	// snapshot is the committed seed every restore is created from.
+	snapshot compose.Image
+	image    compose.Image
+	dep      compose.Dependency
+	record   SeedRecord
 	// plan is where the seed's writable paths land.
 	plan storagePlan
 	// spec is the service's container spec, with only the mounts compose declared.
 	spec compose.Spec
+	// identity is a Postgres snapshot's system identifier, which its first restore must carry.
+	identity uint64
 	// healthy reports a service_healthy condition naming the service.
 	healthy bool
 }
