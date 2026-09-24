@@ -98,7 +98,7 @@ func (c *Corpus) Clear(ctx context.Context) error {
 		return fmt.Errorf("delete the corpus stream: %w", err)
 	}
 
-	if _, err := c.stream.CreateStream(ctx, streamConfig(c.topic)); err != nil {
+	if _, err := c.stream.CreateStream(ctx, streamConfig(c.topic.Stream, c.topic.Subjects)); err != nil {
 		return fmt.Errorf("recreate the corpus stream: %w", err)
 	}
 
@@ -230,12 +230,12 @@ func lookup(ctx context.Context, stream jetstream.Stream, consumer string) (*jet
 	return push.CachedInfo(), nil
 }
 
-// streamConfig is the corpus stream's shape, in one place so a staged stream is identical to the one
-// Start created.
-func streamConfig(topic Topic) jetstream.StreamConfig {
+// streamConfig is the shape of a stream Stutter owns, in one place so a staged stream is identical to
+// the one Start created.
+func streamConfig(name string, subjects []string) jetstream.StreamConfig {
 	return jetstream.StreamConfig{
-		Name:      topic.Stream,
-		Subjects:  []string{topic.Filter},
+		Name:      name,
+		Subjects:  subjects,
 		Storage:   jetstream.FileStorage,
 		Retention: jetstream.LimitsPolicy,
 	}
