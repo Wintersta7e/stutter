@@ -271,6 +271,92 @@ func TestACrowdedServiceIsJudgedOneConsumerAtATime(t *testing.T) {
 	}
 }
 
+// TestALateConsumerIsNeverDeliveredToUnserialised: with no consumer named, a service that created none
+// by the startup limit has the corpus published anyway, so the observation gate can say where to
+// look. A consumer it creates after that was never held to one message in flight, and attributing its
+// deliveries would put a batch's effects on whichever message the proxy saw last. The run stops.
+func TestALateConsumerIsNeverDeliveredToUnserialised(t *testing.T) {
+	t.Parallel()
+
+	const startup = 300 * time.Millisecond
+
+	built, _ := quirkySandbox(t, observedConfig(), quirks{lateBy: 2 * startup}, func(settings *harness.Config) {
+		settings.Startup = startup
+		// Long enough that the late consumer's deliveries land inside the run.
+		settings.Drain = 2 * time.Second
+	}, "ORD-LATE-1", "ORD-LATE-2")
+
+	_, err := built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if err == nil {
+		t.Fatal("Run() error = nil — a consumer created after the corpus was published was delivered to " +
+			"and its effects attributed, with nothing holding it to one message in flight")
+	}
+
+	t.Logf("the run stopped: %v", err)
+
+	for _, want := range []string{observedConsumer, startup.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Run() error = %q, want it to name %q", err, want)
+		}
+	}
+}
+
+// TestANamedConsumerAbsentAtStartupStopsTheRun: a named consumer that never appeared cannot be held to
+// one message in flight, so the corpus is never published for it to find later.
+func TestANamedConsumerAbsentAtStartupStopsTheRun(t *testing.T) {
+	t.Parallel()
+
+	store, err := corpus.Start(t.Context(), t.TempDir())
+	if err != nil {
+		t.Fatalf("corpus.Start() error = %v", err)
+	}
+
+	t.Cleanup(store.Close)
+
+	order := orderPayload("ORD-NAMED-1", "WIDGET-WIRE")
+	if _, publishErr := store.Publish(t.Context(), toy.SubjectOrderCreated, order); publishErr != nil {
+		t.Fatalf("Publish() error = %v", publishErr)
+	}
+
+	built, err := harness.New(harness.Config{
+		Corpus:   store,
+		Consumer: observedConsumer,
+		HashKey:  make([]byte, hashKeyLen),
+		Policy:   observedConfig(),
+		Quiesce:  toy.DefaultQuiesce,
+		Drain:    fetchWait,
+		Startup:  fetchWait,
+		Start:    func(context.Context, harness.Addresses) (harness.Consumer, error) { return absent{}, nil },
+	})
+	if err != nil {
+		t.Fatalf("harness.New() error = %v", err)
+	}
+
+	_, err = built.Run(t.Context(), "clean-1", replay.Clean{}, nil)
+	if err == nil {
+		t.Fatal("Run() error = nil, want the run stopped at the startup limit")
+	}
+
+	t.Logf("the run stopped: %v", err)
+
+	for _, want := range []string{observedConsumer, fetchWait.String()} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Run() error = %q, want it to name %q", err, want)
+		}
+	}
+
+	published, err := store.Snapshot(t.Context())
+	if err != nil {
+		t.Fatalf("Snapshot() error = %v", err)
+	}
+
+	t.Logf("the stream holds %d messages after the run stopped", len(published))
+
+	if len(published) != 0 {
+		t.Errorf("the corpus was published (%d messages) for a consumer that never appeared", len(published))
+	}
+}
+
 // TestACrowdedServiceNeedsItsConsumerNamed: guessing which of several consumers is under test would
 // put a verdict on the wrong handler, so the run is refused and the refusal names the candidates.
 func TestACrowdedServiceNeedsItsConsumerNamed(t *testing.T) {

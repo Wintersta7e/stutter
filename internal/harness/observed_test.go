@@ -58,6 +58,48 @@ type quirks struct {
 	// nakFor refuses each message's first delivery with a NAK asking for redelivery after this long.
 	// Zero never does.
 	nakFor time.Duration
+	// lateBy holds the whole service back this long after it is started, so its consumer appears
+	// after the startup limit. Zero starts it at once.
+	lateBy time.Duration
+}
+
+// latecomer is a service that comes up only after a delay: it connects and creates its consumer once
+// the startup limit has passed and the corpus has already been published.
+type latecomer struct {
+	service *pulling
+	done    chan struct{}
+	settled chan struct{}
+}
+
+// startLate starts a pulling service after a delay, in the background, as a slow container does.
+func startLate(ctx context.Context, at harness.Addresses, config policy.Config, after time.Duration) *latecomer {
+	late := &latecomer{done: make(chan struct{}), settled: make(chan struct{})}
+
+	go func() {
+		defer close(late.settled)
+
+		select {
+		case <-late.done:
+			return
+		case <-time.After(after):
+		}
+
+		//nolint:errcheck // a service that fails to come up is one the run never sees, which is the
+		// case the test's own assertion reports.
+		late.service, _ = startPulling(ctx, at, config, quirks{})
+	}()
+
+	return late
+}
+
+// Close stops the service if it ever came up, after waiting for it to finish coming up.
+func (l *latecomer) Close(ctx context.Context) {
+	close(l.done)
+	<-l.settled
+
+	if l.service != nil {
+		l.service.Close(ctx)
+	}
 }
 
 // startPulling connects the service to the proxied bus and lets it start consuming.
@@ -252,6 +294,10 @@ func quirkySandbox(
 		Policy:  config,
 		Quiesce: toy.DefaultQuiesce,
 		Start: func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
+			if behaviour.lateBy > 0 {
+				return startLate(ctx, at, config, behaviour.lateBy), nil
+			}
+
 			service, startErr := startPulling(ctx, at, config, behaviour)
 			if startErr != nil {
 				return nil, startErr

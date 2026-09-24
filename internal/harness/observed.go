@@ -26,6 +26,10 @@ var (
 	// errUnscoped means a consumer that was not under test took deliveries anyway, so its effects are
 	// mixed into the run's with no way to separate them.
 	errUnscoped = errors.New("a consumer other than the one under test took deliveries during the run")
+	// errLateConsumer means the service had created no consumer when the corpus was published, and one
+	// it created afterwards took deliveries. Nothing held it to one message in flight, so its effects
+	// cannot be attributed to messages.
+	errLateConsumer = errors.New("a consumer created after the corpus was published took deliveries")
 )
 
 const (
@@ -180,14 +184,16 @@ func (s *Sandbox) begin(
 	}
 
 	// One message in flight, whatever batch the service asks for: across two connections, the order the
-	// proxy sees an acknowledgement and the next message's write is not the order they happened in.
-	if slices.Contains(consumers, target) {
+	// proxy sees an acknowledgement and the next message's write is not the order they happened in. A
+	// named target exists by now; an empty one means the service created no consumer at all, and scope
+	// then refuses whatever consumer it creates later.
+	if target != "" {
 		if err := s.cfg.Corpus.Serialise(ctx, target); err != nil {
 			return fmt.Errorf("serialise the consumer under test: %w", err)
 		}
 	}
 
-	run.scope(target)
+	run.scope(target, s.startupLimit())
 
 	if err := s.cfg.Corpus.Fill(ctx, messages); err != nil {
 		return fmt.Errorf("stage the corpus: %w", err)
@@ -196,16 +202,17 @@ func (s *Sandbox) begin(
 	return nil
 }
 
-// awaitStartup waits for the service to create a consumer on the corpus stream and then fall quiet,
-// and returns the consumers it created.
+// awaitStartup waits for the service to create a consumer on the corpus stream — the named one, when
+// Config.Consumer names it — and then fall quiet, and returns the consumers it created.
 //
 // Quiet means no effect for the settle period. Nothing is attributed to a message yet, so whatever
 // the service does meanwhile is counted as setup, and a pull request is bookkeeping rather than an
 // effect, so a service polling an empty stream is already quiet.
 //
-// A service that never creates a consumer is given up on at the startup limit and the corpus is
-// published regardless: the run then observes nothing, and the observation gate says so and says
-// where to look. Returning an error instead would bury that diagnosis under a timeout.
+// With no consumer named, a service that never creates one is given up on at the startup limit and
+// the corpus is published regardless: the run then observes nothing, and the observation gate says so
+// and says where to look. Returning an error instead would bury that diagnosis under a timeout. A named
+// consumer still absent at the limit stops the run in target, before anything is published.
 func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) ([]string, error) {
 	ticker := time.NewTicker(drainPoll)
 	defer ticker.Stop()
@@ -223,7 +230,12 @@ func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) (
 			quietSince, setup = time.Now(), count
 		}
 
-		settled := len(consumers) > 0 && time.Since(quietSince) >= s.settle()
+		created := len(consumers) > 0
+		if s.cfg.Consumer != "" {
+			created = slices.Contains(consumers, s.cfg.Consumer)
+		}
+
+		settled := created && time.Since(quietSince) >= s.settle()
 		if settled || time.Since(started) >= s.startupLimit() {
 			return consumers, nil
 		}
@@ -243,9 +255,16 @@ func (s *Sandbox) awaitStartup(ctx context.Context, recorder *effect.Recorder) (
 func (s *Sandbox) target(consumers []string) (string, error) {
 	switch {
 	case s.cfg.Consumer != "":
-		if len(consumers) > 0 && !slices.Contains(consumers, s.cfg.Consumer) {
-			return "", fmt.Errorf("%w: %q is not among them (%s)",
-				errNoSuchConsumer, s.cfg.Consumer, strings.Join(consumers, ", "))
+		// Absent at the startup limit, it cannot be held to one message in flight, so nothing is
+		// published for it to find later.
+		if !slices.Contains(consumers, s.cfg.Consumer) {
+			found := "none"
+			if len(consumers) > 0 {
+				found = strings.Join(consumers, ", ")
+			}
+
+			return "", fmt.Errorf("%w: %q did not appear within the startup limit of %s (found: %s)",
+				errNoSuchConsumer, s.cfg.Consumer, s.startupLimit(), found)
 		}
 
 		return s.cfg.Consumer, nil
@@ -346,12 +365,17 @@ type observedRun struct {
 	// period ends the run before a withheld acknowledgement's redelivery arrives — a clean sequence
 	// reported for a fault that never got to land.
 	began time.Time
-	// target is the consumer under test. Nil until the service has started, and for good if it never
-	// created one; while nil, every consumer on the stream counts.
+	// target is the consumer under test. Nil until the service has started, and while nil every
+	// consumer on the stream counts; empty once it has, if it had created none.
 	target atomic.Pointer[string]
+	// strangers names the consumers that took deliveries without being under test.
+	strangers sync.Map
 	// stream is the corpus stream. A delivery or acknowledgement on any other stream is the service's
 	// own bus work and is none of this run's business.
 	stream string
+	// startup is the limit the service had to create its consumer by, which a consumer that turns up
+	// later is told it missed.
+	startup time.Duration
 	// activity is when the bus was last active, as an offset from began.
 	activity  atomic.Int64
 	delivered atomic.Int64
@@ -400,6 +424,7 @@ func (r *observedRun) Delivered(delivery natsproxy.Delivery) {
 	// Opening a window for it would hand the consumer under test's window to a message it never saw.
 	if !r.targets(delivery.Ack.Consumer) {
 		r.foreign.Add(1)
+		r.strangers.Store(delivery.Ack.Consumer, struct{}{})
 
 		return
 	}
@@ -473,11 +498,13 @@ func (r *observedRun) finish() {
 // scope names the consumer under test, just before the corpus is published. It restarts the drain
 // clock too: the run begins at publication, and a service that took longer to start than the drain
 // period would otherwise be called finished before its first delivery.
-func (r *observedRun) scope(consumer string) {
-	if consumer != "" {
-		r.target.Store(&consumer)
-	}
-
+//
+// An empty name means the service had created no consumer by the startup limit. Every consumer is then
+// a stranger: one created later was never held to one message in flight, so none of its deliveries is
+// attributed or faulted, and any of them stops the run.
+func (r *observedRun) scope(consumer string, startup time.Duration) {
+	r.target.Store(&consumer)
+	r.startup = startup
 	r.touch()
 }
 
@@ -491,12 +518,35 @@ func (r *observedRun) targets(consumer string) bool {
 // unscoped fails a run in which a consumer that was not under test took deliveries. Its effects sit in
 // the run's sequence with no way to separate them, so a verdict would be on two handlers at once.
 func (r *observedRun) unscoped() error {
-	if count := r.foreign.Load(); count > 0 {
-		return fmt.Errorf("%w: %d deliveries to a consumer that was not paused, "+
-			"most likely one created after the service had finished starting", errUnscoped, count)
+	count := r.foreign.Load()
+	if count == 0 {
+		return nil
 	}
 
-	return nil
+	if target := r.target.Load(); target != nil && *target == "" {
+		return fmt.Errorf("%w: %d deliveries to %s, which did not exist at the startup limit of %s",
+			errLateConsumer, count, r.strangerNames(), r.startup)
+	}
+
+	return fmt.Errorf("%w: %d deliveries to a consumer that was not paused, "+
+		"most likely one created after the service had finished starting", errUnscoped, count)
+}
+
+// strangerNames lists the consumers that took deliveries without being under test, in name order.
+func (r *observedRun) strangerNames() string {
+	var names []string
+
+	r.strangers.Range(func(name, _ any) bool {
+		if text, isText := name.(string); isText {
+			names = append(names, text)
+		}
+
+		return true
+	})
+
+	slices.Sort(names)
+
+	return strings.Join(names, ", ")
 }
 
 // result is what the run observed, in the shape a driven run reports, or why it cannot be used.

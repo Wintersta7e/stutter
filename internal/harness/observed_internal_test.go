@@ -32,7 +32,7 @@ func TestAnotherConsumersTrafficIsNotTheRunsBusiness(t *testing.T) {
 		[]corpus.Staged{{Recorded: 1, Sequence: 1}},
 		time.Millisecond,
 	)
-	run.scope("under_test")
+	run.scope("under_test", time.Second)
 
 	bystander := natsproxy.Ack{Stream: stream, Consumer: "bystander", StreamSeq: 1, Deliveries: 1}
 
