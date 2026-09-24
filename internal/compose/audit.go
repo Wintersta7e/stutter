@@ -1,6 +1,7 @@
 package compose
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"path"
@@ -8,7 +9,8 @@ import (
 	"strings"
 )
 
-// Audit compares a created container, as the engine reports it, with the spec it was created from.
+// Audit compares a created container, as the engine reports it, with the spec it was created from. A
+// user or working directory compose leaves unset is the image's, as the engine gives it.
 // It returns the properties checked and the properties that differ; any difference is an error
 // wrapping ErrAudit naming each property and key — never a value. The expectations come from the
 // compose environment, the image and Stutter's constants, not from the values Spec computed, so a
@@ -21,8 +23,8 @@ func Audit(s Spec, img Image, got Inspected) (checked, differ int, err error) {
 	a.row("image", "", got.Image == img.ID)
 	a.environment(s, img, got.Env)
 	a.argv(s, img, got)
-	a.row("user", "", got.User == s.User)
-	a.row("working_dir", "", got.WorkingDir == s.WorkingDir)
+	a.row("user", "", got.User == cmp.Or(s.User, img.User))
+	a.row("working_dir", "", got.WorkingDir == cmp.Or(s.WorkingDir, img.WorkingDir))
 	a.row("hostname", "", got.Hostname == s.Hostname)
 	a.row("domainname", "", got.Domainname == s.Domainname)
 	a.mounts(s, got.Mounts)

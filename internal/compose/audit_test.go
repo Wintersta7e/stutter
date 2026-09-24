@@ -1,6 +1,7 @@
 package compose_test
 
 import (
+	"cmp"
 	"crypto/rand"
 	"errors"
 	"maps"
@@ -53,8 +54,8 @@ func faithful(s compose.Spec, img compose.Image) compose.Inspected {
 	got := compose.Inspected{
 		Labels:         maps.Clone(img.Labels),
 		Image:          img.ID,
-		User:           s.User,
-		WorkingDir:     s.WorkingDir,
+		User:           cmp.Or(s.User, img.User),
+		WorkingDir:     cmp.Or(s.WorkingDir, img.WorkingDir),
 		Hostname:       s.Hostname,
 		Domainname:     s.Domainname,
 		RestartPolicy:  "no",
@@ -347,5 +348,34 @@ func TestAuditComparesTheWholeArgv(t *testing.T) {
 
 	if _, _, err := compose.Audit(bare, img, leaked); !errors.Is(err, compose.ErrAudit) {
 		t.Errorf("the image CMD leaking past a compose entrypoint = %v, want ErrAudit", err)
+	}
+}
+
+// TestAuditReadsTheImageDefaultsComposeLeftUnset expects the image's user and working directory on a
+// container whose compose service sets neither — what the engine applies — and compose's own when set.
+func TestAuditReadsTheImageDefaultsComposeLeftUnset(t *testing.T) {
+	t.Parallel()
+
+	img := compose.Image{ID: "sha256:defaults", User: "1234:1234", WorkingDir: "/srv", Cmd: []string{"/app"}}
+
+	job, err := modelFrom(t, `{"name": "shop", "services": {"api": {}}}`).Spec(target, img, nil)
+	if err != nil {
+		t.Fatalf("Spec: %v", err)
+	}
+
+	got := faithful(job, img)
+	if got.User != img.User || got.WorkingDir != img.WorkingDir {
+		t.Fatalf("the fixture made user %q and working_dir %q, want the image's", got.User, got.WorkingDir)
+	}
+
+	if _, differ, err := compose.Audit(job, img, got); err != nil || differ != 0 {
+		t.Errorf("Audit of a container that inherited the image's defaults = %d differ, %v", differ, err)
+	}
+
+	got.WorkingDir, got.User = "/", ""
+
+	if _, _, err := compose.Audit(job, img, got); !errors.Is(err, compose.ErrAudit) ||
+		!strings.Contains(err.Error(), "user") || !strings.Contains(err.Error(), "working_dir") {
+		t.Errorf("Audit of a container that lost the image's defaults = %v, want user and working_dir named", err)
 	}
 }
