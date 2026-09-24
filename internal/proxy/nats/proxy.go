@@ -91,6 +91,8 @@ type Options struct {
 	Pulls Pulls
 	// Hold keeps what the bus sends waiting while it is on. Nil never holds.
 	Hold *Hold
+	// Requests is told of each JetStream API request the service sends. Nil is never called.
+	Requests Requests
 }
 
 // Proxy accepts NATS client connections and forwards them to an upstream server.
@@ -546,6 +548,9 @@ func (s *session) inspect(current *frame) {
 			s.opts.Pulls.Pulled(pull)
 		}
 	}
+
+	// Reported before the bookkeeping return: a pull request is the service asking JetStream too.
+	s.noteRequest(current.args.subject)
 
 	// An acknowledgement or a pull request is delivery bookkeeping, not the service's own work.
 	// Recording one would put Stutter's own fault injection into the sequence it is comparing.
