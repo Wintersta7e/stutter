@@ -112,20 +112,48 @@ func (r *running) exit() int {
 	return r.code
 }
 
+// ports hands each test in this package its own ports, from [63000, 65000): above the kernel's
+// source-port range (32768–60999), and above the range the package's internal tests use — both run in
+// one test binary.
+var ports struct {
+	next uint16
+	mu   sync.Mutex
+}
+
+// localhost is where every test relay listens.
+var localhost = netip.MustParseAddr("127.0.0.1")
+
+// freePort is a port no other test is handed and nothing on the host listens on right now. Never one
+// the kernel picked for a listener that was then closed: under load another test's socket takes it
+// before the relay binds it.
 func freePort(t *testing.T) uint16 {
 	t.Helper()
 
-	var config net.ListenConfig
+	ports.mu.Lock()
+	defer ports.mu.Unlock()
 
-	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	if ports.next == 0 {
+		ports.next = 63000
 	}
 
-	port := netip.MustParseAddrPort(listener.Addr().String()).Port()
-	_ = listener.Close()
+	var config net.ListenConfig
 
-	return port
+	for ; ports.next < 65000; ports.next++ {
+		listener, err := config.Listen(t.Context(), "tcp4", netip.AddrPortFrom(localhost, ports.next).String())
+		if err != nil {
+			continue
+		}
+
+		_ = listener.Close()
+		port := ports.next
+		ports.next++
+
+		return port
+	}
+
+	t.Fatal("no free port in [63000, 65000)")
+
+	return 0
 }
 
 // hostSide is the host listener a relay dials: every connection's preamble is read with relay.Accept,

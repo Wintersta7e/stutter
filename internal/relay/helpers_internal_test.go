@@ -144,20 +144,13 @@ func testToken(t *testing.T) Token {
 	return token
 }
 
+// unusedPort is a port no other test is handed and nothing on the host listens on. Never one the
+// kernel picked for a listener that was then closed: under load another test's socket takes it
+// before the relay binds it.
 func unusedPort(t *testing.T) uint16 {
 	t.Helper()
 
-	var config net.ListenConfig
-
-	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-
-	port := netip.MustParseAddrPort(listener.Addr().String()).Port()
-	_ = listener.Close()
-
-	return port
+	return freeSpan(t, 1)
 }
 
 // hostListener accepts relayed connections, reads each preamble and reports it.

@@ -13,17 +13,25 @@ import (
 	"time"
 )
 
-// spans hands each catch-all test its own run of ports.
+// spans hands each internal test its own ports.
 var spans struct {
 	next uint16
 	mu   sync.Mutex
 }
 
+// The internal tests' ports. The package's external tests take theirs from a range above this one:
+// both run in one test binary, and two allocators must never hand out the same port.
+const (
+	spanFirst = 61000
+	spanLimit = 63000
+)
+
 // freeSpan returns the first port of count consecutive ports that are free on 127.0.0.1 right now.
 //
 // The search runs above the kernel's default source-port range (32768–60999), so no test's outbound
-// connection takes a port from under it, and skips any port something on the host already listens on:
-// a fixed span collided with an unrelated local listener once. Spans are never handed out twice.
+// connection or kernel-picked listener takes a port from under it, and skips any port something on the
+// host already listens on: a fixed span collided with an unrelated local listener once. Spans are
+// never handed out twice.
 func freeSpan(t *testing.T, count uint16) uint16 {
 	t.Helper()
 
@@ -31,10 +39,10 @@ func freeSpan(t *testing.T, count uint16) uint16 {
 	defer spans.mu.Unlock()
 
 	if spans.next == 0 {
-		spans.next = 61000
+		spans.next = spanFirst
 	}
 
-	for base := spans.next; base < 65000; base++ {
+	for base := spans.next; base+count <= spanLimit; base++ {
 		if spanIsFree(t, base, count) {
 			spans.next = base + count
 
@@ -42,7 +50,7 @@ func freeSpan(t *testing.T, count uint16) uint16 {
 		}
 	}
 
-	t.Fatalf("no %d consecutive free ports above 61000", count)
+	t.Fatalf("no %d consecutive free ports in [%d, %d)", count, spanFirst, spanLimit)
 
 	return 0
 }
