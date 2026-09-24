@@ -5,8 +5,10 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -70,6 +72,51 @@ func serve(t *testing.T, handle script) (string, *atomic.Int32) {
 	})
 
 	return listener.Addr().String(), &accepts
+}
+
+// refusingPort reserves a loopback port that refuses every connection for the whole test: a TCP
+// socket bound to it and never listening. Freeing a port and dialling it later races any other
+// test that binds the same port in between and answers; a bound port can be taken by nobody.
+func refusingPort(t *testing.T) string {
+	t.Helper()
+
+	socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("socket: %v", err)
+	}
+
+	t.Cleanup(func() { _ = syscall.Close(socket) })
+
+	if err = syscall.Bind(socket, &syscall.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	bound, err := syscall.Getsockname(socket)
+	if err != nil {
+		t.Fatalf("getsockname: %v", err)
+	}
+
+	inet, ok := bound.(*syscall.SockaddrInet4)
+	if !ok {
+		t.Fatalf("bound to %T, want an IPv4 address", bound)
+	}
+
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(inet.Port))
+
+	var dialer net.Dialer
+
+	conn, err := dialer.DialContext(t.Context(), "tcp", addr)
+	if err == nil {
+		_ = conn.Close()
+
+		t.Fatalf("a dial to the reserved port %s was accepted", addr)
+	}
+
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("a dial to the reserved port %s = %v, want it refused", addr, err)
+	}
+
+	return addr
 }
 
 // drain reads whatever arrives until the client closes.
@@ -168,9 +215,7 @@ func TestHandshakeAnswerTable(t *testing.T) {
 			)
 
 			if row.closed {
-				listener := listen(t)
-				addr = listener.Addr().String()
-				_ = listener.Close()
+				addr = refusingPort(t)
 			} else {
 				addr, accepts = serve(t, row.script)
 			}
