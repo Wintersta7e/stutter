@@ -34,8 +34,8 @@ const (
 	// helperMode turns this test binary into a helper process when set in its environment. A helper
 	// is the process a test kills or signals, standing in for a stutter invocation.
 	helperMode = "STUTTER_PROVISION_HELPER"
-	// miniSpecVar names the file a mini helper reads its spec from.
-	miniSpecVar = "STUTTER_MINI_SPEC"
+	// specVar names the file a helper reads its spec from.
+	specVar = "STUTTER_HELPER_SPEC"
 	// testImage is the image the engine suite runs: it has a shell and declares a VOLUME.
 	testImage = "postgres:18-alpine"
 	// testService is the compose service every test container serves.
@@ -48,6 +48,8 @@ const (
 	exitLimit = time.Minute
 	// logName is the invocation log's name in the check-private directory.
 	logName = "invocation.log"
+	// logsDir is where the check-private directory keeps container logs.
+	logsDir = "logs"
 )
 
 // testSubnets is the range the engine suite's networks come from: no host interface uses it.
@@ -62,49 +64,33 @@ func TestMain(m *testing.M) {
 	dockertest.Main(m)
 }
 
-// runHelper runs one helper mode and returns the process's exit code.
-func runHelper(mode string) int {
-	var err error
-
-	switch mode {
-	case "child":
-		// Blocks in whatever the first precondition call spawned, until the test kills this process.
-		_, err = provision.Preconditions(context.Background())
-	case "mini":
-		err = runMini(context.Background())
-	default:
-		err = fmt.Errorf("unknown helper mode %q", mode)
-	}
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "helper %s: %v\n", mode, err)
-
-		return 1
-	}
-
-	return 0
-}
-
 // writeShim writes an executable `docker` script into dir. It holds the fork lock while the file is
 // open for writing: a child another parallel test forks meanwhile would inherit the descriptor until
 // it execs, and executing the shim then fails with "text file busy".
 func writeShim(t *testing.T, dir, script string) {
 	t.Helper()
 
+	writeExecutable(t, filepath.Join(dir, "docker"), script)
+}
+
+// writeExecutable writes an executable script at path, under the fork lock as writeShim says.
+func writeExecutable(t *testing.T, path, script string) {
+	t.Helper()
+
 	syscall.ForkLock.Lock()
-	//nolint:gosec // a test shim must be executable to stand in for the docker CLI.
-	err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755)
+	//nolint:gosec // a test shim must be executable to stand in for a program.
+	err := os.WriteFile(path, []byte(script), 0o755)
 	syscall.ForkLock.Unlock()
 
 	if err != nil {
-		t.Fatalf("write shim: %v", err)
+		t.Fatalf("write %s: %v", path, err)
 	}
 }
 
-// startHelper re-executes this test binary as a helper in mode, with exactly env as its
-// environment, and returns it with a reader over its stdout. The helper is killed and reaped when
-// the test ends.
-func startHelper(t *testing.T, mode string, env []string) (*exec.Cmd, *bufio.Reader) {
+// startProcess re-executes this test binary as a helper in mode, with exactly env as its
+// environment, and returns it with its stdin and a reader over its stdout. The helper is killed and
+// reaped when the test ends.
+func startProcess(t *testing.T, mode string, env []string) (*exec.Cmd, io.WriteCloser, *bufio.Reader) {
 	t.Helper()
 
 	//nolint:gosec // re-executes this test binary; the only argument is fixed.
@@ -112,6 +98,11 @@ func startHelper(t *testing.T, mode string, env []string) (*exec.Cmd, *bufio.Rea
 
 	cmd.Env = append(append([]string(nil), env...), helperMode+"="+mode)
 	cmd.Stderr = os.Stderr
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("helper stdin: %v", err)
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -136,78 +127,42 @@ func startHelper(t *testing.T, mode string, env []string) (*exec.Cmd, *bufio.Rea
 		}
 	})
 
-	return cmd, bufio.NewReader(stdout)
+	return cmd, stdin, bufio.NewReader(stdout)
 }
 
-// miniSpec is what a mini helper creates: one target container, kept.
-type miniSpec struct {
+// startHelper is startProcess for a helper that reads nothing.
+func startHelper(t *testing.T, mode string, env []string) (*exec.Cmd, *bufio.Reader) {
+	t.Helper()
+
+	cmd, _, stdout := startProcess(t, mode, env)
+
+	return cmd, stdout
+}
+
+// helperSpec is the check a helper opens and what it does there, written by the parent.
+type helperSpec struct {
 	Env      map[string]string `json:"env"`
 	Image    string            `json:"image"`
 	StateDir string            `json:"state_dir"`
 	TempDir  string            `json:"temp_dir"`
+	Dir      string            `json:"dir"`
+	FIFO     string            `json:"fifo"`
 	Unset    []string          `json:"unset"`
+	Keep     bool              `json:"keep"`
 }
 
-// miniResult is what a mini helper printed.
-type miniResult struct {
-	check     string
-	private   string
-	container string
+// helper is a helper process that opened a check: a stutter invocation the test drives, signals
+// or kills.
+type helper struct {
+	cmd   *exec.Cmd
+	stdin io.WriteCloser
+	out   *bufio.Reader
+	check string
 }
 
-// runMini opens a kept check, creates a network and one target container from the spec file,
-// closes, and prints the check ID, the private directory and the container.
-func runMini(ctx context.Context) error {
-	//nolint:gosec // the parent test names the spec file it wrote for this helper.
-	data, err := os.ReadFile(os.Getenv(miniSpecVar))
-	if err != nil {
-		return err
-	}
-
-	var spec miniSpec
-	if err = json.Unmarshal(data, &spec); err != nil {
-		return err
-	}
-
-	engine, err := provision.Open(ctx, provision.Options{StateDir: spec.StateDir, TempDir: spec.TempDir, Keep: true})
-	if err != nil {
-		return err
-	}
-
-	container, err := miniContainer(ctx, engine, spec)
-	if down := engine.Close(ctx, provision.KeepLogs); err == nil {
-		err = down.Err
-	}
-
-	fmt.Printf("check %s\nprivate %s\n", engine.CheckID(), engine.PrivateDir()) //nolint:forbidigo // to the parent
-
-	if container != nil {
-		fmt.Printf("container %s\n", container.ID()) //nolint:forbidigo // to the parent
-	}
-
-	return err
-}
-
-func miniContainer(ctx context.Context, engine *provision.Engine, spec miniSpec) (*provision.Container, error) {
-	image, err := engine.ResolveImage(ctx, spec.Image, "")
-	if err != nil {
-		return nil, err
-	}
-
-	network, err := pickSubnet(ctx, engine, serviceRole)
-	if err != nil {
-		return nil, err
-	}
-
-	cs := targetSpec(image, network)
-	cs.Spec.Env, cs.Spec.Unset = spec.Env, spec.Unset
-
-	return engine.CreateContainer(ctx, cs)
-}
-
-// runMiniHelper writes spec, runs a mini helper with exactly env, and returns what it printed. The
-// kept check is cleaned when the test ends.
-func runMiniHelper(t *testing.T, spec miniSpec, env []string) miniResult {
+// launch writes spec, starts a helper in mode with exactly env, and reads the check ID it opened.
+// The check is cleaned — the way a user would, `stutter clean --check` — once the helper is gone.
+func launch(t *testing.T, mode string, spec helperSpec, env []string) *helper {
 	t.Helper()
 
 	path := filepath.Join(t.TempDir(), "spec.json")
@@ -221,32 +176,92 @@ func runMiniHelper(t *testing.T, spec miniSpec, env []string) miniResult {
 		t.Fatal(err)
 	}
 
-	helper, stdout := startHelper(t, "mini", append(env, miniSpecVar+"="+path))
+	h := &helper{}
 
-	var out miniResult
+	// Registered before the process starts, so it runs after the process is killed: a live
+	// helper's ledger is locked, and a clean refuses it.
+	t.Cleanup(func() {
+		if h.check != "" {
+			cleanCheck(t, spec.StateDir, h.check)
+		}
+	})
 
-	for line, err := stdout.ReadString('\n'); err == nil; line, err = stdout.ReadString('\n') {
-		key, value, _ := strings.Cut(strings.TrimSpace(line), " ")
+	h.cmd, h.stdin, h.out = startProcess(t, mode, append(env, specVar+"="+path))
+	h.check = h.await(t, "check")
 
-		switch key {
-		case "check":
-			out.check = value
-		case "private":
-			out.private = value
-		case "container":
-			out.container = value
-		default:
+	return h
+}
+
+// await reads the helper's report until a line starting with key, and returns the rest of it.
+func (h *helper) await(t *testing.T, key string) string {
+	t.Helper()
+
+	for {
+		line, err := h.out.ReadString('\n')
+		if k, v, _ := strings.Cut(strings.TrimSpace(line), " "); k == key {
+			return v
+		}
+
+		if err != nil {
+			t.Fatalf("the helper ended before reporting %q: %v", key, err)
 		}
 	}
+}
 
-	waitErr := helper.Wait()
+// collect reads the helper's report through the first line starting with last, and returns every
+// value it reported, by key.
+func (h *helper) collect(t *testing.T, last string) map[string][]string {
+	t.Helper()
 
-	if out.check != "" {
-		t.Cleanup(func() { cleanCheck(t, spec.StateDir, out.check) })
+	out := map[string][]string{}
+
+	for {
+		line, err := h.out.ReadString('\n')
+		if k, v, _ := strings.Cut(strings.TrimSpace(line), " "); k != "" {
+			out[k] = append(out[k], v)
+
+			if k == last {
+				return out
+			}
+		}
+
+		if err != nil {
+			t.Fatalf("the helper ended before reporting %q: %v (reported %v)", last, err, out)
+		}
+	}
+}
+
+// kill ends the helper with SIGKILL, as a crash would: nothing it holds is released but its locks.
+func (h *helper) kill(t *testing.T) {
+	t.Helper()
+
+	if err := h.cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatalf("kill the helper: %v", err)
 	}
 
-	if waitErr != nil || out.container == "" {
-		t.Fatalf("the mini helper failed: %v (printed %+v)", waitErr, out)
+	if err := h.cmd.Wait(); err == nil {
+		t.Fatal("the helper exited cleanly; it was meant to die by SIGKILL")
+	}
+}
+
+// miniResult is what a mini helper reported.
+type miniResult struct {
+	check     string
+	private   string
+	container string
+}
+
+// runMiniHelper runs a mini helper on spec with exactly env and returns what it reported: a kept
+// check with one created target container.
+func runMiniHelper(t *testing.T, spec helperSpec, env []string) miniResult {
+	t.Helper()
+
+	spec.Keep = true
+	h := launch(t, "mini", spec, env)
+	out := miniResult{check: h.check, private: h.await(t, "private"), container: h.await(t, "container")}
+
+	if err := h.cmd.Wait(); err != nil {
+		t.Fatalf("the mini helper failed: %v (reported %+v)", err, out)
 	}
 
 	return out

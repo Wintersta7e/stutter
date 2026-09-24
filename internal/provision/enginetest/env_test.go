@@ -95,7 +95,7 @@ func TestNoProxyVariableReachesTheTarget(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	kept := runMiniHelper(t, miniSpec{
+	kept := runMiniHelper(t, helperSpec{
 		Image: image, StateDir: newStateDir(t), TempDir: t.TempDir(),
 		Env: map[string]string{"KEEP": "1"}, Unset: proxyNames(),
 	}, helperEnv(gate, os.Getenv("PATH"), userConfig))
@@ -169,7 +169,7 @@ func TestNoEnvironmentValueReachesArgv(t *testing.T) {
 	}
 
 	stateDir := newStateDir(t)
-	kept := runMiniHelper(t, miniSpec{Image: testImage, StateDir: stateDir, TempDir: t.TempDir(), Env: sentinels},
+	kept := runMiniHelper(t, helperSpec{Image: testImage, StateDir: stateDir, TempDir: t.TempDir(), Env: sentinels},
 		helperEnv(gate, shimDir+":"+os.Getenv("PATH"), t.TempDir()))
 
 	shimmed, err := os.ReadFile(argvLog)
