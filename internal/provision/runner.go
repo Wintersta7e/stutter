@@ -763,9 +763,14 @@ func (s *stderrSink) count() int {
 	return s.lines
 }
 
-// firstLine returns the first line kept, trimmed.
+// firstLine returns the first line kept that is not blank, trimmed: the docker CLI opens a failed
+// inspect's stderr with a blank line.
 func (s *stderrSink) firstLine() string {
-	line, _, _ := bytes.Cut(s.buf, []byte{'\n'})
+	for line := range bytes.Lines(s.buf) {
+		if text := strings.TrimSpace(string(line)); text != "" {
+			return text
+		}
+	}
 
-	return strings.TrimSpace(string(line))
+	return ""
 }

@@ -337,3 +337,19 @@ func TestComposeStderrIsNeverQuoted(t *testing.T) {
 		t.Errorf("a first-line row did not quote its stderr: %v", err)
 	}
 }
+
+// The docker CLI opens a failed inspect's stderr with a blank line — measured on 28.0.4 and 29.6.2,
+// for a missing object and a failing template alike — so the line quoted is the first one that is not
+// blank. Quoting the blank one hid why a read failed.
+func TestTheQuotedStderrLineIsTheFirstNonBlankOne(t *testing.T) {
+	t.Parallel()
+
+	const cause = `template parsing error: map has no entry for key "Gateway"`
+
+	runner := newRunner(shimEnv(t, "printf '\\n%s\\n' '"+cause+"' >&2\nexit 1\n"), nil)
+
+	_, err := runner.call(t.Context(), request{verb: verbInfo, args: []arg{{val: infoTemplate}}})
+	if err == nil || !strings.Contains(err.Error(), cause) {
+		t.Errorf("a call whose stderr opens with a blank line = %v, want it to quote %q", err, cause)
+	}
+}
