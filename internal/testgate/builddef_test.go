@@ -10,6 +10,7 @@ import (
 // makefile is a Makefile whose build recipe is the one build of the product.
 const makefile = `GO ?= go
 BIN ?= bin/stutter
+CGO = 0
 
 .PHONY: test
 test: ## Race tests keep cgo
@@ -17,7 +18,7 @@ test: ## Race tests keep cgo
 
 .PHONY: build
 build: ## Build the CLI
-	CGO_ENABLED=0 $(GO) build -trimpath -o $(BIN) ./cmd/stutter
+	CGO_ENABLED=$(CGO) $(GO) build -trimpath -o $(BIN) ./cmd/stutter
 `
 
 func file(path, content string) testgate.SourceFile {
@@ -125,8 +126,8 @@ func TestAScannedFileIsCountedOnce(t *testing.T) {
 	}
 
 	match := scan.Found[0]
-	if match.Path != "Makefile" || match.Line != 10 || !strings.Contains(match.Text, "-trimpath") {
-		t.Fatalf("match = %+v, want Makefile:10 and the recipe's text", match)
+	if match.Path != "Makefile" || match.Line != 11 || !strings.Contains(match.Text, "-trimpath") {
+		t.Fatalf("match = %+v, want Makefile:11 and the recipe's text", match)
 	}
 }
 
@@ -170,6 +171,82 @@ func TestAnExportedCgoSettingFailsTheScan(t *testing.T) {
 
 			if err := scan.Err(); (err == nil) != (tc.cgo == 0) {
 				t.Errorf("Err() = %v, want pass=%v", err, tc.cgo == 0)
+			}
+		})
+	}
+}
+
+func TestTheMakefileDefaultIsCGOZero(t *testing.T) {
+	t.Parallel()
+
+	withDefault := func(assignment string) string {
+		return strings.Replace(makefile, "CGO = 0\n", assignment, 1)
+	}
+
+	cases := []struct {
+		name       string
+		cgoDefault string
+		files      []testgate.SourceFile
+		pass       bool
+	}{
+		{name: "a plain zero", files: []testgate.SourceFile{file("Makefile", makefile)}, cgoDefault: "0", pass: true},
+		{
+			name:       "a conditional default yields to the environment",
+			files:      []testgate.SourceFile{file("Makefile", withDefault("CGO ?= 0\n"))},
+			cgoDefault: "0",
+		},
+		{
+			name:       "a default of one",
+			files:      []testgate.SourceFile{file("Makefile", withDefault("CGO = 1\n"))},
+			cgoDefault: "1",
+		},
+		{
+			name:       "an exported default",
+			files:      []testgate.SourceFile{file("Makefile", withDefault("export CGO = 0\n"))},
+			cgoDefault: "0",
+		},
+		{name: "no default at all", files: []testgate.SourceFile{file("Makefile", withDefault(""))}},
+		{
+			name: "a workflow passing CGO=1 to make",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file(".github/workflows/ci.yml", "      - run: make build CGO=1 BIN=x\n"),
+			},
+			cgoDefault: "0",
+		},
+		{
+			name: "make told to let the environment win",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file("scripts/release.sh", "make -e build\n"),
+			},
+			cgoDefault: "0",
+		},
+		{
+			name: "a shell CGO in the environment is harmless",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file(".github/workflows/ci.yml", "      - run: CGO=1 make build BIN=x\n"),
+			},
+			cgoDefault: "0", pass: true,
+		},
+		{
+			name: "a test passing CGO=1 is not scanned",
+			files: []testgate.SourceFile{
+				file("Makefile", makefile), file("build_test.go", `var argv = []string{"make", "build", "CGO=1"}`),
+			},
+			cgoDefault: "0", pass: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			scan := testgate.ScanBuilds(tc.files)
+			if scan.CgoDefault != tc.cgoDefault {
+				t.Errorf("cgo-default=%q, want %q", scan.CgoDefault, tc.cgoDefault)
+			}
+
+			if err := scan.Err(); (err == nil) != tc.pass {
+				t.Errorf("Err() = %v, want pass=%v (cgo settings %v)", err, tc.pass, scan.CgoAssignments)
 			}
 		})
 	}

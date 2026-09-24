@@ -27,6 +27,13 @@ var (
 	targetPattern = regexp.MustCompile(`^([A-Za-z0-9_./-]+)\s*:(?:[^=]|$)`)
 	// cgoPattern matches the cgo switch.
 	cgoPattern = regexp.MustCompile(`\bCGO_ENABLED\b`)
+	// cgoDefaultPattern matches a Makefile assignment or export of the build's CGO parameter.
+	cgoDefaultPattern = regexp.MustCompile(`^\s*(export\s+|override\s+)?CGO\s*(?:(\?=|::?=|\+=|!=|=)\s*(\S*)\s*)?$`)
+	// makeCgoPattern matches CGO passed to make on its command line, which overrides the default.
+	makeCgoPattern = regexp.MustCompile(`(?:\bmake|\$\(MAKE\))\s[^|;&]*\bCGO=(\S*)`)
+	// makeEnvPattern matches make told to let the environment override the Makefile, spelled so this
+	// source never holds the words it looks for.
+	makeEnvPattern = regexp.MustCompile(`(?:(?:\bmake|\$\(MAKE\))(?:\s[^|;&]*)?\s-e(?:\s|$)|\bMAKE(?:FLAGS)\b)`)
 )
 
 // errBuilds means the tree does not hold exactly one build of the product, in the Makefile's build
@@ -48,9 +55,13 @@ type BuildMatch struct {
 
 // BuildScan is what ScanBuilds found.
 type BuildScan struct {
+	// CgoDefault is the value the Makefile assigns the build's CGO parameter; empty when none.
+	CgoDefault string
 	// Found holds every line that builds the product: a build or install that writes a file.
 	Found []BuildMatch
-	// CgoAssignments holds every cgo setting outside the build recipe's own line.
+	// CgoAssignments holds every cgo setting that could make the build dynamic: CGO_ENABLED outside
+	// the build recipe's own line, a CGO default other than exactly `CGO = 0`, CGO passed to make on
+	// its command line, and make told to let the environment win.
 	CgoAssignments []BuildMatch
 	// Files is the number of files scanned.
 	Files int
@@ -123,9 +134,33 @@ func addLine(s *BuildScan, l line) {
 		}
 	}
 
-	if cgoPattern.MatchString(l.text) && (l.workflow || l.makefile && !l.recipe) {
+	if dynamicCgo(l) {
 		s.CgoAssignments = append(s.CgoAssignments, match)
 	}
+
+	if m := cgoDefaultPattern.FindStringSubmatch(l.text); m != nil && l.makefile && !l.recipe {
+		s.CgoDefault = m[3]
+
+		// Only a plain assignment of 0 holds: `?=` yields to the environment, an export reaches every
+		// recipe, and any other value builds with cgo.
+		if m[1] != "" || m[2] != "=" || m[3] != "0" {
+			s.CgoAssignments = append(s.CgoAssignments, match)
+		}
+	}
+}
+
+// dynamicCgo reports whether l sets CGO_ENABLED anywhere but the build recipe's own line, runs make
+// with a CGO other than 0 on its command line, or tells make to let the environment win.
+func dynamicCgo(l line) bool {
+	if cgoPattern.MatchString(l.text) && (l.workflow || l.makefile && !l.recipe) {
+		return true
+	}
+
+	if m := makeCgoPattern.FindStringSubmatch(l.text); m != nil && m[1] != "0" {
+		return true
+	}
+
+	return makeEnvPattern.MatchString(l.text)
 }
 
 // writesProduct reports whether text builds or installs something that writes a file: a build whose
@@ -157,8 +192,13 @@ func (s BuildScan) Err() error {
 			makeRecipe, len(s.Found)))
 	}
 
+	if s.CgoDefault != "0" {
+		problems = append(problems, fmt.Sprintf("cgo-default=%q: the Makefile must assign exactly CGO = 0",
+			s.CgoDefault))
+	}
+
 	if len(s.CgoAssignments) > 0 {
-		problems = append(problems, fmt.Sprintf("%d cgo settings outside the build recipe's line",
+		problems = append(problems, fmt.Sprintf("%d cgo settings that could make the build dynamic",
 			len(s.CgoAssignments)))
 	}
 

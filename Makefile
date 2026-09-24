@@ -1,5 +1,14 @@
+SHELL := bash
+.SHELLFLAGS := -euo pipefail -c
+
 GO ?= go
-BIN := bin/stutter
+BIN ?= bin/stutter
+PKG ?= ./cmd/stutter
+# The build's cgo switch, deliberately a plain assignment: a CGO=1 on make's command line overrides
+# it (a dynamic artifact a test asks for by name), one in the environment does not, so no shell can
+# silently make the release dynamic.
+CGO = 0
+TESTGATE := $(GO) run ./tools/testgate
 
 .PHONY: all
 all: fmt lint test build
@@ -21,8 +30,20 @@ test: ## Race-enabled, shuffled, with coverage
 	$(GO) test -race -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
 
 .PHONY: build
-build: ## Build the CLI
-	$(GO) build -trimpath -o $(BIN) ./cmd/stutter
+build: ## Build the CLI: the one build of the product, static unless CGO=1 is passed to make
+	CGO_ENABLED=$(CGO) $(GO) build -trimpath -o $(BIN) $(PKG)
+
+.PHONY: static-check
+static-check: ## Fail unless $(BIN) was built without cgo and has no ELF interpreter
+	@hdrs="$$(readelf -l $(BIN))"; \
+	interp="$$(printf '%s\n' "$$hdrs" | grep -c INTERP || true)"; \
+	cgo="$$($(GO) version -m $(BIN) | awk '$$2 ~ /^CGO_ENABLED=/ { sub(/^CGO_ENABLED=/, "", $$2); print $$2 }')"; \
+	echo "artifact $(BIN): CGO_ENABLED=$${cgo:-unset} INTERP=$$interp"; \
+	[ "$$cgo" = 0 ] && [ "$$interp" = 0 ]
+
+.PHONY: buildscan
+buildscan: ## Fail unless the Makefile's build recipe is the only build of the product
+	git ls-files -z | $(TESTGATE) builddef $(BUILDSCAN_EXTRA)
 
 .PHONY: vuln
 vuln: ## Scan dependencies for known vulnerabilities
@@ -33,7 +54,7 @@ tidy: ## Fail if go.mod/go.sum are not tidy
 	$(GO) mod tidy -diff
 
 .PHONY: ci
-ci: fmt-check lint tidy test vuln build ## Everything CI runs, locally
+ci: fmt-check lint buildscan tidy test vuln build static-check ## Everything CI runs, locally
 
 .PHONY: clean
 clean:

@@ -44,6 +44,8 @@ jobs:
           args: --max-issues-per-linter=0 --max-same-issues=0
       - name: Formatting is clean
         run: golangci-lint fmt --diff
+      - name: One build definition
+        run: make buildscan
       - name: Workflows are valid
         run: |
           go install "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}"
@@ -168,7 +170,13 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
-      - run: go build -trimpath -o stutter ./cmd/stutter
+      - run: make build BIN=stutter
+      - name: The artifact is static
+        run: make static-check BIN=stutter
+      - name: A shell CGO cannot make the build dynamic
+        # CGO in the environment must not override the Makefile's plain default; only a CGO=1 on
+        # make's own command line may, and nothing in CI passes one.
+        run: CGO=1 make build BIN=stutter-env && make static-check BIN=stutter-env
       - name: version and help succeed
         run: |
           ./stutter version

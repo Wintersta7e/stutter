@@ -63,8 +63,8 @@ func builddef(extra []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 	scan := testgate.ScanBuilds(files)
 
-	fmt.Fprintf(stdout, "build-definitions files=%d found=%d cgo-assignments=%d\n", scan.Files, len(scan.Found),
-		len(scan.CgoAssignments))
+	fmt.Fprintf(stdout, "build-definitions files=%d found=%d cgo-assignments=%d cgo-default=%s\n", scan.Files,
+		len(scan.Found), len(scan.CgoAssignments), scan.CgoDefault)
 
 	for _, m := range scan.Found {
 		fmt.Fprintf(stdout, "%s:%d: %s\n", m.Path, m.Line, m.Text)

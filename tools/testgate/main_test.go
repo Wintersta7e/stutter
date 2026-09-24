@@ -18,7 +18,11 @@ func TestBuilddefPrintsWhatItScanned(t *testing.T) {
 	makefile := filepath.Join(dir, "Makefile")
 	extra := filepath.Join(dir, "gate.sh")
 
-	if err := os.WriteFile(makefile, []byte("build:\n\tCGO_ENABLED=0 $(GO) build -o x ./cmd/x\n"), 0o600); err != nil {
+	if err := os.WriteFile(
+		makefile,
+		[]byte("CGO = 0\nbuild:\n\tCGO_ENABLED=$(CGO) $(GO) build -o x ./cmd/x\n"),
+		0o600,
+	); err != nil {
 		t.Fatal(err)
 	}
 
@@ -32,7 +36,7 @@ func TestBuilddefPrintsWhatItScanned(t *testing.T) {
 		t.Fatalf("the recipe alone: exit %d, stderr %q", code, stderr.String())
 	}
 
-	if !strings.HasPrefix(stdout.String(), "build-definitions files=1 found=1 cgo-assignments=0\n") {
+	if !strings.HasPrefix(stdout.String(), "build-definitions files=1 found=1 cgo-assignments=0 cgo-default=0\n") {
 		t.Fatalf("stdout %q does not begin with the count line", stdout.String())
 	}
 
