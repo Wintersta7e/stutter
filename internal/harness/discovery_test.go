@@ -494,3 +494,230 @@ func TestAFailedResetStopsDiscoveryBeforeTheServiceStarts(t *testing.T) {
 		t.Errorf("the service was started %d times, want 0", got)
 	}
 }
+
+// consumerNamed finds one consumer discovery found, by name.
+func consumerNamed(t *testing.T, found []harness.Found, name string) harness.Found {
+	t.Helper()
+
+	for _, consumer := range found {
+		if consumer.Name == name {
+			return consumer
+		}
+	}
+
+	t.Fatalf("discovery found no consumer %q among %q", name, names(found))
+
+	return harness.Found{}
+}
+
+// TestDiscoveryReadsTheConfigBeforeSerialise: each consumer's configuration is read back as the server
+// holds it, defaults applied, before any run rewrites it to one message in flight — the read is the one
+// legality input, and reading the rewrite would license faults against a contract the service never had.
+func TestDiscoveryReadsTheConfigBeforeSerialise(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		for _, config := range []jetstream.ConsumerConfig{
+			{Durable: "slow", AckPolicy: jetstream.AckExplicitPolicy, MaxAckPending: 10},
+			{
+				Durable:    "curved",
+				AckPolicy:  jetstream.AckExplicitPolicy,
+				AckWait:    2 * time.Minute,
+				BackOff:    []time.Duration{time.Second, 2 * time.Second},
+				MaxDeliver: 3,
+			},
+		} {
+			if _, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", config); err != nil {
+				return 2
+			}
+		}
+
+		return idle(ctx)
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	slow, curved := consumerNamed(t, found.Consumers, "slow"), consumerNamed(t, found.Consumers, "curved")
+	t.Logf("slow: MaxAckPending %d, Deadline(1) %s; curved: Deadline(1) %s",
+		slow.Policy.MaxAckPending, slow.Policy.Deadline(1), curved.Policy.Deadline(1))
+
+	if slow.Policy.MaxAckPending != 10 || slow.Policy.Deadline(1) != 30*time.Second {
+		t.Errorf("slow reads MaxAckPending %d, Deadline(1) %s; want 10 and the server's 30s default",
+			slow.Policy.MaxAckPending, slow.Policy.Deadline(1))
+	}
+
+	if curved.Policy.Deadline(1) != time.Second {
+		t.Errorf("curved reads Deadline(1) %s, want BackOff[0] = 1s", curved.Policy.Deadline(1))
+	}
+}
+
+// TestDiscoveryListsEveryConsumerTheServerHolds: discovery finds exactly the consumers the server holds
+// on the corpus stream, names the ones on other streams, and leaves out the client library's own
+// machinery on a key/value bucket's stream.
+func TestDiscoveryListsEveryConsumerTheServerHolds(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{}
+	service.script = func(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+		audit := jetstream.StreamConfig{Name: "AUDIT", Subjects: []string{"audit.>"}}
+		if _, err := js.CreateStream(ctx, audit); err != nil {
+			return 2
+		}
+
+		claims, err := js.CreateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: "claims"})
+		if err != nil {
+			return 2
+		}
+
+		watcher, err := claims.WatchAll(ctx)
+		if err != nil {
+			return 2
+		}
+
+		defer func() { _ = watcher.Stop() }() //nolint:errcheck // the service is stopping either way.
+
+		if err := createDurable(ctx, js, "AUDIT", "audit"); err != nil {
+			return 2
+		}
+
+		return idleAfter("alpha", "beta", "gamma")(ctx, js, nil, harness.Addresses{})
+	}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	listed := listedOn(t, store, "ORDERS")
+	discovered := names(found.Consumers)
+	t.Logf("discovered: %d, listed: %d", len(discovered), len(listed))
+
+	if len(discovered) == 0 || len(listed) == 0 {
+		t.Fatalf("discovered: %d, listed: %d; want both above zero", len(discovered), len(listed))
+	}
+
+	if !slices.Equal(discovered, listed) || !slices.Equal(discovered, []string{"alpha", "beta", "gamma"}) {
+		t.Errorf("discovered %q, listed %q; want both [alpha beta gamma]", discovered, listed)
+	}
+
+	if !slices.Equal(found.Elsewhere, []string{"AUDIT/audit"}) {
+		t.Errorf("elsewhere = %q, want [AUDIT/audit] and no key/value bucket's consumer", found.Elsewhere)
+	}
+}
+
+// listedOn lists a stream's consumers on a direct connection of the test's own.
+func listedOn(t *testing.T, store *corpus.Corpus, stream string) []string {
+	t.Helper()
+
+	held, err := directStream(t, store).Stream(t.Context(), stream)
+	if err != nil {
+		t.Fatalf("Stream(%s) error = %v", stream, err)
+	}
+
+	lister := held.ConsumerNames(t.Context())
+
+	var listed []string
+	for name := range lister.Name() {
+		listed = append(listed, name)
+	}
+
+	if err := lister.Err(); err != nil {
+		t.Fatalf("ConsumerNames() error = %v", err)
+	}
+
+	slices.Sort(listed)
+
+	return listed
+}
+
+// TestDiscoveryMarksConsumersThatCannotBeTargets: a consumer whose configuration has no legality row,
+// or whose kind can neither be faulted nor held to one message in flight, is found and marked excluded,
+// naming why; a checkable one beside them is not.
+func TestDiscoveryMarksConsumersThatCannotBeTargets(t *testing.T) {
+	t.Parallel()
+
+	store, checkpoint := newBus(t, withOrders(t))
+	service := &fakeService{script: targetKinds}
+
+	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if err != nil {
+		t.Fatalf("Discover() error = %v", err)
+	}
+
+	for _, consumer := range found.Consumers {
+		t.Logf("%s: kind %s, excluded %q", consumer.Name, consumer.Kind, consumer.Excluded)
+	}
+
+	if len(found.Consumers) == 0 {
+		t.Fatal("discovered: 0")
+	}
+
+	if ok := consumerNamed(t, found.Consumers, "ok"); ok.Kind != corpus.KindPull || ok.Excluded != "" {
+		t.Errorf("ok: kind %s, excluded %q; want a pull consumer, not excluded", ok.Kind, ok.Excluded)
+	}
+
+	fc := consumerNamed(t, found.Consumers, "fc")
+	if fc.Kind != corpus.KindPush || !strings.Contains(fc.Excluded, "AckFlowControl") {
+		t.Errorf("fc: kind %s, excluded %q; want a push consumer excluded for AckFlowControl", fc.Kind, fc.Excluded)
+	}
+
+	if quiet := consumerNamed(t, found.Consumers, "quiet"); !strings.Contains(quiet.Excluded, "AckNone") {
+		t.Errorf("quiet: excluded %q, want it to name AckNone", quiet.Excluded)
+	}
+
+	ordered := 0
+
+	for _, consumer := range found.Consumers {
+		if consumer.Kind == corpus.KindOrdered && strings.Contains(consumer.Excluded, "ordered") {
+			ordered++
+		}
+	}
+
+	if ordered != 1 {
+		t.Errorf("%d ordered consumers excluded as ordered, want 1", ordered)
+	}
+}
+
+// targetKinds is a service creating one consumer of every kind on ORDERS, and consuming from the
+// ordered one until it is stopped.
+func targetKinds(ctx context.Context, js jetstream.JetStream, _ *nats.Conn, _ harness.Addresses) int {
+	if createDurable(ctx, js, "ORDERS", "ok") != nil {
+		return 2
+	}
+
+	if _, err := js.CreateOrUpdatePushConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:        "fc",
+		AckPolicy:      jetstream.AckFlowControlPolicy,
+		DeliverSubject: "fc.inbox",
+		MaxAckPending:  10,
+	}); err != nil {
+		return 2
+	}
+
+	if _, err := js.CreateOrUpdateConsumer(ctx, "ORDERS", jetstream.ConsumerConfig{
+		Durable:   "quiet",
+		AckPolicy: jetstream.AckNonePolicy,
+	}); err != nil {
+		return 2
+	}
+
+	ordered, err := js.OrderedConsumer(ctx, "ORDERS", jetstream.OrderedConsumerConfig{})
+	if err != nil {
+		return 2
+	}
+
+	consuming, err := ordered.Consume(func(jetstream.Msg) {})
+	if err != nil {
+		return 2
+	}
+
+	defer consuming.Stop()
+
+	return idle(ctx)
+}

@@ -190,22 +190,77 @@ func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
 }
 
 // settleDiscovery waits the start out under discovery's rule, reads what it found, and discards it.
+//
+// Every read happens before the service is removed: a consumer with no durable name is deleted once
+// its client has gone idle, and a read after the removal could find it gone.
 func (s *Sandbox) settleDiscovery(ctx context.Context, start *bare) (Discovery, error) {
 	var listing corpus.Listing
 
 	_, err := start.observed.await(ctx, start.service.Exited(), s.discoverySettled(start, &listing))
+
+	var found Discovery
+	if err == nil {
+		found, err = s.readDiscovered(ctx, listing)
+	}
 
 	exit, discardErr := start.discard(ctx)
 	if err = errors.Join(err, discardErr); err != nil {
 		return Discovery{}, fmt.Errorf("%s: %w", start.stage, err)
 	}
 
-	found := make([]Found, 0, len(listing.Corpus))
+	found.Exit, found.Setup = exit, start.recorder.SetupCount()
+
+	return found, nil
+}
+
+// readDiscovered reads every consumer on the corpus stream as the server holds it, on Stutter's own
+// connection. Nothing is serialised: the read-back is the one legality input, and a rewrite read back
+// would license faults against a contract the service never had.
+func (s *Sandbox) readDiscovered(ctx context.Context, listing corpus.Listing) (Discovery, error) {
+	consumers := make([]Found, 0, len(listing.Corpus))
+
 	for _, name := range listing.Corpus {
-		found = append(found, Found{Name: name})
+		found, err := s.readConsumer(ctx, name)
+		if err != nil {
+			return Discovery{}, err
+		}
+
+		consumers = append(consumers, found)
 	}
 
-	return Discovery{Exit: exit, Consumers: found}, nil
+	return Discovery{Consumers: consumers, Elsewhere: listing.Elsewhere}, nil
+}
+
+// readConsumer reads one consumer: what kind it is, and its configuration. A kind that cannot be a
+// target, or a configuration with no legality row, is marked rather than returned as an error — it
+// stops that consumer, not the others beside it.
+func (s *Sandbox) readConsumer(ctx context.Context, name string) (Found, error) {
+	kind, err := s.cfg.Corpus.Kind(ctx, name)
+	if err != nil {
+		return Found{}, fmt.Errorf("read consumer %q: %w", name, err)
+	}
+
+	found := Found{Name: name, Kind: kind}
+
+	if kind.Refused() {
+		found.Excluded = fmt.Sprintf("consumer kind %s: no fault is legal against it, "+
+			"and one message in flight cannot be enforced", kind)
+
+		return found, nil
+	}
+
+	config, err := s.cfg.Corpus.Policy(ctx, name)
+
+	switch {
+	case errors.Is(err, corpus.ErrUnmappable):
+		found.Excluded = err.Error()
+	case err != nil:
+		return Found{}, fmt.Errorf("read consumer %q: %w", name, err)
+	default:
+		found.Policy = config
+	}
+
+	return found, nil
 }
 
 // discoverySettled is discovery's end rule: a consumer exists on any stream and the service has been
