@@ -65,10 +65,9 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    # PROVISIONAL, to obtain a first complete run: 2 minutes (twice a local 54.0 s measurement) cancelled
-    # the job mid-test on 2026-09-24, and the whole job took 2 min 46 s before the Docker suite existed.
-    # Reset to twice the duration of the first green run on CI, with that run's id in this comment.
-    timeout-minutes: 15
+    # Twice the measured duration, never guessed: the first green run with the Docker suite (run
+    # 36011527499, 2026-09-24) took 3 min 40 s end to end, set-up and database service included.
+    timeout-minutes: 8
     # The replay suite drives the real Postgres wire protocol against a real
     # server. Without one it SKIPS and still prints "ok", which is a false green.
     services:
