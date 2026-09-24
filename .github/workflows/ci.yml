@@ -199,7 +199,9 @@ jobs:
         env:
           DOCKER_HOST: unix:///nonexistent.sock
         run: |
-          set -uo pipefail
+          # Actions runs this under `bash -e`; two of the probes below are meant to fail, so errexit is
+          # off until their outputs are judged.
+          set +e -uo pipefail
           dir="$RUNNER_TEMP/optout"; mkdir -p "$dir"
           probe() { go test -count=1 -json -run '^TestTheEngineAnswers$' ./internal/dockertest/; }
           (unset STUTTER_TEST_DOCKER; probe) > "$dir/unset.json"
