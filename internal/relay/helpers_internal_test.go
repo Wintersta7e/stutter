@@ -53,7 +53,10 @@ func runSystem(t *testing.T, sys system, args []string) *started {
 
 	run := &started{stdout: make(chan string, 8), stderr: &lockedBuffer{}, done: make(chan struct{}), cancel: cancel}
 
+	// Closed at the pipe's end, after run has returned: a reader that sees it closed has seen every line.
 	go func() {
+		defer close(run.stdout)
+
 		scanner := bufio.NewScanner(outReader)
 		for scanner.Scan() {
 			run.stdout <- scanner.Text()
@@ -75,15 +78,13 @@ func runSystem(t *testing.T, sys system, args []string) *started {
 	return run
 }
 
-// line waits for the next stdout line. It reports false when the run ended first.
+// line waits for the next stdout line. It reports false when the run ended without printing another.
 func (r *started) line(t *testing.T) (string, bool) {
 	t.Helper()
 
 	select {
-	case line := <-r.stdout:
-		return line, true
-	case <-r.done:
-		return "", false
+	case line, printed := <-r.stdout:
+		return line, printed
 	case <-time.After(testWait):
 		t.Fatalf("no stdout line within %s: %s", testWait, r.stderr)
 	}
@@ -97,6 +98,7 @@ func (r *started) ready(t *testing.T) netip.Addr {
 
 	line, printed := r.line(t)
 	if !printed {
+		<-r.done
 		t.Fatalf("relay exited %d before ready: %s", r.code, r.stderr)
 	}
 

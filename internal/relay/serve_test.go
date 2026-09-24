@@ -57,7 +57,10 @@ func startRelay(t *testing.T, args []string) *running {
 
 	run := &running{stdout: make(chan string, 8), stderr: &syncBuffer{}, done: make(chan struct{}), cancel: cancel}
 
+	// Closed at the pipe's end, after Run has returned: a reader that sees it closed has seen every line.
 	go func() {
+		defer close(run.stdout)
+
 		scanner := bufio.NewScanner(outReader)
 		for scanner.Scan() {
 			run.stdout <- scanner.Text()
@@ -84,15 +87,18 @@ func (r *running) ready(t *testing.T) string {
 	t.Helper()
 
 	select {
-	case line := <-r.stdout:
+	case line, printed := <-r.stdout:
+		if !printed {
+			<-r.done
+			t.Fatalf("relay exited %d before ready: %s", r.code, r.stderr)
+		}
+
 		address, found := strings.CutPrefix(line, relay.Ready+" ")
 		if !found {
 			t.Fatalf("first stdout line = %q, want %q", line, relay.Ready+" <IPv4>")
 		}
 
 		return address
-	case <-r.done:
-		t.Fatalf("relay exited %d before ready: %s", r.code, r.stderr)
 	case <-time.After(ioBound):
 		t.Fatalf("relay not ready within %s: %s", ioBound, r.stderr)
 	}
