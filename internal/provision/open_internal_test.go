@@ -40,7 +40,7 @@ func TestOpenFollowsTheRefusalFirstOrder(t *testing.T) {
 	}
 	host.lstat = func(path string) (fs.FileInfo, error) {
 		if strings.HasPrefix(filepath.Base(path), "stutter-") {
-			note("private")
+			note("private dir")
 		}
 
 		return realLstat(path)
@@ -67,7 +67,7 @@ func TestOpenFollowsTheRefusalFirstOrder(t *testing.T) {
 		}
 	})
 
-	if want := []string{"preconditions", "ledger", "private"}; !slices.Equal(events, want) {
+	if want := []string{"preconditions", "ledger", "private dir"}; !slices.Equal(events, want) {
 		t.Errorf("Open ran %v, want %v", events, want)
 	}
 

@@ -39,18 +39,19 @@ type openDeps struct {
 // Engine is one check's hold on the user's engine: its identity, its ledger and its private
 // directory. Everything the check creates on the engine is created, verified and removed through it.
 type Engine struct {
-	run        engineCaller
-	book       *book
-	pins       map[string]compose.Image
-	interfaces func() ([]localAddr, error)
-	log        *invLog
-	identity   Identity
-	id         string
-	private    string
-	host       hostFS
-	down       Teardown
-	swept      SweepResult
-	privateSeq int
+	run          engineCaller
+	book         *book
+	pins         map[string]compose.Image
+	fingerprints map[string]compose.Prints
+	interfaces   func() ([]localAddr, error)
+	log          *invLog
+	identity     Identity
+	id           string
+	private      string
+	host         hostFS
+	down         Teardown
+	swept        SweepResult
+	privateSeq   int
 	// teardownBound overrides teardown's bound when set; tests shorten it.
 	teardownBound time.Duration
 	closeOnce     sync.Once

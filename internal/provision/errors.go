@@ -25,6 +25,12 @@ var (
 	// ErrSubnetOverlap means a requested subnet is not a masked IPv4 prefix, or intersects a prefix
 	// of a local interface; it is refused before any call.
 	ErrSubnetOverlap = errors.New("subnet refused")
+	// ErrRefused means a container spec asks for something Stutter will not create; it is refused
+	// before any call. A compose *Refusal is wrapped when that is the cause.
+	ErrRefused = errors.New("refused container")
+	// ErrUnlabelledVolume means a created container holds a volume without this check's labels: a
+	// class defect. The container is removed before it starts.
+	ErrUnlabelledVolume = errors.New("container holds an unlabelled volume")
 	// ErrImage means an image could not be resolved, built, imported or committed as this check's.
 	ErrImage = errors.New("image failure")
 	// ErrLive means clean was asked for a check whose owner still holds its ledger's lock.

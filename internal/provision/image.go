@@ -120,14 +120,21 @@ func (e *Engine) pinnedRef(ref string) (compose.Image, bool) {
 
 // pinnedID reports an image ID this check pinned: resolved, built, imported or committed.
 func (e *Engine) pinnedID(id string) bool {
+	_, ok := e.pinnedImage(id)
+
+	return ok
+}
+
+// pinnedImage returns the image this check pinned under id.
+func (e *Engine) pinnedImage(id string) (compose.Image, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
 	for _, image := range e.pins {
-		if image.ID == id {
-			return true
+		if image.ID == id && id != "" {
+			return image, true
 		}
 	}
 
-	return false
+	return compose.Image{}, false
 }

@@ -46,6 +46,9 @@ const (
 	verbComposeBuild
 	verbImport
 	verbCommit
+	verbCreate
+	verbCopyIn
+	verbCopyOut
 	// verbCount is the number of rows; it is not a verb.
 	verbCount
 )
@@ -242,6 +245,18 @@ func verbs() [verbCount]verbSpec {
 		verbCommit: {
 			name: "commit", program: programDocker, prefix: []string{"commit"},
 			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCreate: {
+			name: "create", program: programDocker, prefix: []string{"create", "--pull", "never"},
+			mode: modeConstructed, deadline: deadlineShort, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCopyIn: {
+			name: "copyIn", program: programDocker, prefix: []string{"cp", "-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine, mutates: true, hold: true,
+		},
+		verbCopyOut: {
+			name: "copyOut", program: programDocker, prefix: []string{"cp"}, suffix: []string{"-"},
+			mode: modeConstructed, deadline: deadlineCopy, stderr: stderrFirstLine,
 		},
 	}
 }

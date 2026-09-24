@@ -1,19 +1,23 @@
 package provision
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/netip"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Wintersta7e/stutter/internal/compose"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
@@ -534,9 +538,9 @@ func (e *Engine) runBuild(
 		return fmt.Errorf("%w: render the build model: %w", ErrImage, err)
 	}
 
-	path := filepath.Join(e.private, logsDir, "build-"+strconv.Itoa(recs[0].seq)+".log")
+	logPath := filepath.Join(e.private, logsDir, "build-"+strconv.Itoa(recs[0].seq)+".log")
 
-	output, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fileMode)
+	output, err := os.OpenFile(logPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fileMode)
 	if err != nil {
 		return fmt.Errorf("%w: create the build log: %w", ErrImage, err)
 	}
@@ -556,7 +560,7 @@ func (e *Engine) runBuild(
 	}
 
 	if err != nil {
-		return fmt.Errorf("%w: the build failed; its output is in %s: %w", ErrImage, path, err)
+		return fmt.Errorf("%w: the build failed; its output is in %s: %w", ErrImage, logPath, err)
 	}
 
 	return nil
@@ -576,7 +580,9 @@ func (e *Engine) resolveAll(ctx context.Context, recs []record) error {
 
 // Import makes an image from a tar on stdin, labelled as this check's with changes applied, under a
 // reference the check reserved. It needs no builder and leaves no build cache.
-func (e *Engine) Import(ctx context.Context, kind rules.Kind, tar io.Reader, changes []string) (compose.Image, error) {
+func (e *Engine) Import(
+	ctx context.Context, kind rules.Kind, archive io.Reader, changes []string,
+) (compose.Image, error) {
 	rec, err := e.intend(ResourceImage, kind, "", func(seq int) string { return imageRef(e.id, kind, seq) })
 	if err != nil {
 		return compose.Image{}, err
@@ -587,7 +593,7 @@ func (e *Engine) Import(ctx context.Context, kind rules.Kind, tar io.Reader, cha
 		args = append(args, arg{val: "--change"}, arg{val: change})
 	}
 
-	res, err := e.run.call(ctx, request{verb: verbImport, stdin: tar, args: args, tail: []arg{{val: rec.name}}})
+	res, err := e.run.call(ctx, request{verb: verbImport, stdin: archive, args: args, tail: []arg{{val: rec.name}}})
 	if err != nil {
 		return compose.Image{}, errors.Join(fmt.Errorf("%w: import %s: %w", ErrImage, rec.name, err),
 			e.resolveIntent(ctx, e.book, rec))
@@ -664,6 +670,333 @@ func (e *Engine) verifyImage(ctx context.Context, rec record, id string) (compos
 	e.pin(rec.name, image)
 
 	return image, nil
+}
+
+// NetworkAttach is one network a container joins at create, with the names it answers to there.
+type NetworkAttach struct {
+	// Network is one of the check's networks.
+	Network *Network
+	// Aliases are the container's names on that network.
+	Aliases []string
+}
+
+// VolumeMount is one of the check's named volumes mounted into a container.
+type VolumeMount struct {
+	// Volume is the named volume.
+	Volume *Volume
+	// Target is the absolute path inside the container.
+	Target string
+	// NoCopy skips copying the image's content into an empty volume.
+	NoCopy bool
+	// ReadOnly mounts it read-only; the read-back must agree.
+	ReadOnly bool
+}
+
+// Healthcheck is a container's healthcheck. A nil *Healthcheck disables the image's.
+type Healthcheck struct {
+	// Test is compose's test: ["CMD", argv…], ["CMD-SHELL", command] or ["NONE"].
+	Test []string
+	// Interval, Timeout, StartPeriod and StartInterval are its durations; zero keeps the engine's.
+	Interval      time.Duration
+	Timeout       time.Duration
+	StartPeriod   time.Duration
+	StartInterval time.Duration
+	// Retries is its retry count; zero keeps the engine's.
+	Retries int
+	// Inherit keeps the image's own healthcheck, as a snapshot's.
+	Inherit bool
+}
+
+// ContainerSpec is one container to create: what it runs, from the compose model, and where the
+// check attaches it.
+type ContainerSpec struct {
+	// Healthcheck is the container's healthcheck; nil disables the image's.
+	Healthcheck *Healthcheck
+	// Kind is what the container is to the check.
+	Kind rules.Kind
+	// Service is the compose service it serves, if any.
+	Service string
+	// DNS is the resolver the container uses, when set.
+	DNS netip.Addr
+	// Networks are the check's networks it joins at create.
+	Networks []NetworkAttach
+	// Volumes are the check's named volumes it mounts.
+	Volumes []VolumeMount
+	// Publish are the container ports published on the host's loopback.
+	Publish []uint16
+	// Spec is the process, environment and mounts, from the compose model.
+	Spec compose.Spec
+	// NoNetwork runs a helper with no network at all.
+	NoNetwork bool
+}
+
+// File is one regular file copied into a container.
+type File struct {
+	// Path is the file's path relative to the directory it is copied into.
+	Path string
+	// Data is the file's content.
+	Data []byte
+	// Mode is its permission bits.
+	Mode fs.FileMode
+	// UID and GID own it; zero is root.
+	UID int
+	GID int
+}
+
+// CreateContainer creates one container, never started: from the image this check pinned, named
+// and labelled as this check's, `--restart no`, logged locally, on the check's networks and storage
+// only, every image VOLUME covered by a labelled volume, its environment on stdin. The read-back is
+// verified; a container that carries this check's labels but fails any property is removed before
+// the failure is returned.
+func (e *Engine) CreateContainer(ctx context.Context, spec ContainerSpec) (*Container, error) {
+	image, err := e.gate(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+
+	rec, err := e.intend(ResourceContainer, spec.Kind, spec.Service, func(seq int) string {
+		return containerName(e.id, spec.Kind, seq)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	call := createArgs(createPlan{
+		labels: labelSet(e.id, spec.Kind, spec.Service), name: rec.name, image: image.ID, spec: spec,
+		covers: uncovered(image.Volumes, spec), volumeLabels: []string{
+			rules.LabelCheck + "=" + e.id, rules.LabelKind + "=" + string(spec.Kind),
+		},
+	})
+
+	res, err := e.run.call(ctx, request{
+		verb: verbCreate, args: call.args, stdin: bytes.NewReader(call.stdin), extraEnv: call.extra,
+	})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("create %s: %w", rec.name, err), e.resolveIntent(ctx, e.book, rec))
+	}
+
+	if err := e.created(&rec, strings.TrimSpace(string(res.out))); err != nil {
+		return nil, err
+	}
+
+	if err := e.verifyCreated(ctx, rec, spec); err != nil {
+		return nil, err
+	}
+
+	if err := e.book.note(entry{Seq: rec.seq, Op: opVerified, Type: ResourceContainer}); err != nil {
+		return nil, err
+	}
+
+	return &Container{id: rec.id, name: rec.name, check: e.id, kind: spec.Kind, seq: rec.seq}, nil
+}
+
+// uncovered returns the image VOLUME paths no mount of the spec lands exactly on.
+func uncovered(volumes []string, spec ContainerSpec) []string {
+	covered := map[string]bool{}
+
+	for _, m := range spec.Spec.Mounts {
+		covered[path.Clean(m.Target)] = true
+	}
+
+	for _, v := range spec.Volumes {
+		covered[path.Clean(v.Target)] = true
+	}
+
+	var out []string
+
+	for _, volume := range volumes {
+		if !covered[path.Clean(volume)] {
+			out = append(out, volume)
+		}
+	}
+
+	return out
+}
+
+// verifyCreated proves a created container is this check's and is what was asked for. One without
+// this check's labels is never touched. Its anonymous volumes are ledgered against it first, so a
+// container that fails any other property is removed with them.
+func (e *Engine) verifyCreated(ctx context.Context, rec record, spec ContainerSpec) error {
+	var report containerReport
+
+	found, err := e.read(ctx, request{verb: verbInspect, args: []arg{{val: containerTemplate}, {val: rec.id}}},
+		&report)
+	if err != nil {
+		return err
+	}
+
+	if !found {
+		return fmt.Errorf("%w: container %s is gone right after its create", ErrEngine, rec.id)
+	}
+
+	if report.ID != rec.id || !ours(report.Labels, e.id, rec.kind) {
+		return notOurs(ResourceContainer, rec.id, rec.kind, report.Labels, e.id)
+	}
+
+	anonymous, err := e.ledgerAnonymous(ctx, rec, report, spec)
+	if err == nil {
+		err = verifyContainer(report, e.expect(spec, anonymous))
+	}
+
+	if err != nil {
+		return errors.Join(fmt.Errorf("container %s: %w", rec.name, err), e.removeRecorded(ctx, e.book, rec))
+	}
+
+	return nil
+}
+
+// ledgerAnonymous records every volume of the container that is not one of the spec's named volumes
+// against it, and returns those carrying this check's labels.
+func (e *Engine) ledgerAnonymous(
+	ctx context.Context, rec record, report containerReport, spec ContainerSpec,
+) (map[string]bool, error) {
+	named := map[string]bool{}
+	for _, v := range spec.Volumes {
+		named[v.Volume.name] = true
+	}
+
+	labelled := map[string]bool{}
+
+	for _, m := range report.Mounts {
+		if m.Type != mountVolume || named[m.Name] {
+			continue
+		}
+
+		if err := e.book.note(entry{
+			Seq: e.book.led.next(), Op: opCreated, Type: ResourceVolume, Kind: rec.kind, Name: m.Name, ID: m.Name,
+			Parent: rec.seq,
+		}); err != nil {
+			return nil, err
+		}
+
+		var volume identified
+
+		found, err := e.read(ctx, request{verb: verbVolumeInspect, args: []arg{{val: volumeTemplate}, {val: m.Name}}},
+			&volume)
+		if err != nil {
+			return nil, err
+		}
+
+		labelled[m.Name] = found && ours(volume.Labels, e.id, rec.kind)
+	}
+
+	return labelled, nil
+}
+
+// expect is what verifyContainer holds a created container to.
+func (e *Engine) expect(spec ContainerSpec, anonymous map[string]bool) expectation {
+	x := expectation{
+		binds: map[string]bool{}, named: map[string]bool{}, anonymous: anonymous, networks: map[string]bool{},
+		noNetwork: spec.NoNetwork,
+	}
+
+	for _, m := range spec.Spec.Mounts {
+		if m.Kind == compose.MountBind {
+			x.binds[filepath.Clean(m.Source)] = true
+		}
+	}
+
+	for _, v := range spec.Volumes {
+		x.named[v.Volume.name] = v.ReadOnly
+	}
+
+	for _, rec := range e.book.all() {
+		if rec.typ == ResourceNetwork && rec.state == opVerified {
+			x.networks[rec.name] = true
+		}
+	}
+
+	return x
+}
+
+// CopyIn copies files into a container's filesystem under dir: a tar of regular files only, owned by
+// root unless a file says otherwise. Nothing lands at or under a bind destination of the container,
+// where it would overwrite the host.
+func (e *Engine) CopyIn(ctx context.Context, c *Container, dir string, files []File) error {
+	report, err := e.inspectContainer(ctx, c)
+	if err != nil {
+		return err
+	}
+
+	var binds []string
+
+	for _, m := range report.Mounts {
+		if m.Type == mountBind {
+			binds = append(binds, path.Clean(m.Destination))
+		}
+	}
+
+	if !path.IsAbs(dir) || under(path.Clean(dir), binds) {
+		return fmt.Errorf("%w: copy into %s: at or under a bind", ErrRefused, dir)
+	}
+
+	archive, err := regularFiles(dir, files, binds)
+	if err != nil {
+		return err
+	}
+
+	_, err = e.run.call(ctx, request{verb: verbCopyIn, stdin: archive, args: []arg{{val: c.id + ":" + dir}}})
+
+	return err
+}
+
+// regularFiles writes files as a tar of regular-file entries, refusing a path that escapes dir or
+// lands under a bind.
+func regularFiles(dir string, files []File, binds []string) (io.Reader, error) {
+	var out bytes.Buffer
+
+	writer := tar.NewWriter(&out)
+
+	for _, file := range files {
+		name := path.Clean(file.Path)
+		if !fs.ValidPath(name) || name == "." || under(path.Join(dir, name), binds) {
+			return nil, fmt.Errorf("%w: file %s under %s", ErrRefused, file.Path, dir)
+		}
+
+		header := &tar.Header{
+			Typeflag: tar.TypeReg, Name: name, Mode: int64(file.Mode.Perm()), Uid: file.UID, Gid: file.GID,
+			Size: int64(len(file.Data)), ModTime: time.Unix(0, 0),
+		}
+
+		if err := writer.WriteHeader(header); err != nil {
+			return nil, fmt.Errorf("tar %s: %w", name, err)
+		}
+
+		if _, err := writer.Write(file.Data); err != nil {
+			return nil, fmt.Errorf("tar %s: %w", name, err)
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, fmt.Errorf("tar: %w", err)
+	}
+
+	return &out, nil
+}
+
+// under reports a path at or beneath any of roots.
+func under(p string, roots []string) bool {
+	for _, root := range roots {
+		if p == root || strings.HasPrefix(p, strings.TrimSuffix(root, "/")+"/") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// CopyOut returns the tar stream of a path in a container.
+func (e *Engine) CopyOut(ctx context.Context, c *Container, p string) (io.ReadCloser, error) {
+	if err := e.owns(c); err != nil {
+		return nil, err
+	}
+
+	res, err := e.run.call(ctx, request{verb: verbCopyOut, args: []arg{{val: c.id + ":" + p}}})
+	if err != nil {
+		return nil, err
+	}
+
+	return io.NopCloser(bytes.NewReader(res.out)), nil
 }
 
 // killContainer stops a container b records with SIGKILL, after verifying it is still that one:

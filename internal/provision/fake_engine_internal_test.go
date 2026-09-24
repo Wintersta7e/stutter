@@ -3,6 +3,7 @@
 package provision
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -20,9 +21,13 @@ import (
 
 // fakeObject is one resource the fake engine holds.
 type fakeObject struct {
-	labels   map[string]string
-	volumes  map[string]any
+	labels  map[string]string
+	volumes map[string]any
+	// inspect is a created container's whole inspect, in the container template's shape.
+	inspect  *containerReport
 	env      []string
+	anon     []string
+	copied   []byte
 	id       string
 	name     string
 	subnet   string
@@ -37,7 +42,9 @@ type fakeObject struct {
 type fakeCall struct {
 	verb       string
 	lastLedger string
+	stdin      string
 	argv       []string
+	env        []string
 }
 
 // fakeEngine is a stateful engine: networks with IPAM, volumes, containers and images, each with
@@ -50,6 +57,8 @@ type fakeEngine struct {
 	// hang names verbs whose calls block until their context ends, as a hung engine does.
 	hang    map[string]bool
 	logCall func(callLine)
+	// inspectHook, when set, edits every created container's inspect as the engine reports it.
+	inspectHook func(inspect *containerReport)
 	// registry holds the images a pull can land, by reference.
 	registry    map[string]*fakeObject
 	ledgerPath  string
@@ -142,8 +151,20 @@ func (f *fakeEngine) call(ctx context.Context, req request) (result, error) {
 		argv = append(argv, a.val)
 	}
 
+	var stdin []byte
+
+	if req.stdin != nil {
+		if stdin, err = io.ReadAll(req.stdin); err != nil {
+			return result{}, err
+		}
+
+		req.stdin = bytes.NewReader(stdin)
+	}
+
 	f.mu.Lock()
-	f.calls = append(f.calls, fakeCall{verb: spec.name, argv: argv, lastLedger: f.lastLedgerLine()})
+	f.calls = append(f.calls, fakeCall{
+		verb: spec.name, argv: argv, lastLedger: f.lastLedgerLine(), stdin: string(stdin), env: req.extraEnv,
+	})
 	hung := f.hang[spec.name]
 	f.mu.Unlock()
 
@@ -185,6 +206,9 @@ func (f *fakeEngine) imageAnswers(req request, spec verbSpec, rest []string) (fu
 		verbComposeBuild: func() (result, error) { return f.build(req.stdin) },
 		verbImport:       func() (result, error) { return f.importImage(rest) },
 		verbCommit:       func() (result, error) { return f.commit(spec, rest) },
+		verbCreate:       func() (result, error) { return f.create(req, rest) },
+		verbCopyIn:       func() (result, error) { return f.copyIn(spec, req.stdin, rest) },
+		verbCopyOut:      func() (result, error) { return f.copyOut(spec, rest) },
 	}
 
 	answer, ok := answers[req.verb]
@@ -438,7 +462,18 @@ func (f *fakeEngine) inspect(spec verbSpec, typ ResourceType, refs []string) (re
 			return fail(spec, "No such object: "+ref)
 		}
 
-		line, err := json.Marshal(obj.report(typ))
+		var answer any = obj.report(typ)
+
+		if obj.inspect != nil {
+			report := cloneReport(*obj.inspect)
+			if f.inspectHook != nil {
+				f.inspectHook(&report)
+			}
+
+			answer = report
+		}
+
+		line, err := json.Marshal(answer)
 		if err != nil {
 			return result{}, err
 		}
@@ -489,6 +524,11 @@ func (f *fakeEngine) remove(spec verbSpec, typ ResourceType, refs []string) (res
 		}
 
 		delete(f.objects[typ], obj.id)
+
+		// `rm -v` takes a container's anonymous volumes with it.
+		for _, volume := range obj.anon {
+			delete(f.objects[ResourceVolume], volume)
+		}
 	}
 
 	return result{}, nil
