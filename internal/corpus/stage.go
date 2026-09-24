@@ -193,16 +193,12 @@ func (c *Corpus) Serialise(ctx context.Context, consumer string) error {
 		return fmt.Errorf("open the corpus stream: %w", err)
 	}
 
-	handle, err := stream.Consumer(ctx, consumer)
+	info, err := lookup(ctx, stream, consumer)
 	if err != nil {
 		return fmt.Errorf("find consumer %q: %w", consumer, err)
 	}
 
-	info, err := handle.Info(ctx)
-	if err != nil {
-		return fmt.Errorf("read consumer %q: %w", consumer, err)
-	}
-
+	// Every other field is written back as read, a push consumer's deliver subject included.
 	config := info.Config
 	config.MaxAckPending = 1
 
@@ -211,6 +207,27 @@ func (c *Corpus) Serialise(ctx context.Context, consumer string) error {
 	}
 
 	return nil
+}
+
+// lookup reads a consumer's configuration whatever its kind. The client hands out pull and push
+// consumers through separate calls, each refusing the other kind, and a service under test may use
+// either.
+func lookup(ctx context.Context, stream jetstream.Stream, consumer string) (*jetstream.ConsumerInfo, error) {
+	pull, err := stream.Consumer(ctx, consumer)
+	if err == nil {
+		return pull.CachedInfo(), nil
+	}
+
+	if !errors.Is(err, jetstream.ErrNotPullConsumer) {
+		return nil, fmt.Errorf("look up a pull consumer: %w", err)
+	}
+
+	push, err := stream.PushConsumer(ctx, consumer)
+	if err != nil {
+		return nil, fmt.Errorf("look up a push consumer: %w", err)
+	}
+
+	return push.CachedInfo(), nil
 }
 
 // streamConfig is the corpus stream's shape, in one place so a staged stream is identical to the one

@@ -234,6 +234,58 @@ func TestASerialisedConsumerHasOneMessageInFlight(t *testing.T) {
 	}
 }
 
+// TestSerialiseFindsAPushConsumer: a service may consume through a push consumer, and one message in
+// flight matters just as much there. The pull-only lookup refused it with "consumer is not a pull
+// consumer", so a push target was never held to one message in flight.
+func TestSerialiseFindsAPushConsumer(t *testing.T) {
+	t.Parallel()
+
+	const deliverTo = "deliver.pushed"
+
+	store := stocked(t)
+
+	connection, err := nats.Connect(store.URL())
+	if err != nil {
+		t.Fatalf("nats.Connect() error = %v", err)
+	}
+
+	t.Cleanup(connection.Close)
+
+	stream, err := jetstream.New(connection)
+	if err != nil {
+		t.Fatalf("jetstream.New() error = %v", err)
+	}
+
+	_, err = stream.CreateOrUpdatePushConsumer(t.Context(), corpus.StreamName, jetstream.ConsumerConfig{
+		Durable:        "pushed",
+		DeliverSubject: deliverTo,
+		AckPolicy:      jetstream.AckExplicitPolicy,
+		MaxAckPending:  100,
+	})
+	if err != nil {
+		t.Fatalf("CreateOrUpdatePushConsumer() error = %v", err)
+	}
+
+	if err = store.Serialise(t.Context(), "pushed"); err != nil {
+		t.Fatalf("Serialise() error = %v", err)
+	}
+
+	pushed, err := stream.PushConsumer(t.Context(), corpus.StreamName, "pushed")
+	if err != nil {
+		t.Fatalf("PushConsumer() error = %v — serialising turned it into something else", err)
+	}
+
+	config := pushed.CachedInfo().Config
+
+	if config.MaxAckPending != 1 {
+		t.Errorf("MaxAckPending = %d, want 1", config.MaxAckPending)
+	}
+
+	if config.DeliverSubject != deliverTo {
+		t.Errorf("DeliverSubject = %q, want %q unchanged", config.DeliverSubject, deliverTo)
+	}
+}
+
 // fetched pulls once and counts what arrived. A paused consumer must look idle, not broken, so an
 // error here fails the test rather than counting as nothing.
 func fetched(t *testing.T, consumer jetstream.Consumer) int {
