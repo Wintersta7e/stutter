@@ -65,9 +65,20 @@ func (s system) run(ctx context.Context, args []string, stdout, stderr io.Writer
 		}
 
 		return s.verify(ctx, verify, stdout, stderr)
+	case modeCopy:
+		copied, err := ParseCopy(args)
+		if err != nil {
+			return report(stderr, exitArgv, err)
+		}
+
+		if err := copyTree(copied.Src, copied.Dst); err != nil {
+			return report(stderr, exitFailure, err)
+		}
+
+		return 0
 	default:
 		return report(stderr, exitArgv,
-			fmt.Errorf("%w: unknown mode %q, want %s or %s", errArgv, mode, modeServe, modeVerify))
+			fmt.Errorf("%w: unknown mode %q, want %s, %s or %s", errArgv, mode, modeServe, modeVerify, modeCopy))
 	}
 }
 
