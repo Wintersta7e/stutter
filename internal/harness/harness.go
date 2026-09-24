@@ -351,11 +351,21 @@ func (s *Sandbox) advertise(addr string) string {
 }
 
 // egress is the proxies standing in front of the service's dependencies.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type egress struct {
 	httpRun *httpproxy.Run
 	served  chan error
-	at      Addresses
-	closers []func(context.Context) error
+	// attached is the start's hold on the invocation listeners; nil on the Go-caller path.
+	attached *attachment
+	at       Addresses
+	closers  []entryCloser
+}
+
+// entryCloser tears down one proxy, under the endpoint key it serves.
+type entryCloser struct {
+	close func(context.Context) error
+	key   string
 }
 
 // start registers a proxy and begins serving it. A Serve that fails is reported under key, the
@@ -369,7 +379,7 @@ func (e *egress) start(
 	closer func(context.Context) error,
 	serve func(context.Context) error,
 ) {
-	e.closers = append(e.closers, closer)
+	e.closers = append(e.closers, entryCloser{close: closer, key: key})
 
 	go func() {
 		err := serve(ctx)
@@ -405,12 +415,17 @@ func (e *egress) settle(ctx context.Context, runErr error) error {
 }
 
 // close tears the proxies down. A proxy that died mid-run would otherwise present as a handler that
-// simply stopped producing effects, so its error is surfaced rather than discarded.
+// simply stopped producing effects, so its error is surfaced rather than discarded. A start on the
+// invocation listeners detaches from them, within the drain bound.
 func (e *egress) close(ctx context.Context) error {
 	var err error
 
-	for _, closer := range e.closers {
-		err = errors.Join(err, closer(ctx))
+	if e.attached != nil {
+		err = e.detach(ctx)
+	} else {
+		for _, entry := range e.closers {
+			err = errors.Join(err, entry.close(ctx))
+		}
 	}
 
 	for range len(e.closers) {
@@ -423,6 +438,10 @@ func (e *egress) close(ctx context.Context) error {
 // observe puts a proxy in front of each dependency, all recording into the same sink so one
 // ordered effect sequence covers the whole run.
 func (s *Sandbox) observe(ctx context.Context, sink *effect.Recorder, bus natsproxy.Options) (*egress, error) {
+	if s.cfg.Listeners != nil {
+		return s.observeRelayed(ctx, sink, bus)
+	}
+
 	observed := &egress{
 		served: make(chan error, s.proxyCount()),
 		at:     Addresses{Opaque: make(map[string]string, len(s.cfg.Opaque))},

@@ -70,6 +70,8 @@ type endpoint struct {
 type ListenerSet struct {
 	// authority is the one certificate authority every consumer check's TLS stub presents.
 	authority *authority
+	// attached is the start the set hands connections to, nil between starts.
+	attached  *attachment
 	endpoints map[string]*endpoint
 	// conns are the connections whose preamble is still being read, closed with the set.
 	conns map[net.Conn]struct{}
@@ -338,25 +340,35 @@ func (s *ListenerSet) accept(opened *endpoint) {
 	}
 }
 
-// admit checks one connection's preamble and decides what becomes of it.
+// admit checks one connection's preamble and decides what becomes of it: a stranger is closed and
+// counted, a probe is answered, and a relayed connection goes to the attached start — or, between
+// starts, is closed and counted.
 func (s *ListenerSet) admit(opened *endpoint, conn net.Conn) {
-	defer s.release(conn)
-
 	relayed, err := relay.Accept(conn, s.cfg.Token)
+
+	s.forget(conn)
+
 	if err != nil || !opened.accepts(relayed.DestinationPort()) {
 		s.foreign.Add(1)
 
+		_ = conn.Close()
+
 		return
 	}
 
-	if opened.key == KeyVerify {
+	switch attached := s.current(); {
+	case opened.key == KeyVerify:
 		// The probe is judged by its answer; one that goes astray is the verifier's to report.
 		_ = relay.WriteAck(relayed) //nolint:errcheck // see above.
+	case attached != nil && opened.key != KeyDNSSignal:
+		attached.take(opened.key, relayed)
 
 		return
+	default:
+		s.unattached.Add(1)
 	}
 
-	s.unattached.Add(1)
+	_ = conn.Close()
 }
 
 // track registers a connection whose preamble is being read, or closes it when the set is closing.
@@ -375,13 +387,13 @@ func (s *ListenerSet) track(conn net.Conn) bool {
 	return true
 }
 
-// release forgets a connection and closes it.
-func (s *ListenerSet) release(conn net.Conn) {
+// forget stops tracking a connection once its preamble has been read: from then on it is closed where
+// it is decided, or handed to the attached start, which owns it.
+func (s *ListenerSet) forget(conn net.Conn) {
 	s.mu.Lock()
-	delete(s.conns, conn)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
 
-	_ = conn.Close()
+	delete(s.conns, conn)
 }
 
 // advertised is the verified address containers dial the listeners at; zero before verification.

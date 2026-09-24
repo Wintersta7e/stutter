@@ -94,17 +94,20 @@ func dialKey(t *testing.T, set *ListenerSet, key string, token relay.Token, port
 func awaitCounts(t *testing.T, set *ListenerSet, want ListenerCounts) {
 	t.Helper()
 
+	if got := settleCounts(set, want); got != want {
+		t.Fatalf("counts = %+v, want %+v", got, want)
+	}
+}
+
+// settleCounts waits up to setWait for the set's counts to reach want, and returns them either way.
+func settleCounts(set *ListenerSet, want ListenerCounts) ListenerCounts {
 	deadline := time.Now().Add(setWait)
 
-	for time.Now().Before(deadline) {
-		if set.Counts() == want {
-			return
-		}
-
+	for time.Now().Before(deadline) && set.Counts() != want {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	t.Fatalf("counts = %+v, want %+v", set.Counts(), want)
+	return set.Counts()
 }
 
 // TestTheListenerSetOpensEveryKeyOnBindHost holds the set to one listener per key, every one on the
