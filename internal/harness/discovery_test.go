@@ -912,9 +912,13 @@ func TestAFailedServiceRemovalIsASetupError(t *testing.T) {
 	store, checkpoint := newBus(t, withOrders(t))
 	service := &fakeService{script: idleAfter(reserve), closeErr: errRemovalFailed}
 
-	if _, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service)); !errors.Is(
-		err, errRemovalFailed) {
+	_, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	if !errors.Is(err, errRemovalFailed) {
 		t.Fatalf("Discover() error = %v, want it to wrap %v", err, errRemovalFailed)
+	}
+
+	if got := strings.Count(err.Error(), "discovery"); got != 1 {
+		t.Errorf("error %q names discovery %d times, want once", err, got)
 	}
 }
 

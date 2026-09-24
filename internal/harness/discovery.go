@@ -194,7 +194,7 @@ func (b *bare) quiet() time.Duration {
 func (b *bare) discard(ctx context.Context) (replay.Exit, error) {
 	exit, err := b.service.Close(ctx)
 	if err != nil {
-		err = fmt.Errorf("%s: close the service under test: %w", b.stage, err)
+		err = fmt.Errorf("close the service under test: %w", err)
 	}
 
 	return exit, errors.Join(err, b.observed.close(ctx), b.observed.httpRun.Abort())
