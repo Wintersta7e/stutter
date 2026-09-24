@@ -315,18 +315,27 @@ type egress struct {
 	closers []func(context.Context) error
 }
 
-// start registers a proxy and begins serving it.
+// start registers a proxy and begins serving it. A Serve that fails is reported under key, the
+// endpoint it stands in front of, so an unreachable dependency is named rather than merely noticed.
 //
 // Registering as each listener opens, rather than after all of them are up, is what lets a failure
 // half way through tear down the ones already running.
 func (e *egress) start(
 	ctx context.Context,
+	key string,
 	closer func(context.Context) error,
 	serve func(context.Context) error,
 ) {
 	e.closers = append(e.closers, closer)
 
-	go func() { e.served <- serve(ctx) }()
+	go func() {
+		err := serve(ctx)
+		if err != nil {
+			err = fmt.Errorf("%s: %w", key, err)
+		}
+
+		e.served <- err
+	}()
 }
 
 // settle tears the proxies down and decides the run's fate.
@@ -431,7 +440,7 @@ func (s *Sandbox) observeBus(
 		return fmt.Errorf("listen in front of the bus: %w", err)
 	}
 
-	observed.start(ctx, ignoringContext(bus.Close), bus.Serve)
+	observed.start(ctx, KeyBus, ignoringContext(bus.Close), bus.Serve)
 	observed.at.NATS = "nats://" + s.advertise(bus.Addr())
 
 	return nil
@@ -447,7 +456,7 @@ func (s *Sandbox) observeDatabase(ctx context.Context, sink *effect.Recorder, ob
 		return fmt.Errorf("listen in front of the database: %w", err)
 	}
 
-	observed.start(ctx, ignoringContext(postgres.Close), postgres.Serve)
+	observed.start(ctx, keyDatabase, ignoringContext(postgres.Close), postgres.Serve)
 
 	proxied, err := rewriteHost(s.cfg.PostgresDSN, s.advertise(postgres.Addr()))
 	if err != nil {
@@ -472,7 +481,7 @@ func (s *Sandbox) observeHTTP(ctx context.Context, sink *effect.Recorder, observ
 		return fmt.Errorf("listen for HTTP egress: %w", err)
 	}
 
-	observed.start(ctx, proxy.CloseContext, proxy.Serve)
+	observed.start(ctx, KeyHTTP, proxy.CloseContext, proxy.Serve)
 
 	if s.certificates == nil {
 		observed.at.HTTP = "http://" + s.advertise(proxy.Addr())
@@ -520,7 +529,7 @@ func (s *Sandbox) observeOpaque(ctx context.Context, sink *effect.Recorder, obse
 			return fmt.Errorf("listen in front of %q: %w", name, err)
 		}
 
-		observed.start(ctx, ignoringContext(proxy.Close), proxy.Serve)
+		observed.start(ctx, name, ignoringContext(proxy.Close), proxy.Serve)
 		observed.at.Opaque[name] = s.advertise(proxy.Addr())
 	}
 

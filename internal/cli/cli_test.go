@@ -2,7 +2,9 @@ package cli_test
 
 import (
 	"bytes"
+	"net"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -128,6 +130,38 @@ func TestRelayIsAHiddenCommand(t *testing.T) {
 
 	if strings.Contains(got.stderr, "unknown command") {
 		t.Errorf("relay was not dispatched: %s", got.stderr)
+	}
+}
+
+// TestAClosedDatabasePortIsASetupError keeps an unreachable database a setup error that names where it
+// was looked for, never a verdict.
+func TestAClosedDatabasePortIsASetupError(t *testing.T) {
+	t.Parallel()
+
+	var config net.ListenConfig
+
+	// Above the kernel's source-port range, so no socket another test opens takes it meanwhile.
+	closed := ""
+
+	for port := 65500; port < 65600 && closed == ""; port++ {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+
+		listener, err := config.Listen(t.Context(), "tcp4", addr)
+		if err == nil {
+			_ = listener.Close()
+			closed = addr
+		}
+	}
+
+	got := run(t, "check", "--postgres", "postgres://u:p@"+closed+"/db")
+
+	if got.code != 3 {
+		t.Errorf("exit = %d, want 3 (stderr: %s)", got.code, got.stderr)
+	}
+
+	// A setup failure is rendered in the report, on stdout, like any other outcome.
+	if !strings.Contains(got.stdout+got.stderr, closed) {
+		t.Errorf("the output does not name %s:\nstdout: %s\nstderr: %s", closed, got.stdout, got.stderr)
 	}
 }
 
