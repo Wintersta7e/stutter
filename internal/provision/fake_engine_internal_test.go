@@ -52,6 +52,8 @@ type fakeEngine struct {
 	nextID      int
 	mu          sync.Mutex
 	unreachable bool
+	// readOnly refuses mutating calls, as a runner attached read-only does.
+	readOnly bool
 }
 
 func newFakeEngine() *fakeEngine {
@@ -60,8 +62,8 @@ func newFakeEngine() *fakeEngine {
 	}}
 }
 
-func (f *fakeEngine) attach(configDir string, logCall func(callLine)) {
-	f.configDir, f.logCall = configDir, logCall
+func (f *fakeEngine) attach(configDir string, logCall func(callLine), mutable bool) {
+	f.configDir, f.logCall, f.readOnly = configDir, logCall, !mutable
 }
 
 // add puts an object into the engine as another party would, returning its ID.
@@ -145,6 +147,11 @@ func (f *fakeEngine) call(ctx context.Context, req request) (result, error) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.readOnly && spec.mutates {
+		return result{}, fmt.Errorf("%w: the %s call mutates the engine, and this runner is read-only",
+			ErrEngine, spec.name)
+	}
 
 	if f.unreachable {
 		return fail(spec, "Cannot connect to the Docker daemon")

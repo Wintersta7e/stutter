@@ -623,13 +623,18 @@ func (r *execRunner) record(spec verbSpec, typed []arg, res result, sink *stderr
 	}
 }
 
-// attach hands the runner the check's private client configuration and invocation log, flushes the
-// lines that waited for the log, and lets the runner mutate the engine from now on.
-func (r *execRunner) attach(configDir string, logCall func(callLine)) {
-	r.configDir, r.logCall, r.mutable = configDir, logCall, true
+// attach hands the runner its client configuration directory and invocation log, flushes the
+// lines that waited for the log, and says whether it may mutate the engine from now on. A nil log
+// discards every line.
+func (r *execRunner) attach(configDir string, logCall func(callLine), mutable bool) {
+	r.configDir, r.logCall, r.mutable = configDir, logCall, mutable
+
+	if logCall == nil {
+		r.logCall = func(callLine) {}
+	}
 
 	for _, line := range r.pending {
-		logCall(line)
+		r.logCall(line)
 	}
 
 	r.pending = nil

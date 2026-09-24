@@ -30,7 +30,7 @@ func (f *fakeCaller) call(_ context.Context, req request) (result, error) {
 	return f.answer(req)
 }
 
-func (f *fakeCaller) attach(configDir string, logCall func(callLine)) {
+func (f *fakeCaller) attach(configDir string, logCall func(callLine), _ bool) {
 	f.configDir, f.logCall = configDir, logCall
 }
 

@@ -23,10 +23,10 @@ type Options struct {
 }
 
 // engineCaller is a caller that can be handed the check's private client configuration and its
-// invocation log once they exist.
+// invocation log once they exist, and told whether it may change the engine from then on.
 type engineCaller interface {
 	caller
-	attach(configDir string, logCall func(callLine))
+	attach(configDir string, logCall func(callLine), mutable bool)
 }
 
 // openDeps is what Open reads from the host, as fields so tests can stand in for the engine.
@@ -185,7 +185,7 @@ func (e *Engine) prepare() error {
 		return err
 	}
 
-	e.run.attach(filepath.Join(e.private, dockerConfigDir), e.log.call)
+	e.run.attach(filepath.Join(e.private, dockerConfigDir), e.log.call, true)
 
 	return nil
 }

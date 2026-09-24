@@ -207,17 +207,9 @@ func (h hostFS) private(path string) error {
 // and local. given overrides the default: $XDG_STATE_HOME/stutter/checks when that is absolute,
 // else $HOME/.local/state/stutter/checks.
 func stateDir(given string, env []string, host hostFS) (string, error) {
-	dir := given
-
-	if dir == "" {
-		switch xdg, home := lookupEnv(env, "XDG_STATE_HOME"), lookupEnv(env, "HOME"); {
-		case filepath.IsAbs(xdg):
-			dir = filepath.Join(xdg, "stutter", "checks")
-		case filepath.IsAbs(home):
-			dir = filepath.Join(home, ".local", "state", "stutter", "checks")
-		default:
-			return "", fmt.Errorf("%w: neither XDG_STATE_HOME nor HOME is an absolute path", ErrStateDir)
-		}
+	dir, err := statePath(given, env)
+	if err != nil {
+		return "", err
 	}
 
 	if err := os.MkdirAll(dir, privateMode); err != nil {
@@ -229,6 +221,22 @@ func stateDir(given string, env []string, host hostFS) (string, error) {
 	}
 
 	return dir, nil
+}
+
+// statePath is where the check ledgers live, without creating anything.
+func statePath(given string, env []string) (string, error) {
+	if given != "" {
+		return given, nil
+	}
+
+	switch xdg, home := lookupEnv(env, "XDG_STATE_HOME"), lookupEnv(env, "HOME"); {
+	case filepath.IsAbs(xdg):
+		return filepath.Join(xdg, "stutter", "checks"), nil
+	case filepath.IsAbs(home):
+		return filepath.Join(home, ".local", "state", "stutter", "checks"), nil
+	default:
+		return "", fmt.Errorf("%w: neither XDG_STATE_HOME nor HOME is an absolute path", ErrStateDir)
+	}
 }
 
 // ledger is a check's own ledger file, locked for the life of the process.
@@ -425,8 +433,15 @@ func newBook(led *ledger, check string) *book {
 	return &book{led: led, check: check, records: map[int]*record{}}
 }
 
-// note appends one entry, synced, and folds it.
+// note appends one entry, synced, and folds it. A book with no ledger — the resources clean finds
+// by the exact label the user typed, which no ledger here names — only folds.
 func (b *book) note(e entry) error {
+	if b.led == nil {
+		b.fold(e)
+
+		return nil
+	}
+
 	if err := b.led.append(e); err != nil {
 		return err
 	}

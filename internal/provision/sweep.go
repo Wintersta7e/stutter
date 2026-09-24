@@ -7,7 +7,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
@@ -291,17 +290,13 @@ func listedOf(rec record, check string) Listed {
 // remain. The path comes from the ledger, so it is re-validated first: absolute, named for that
 // check, and a private directory of this user — otherwise it is left untouched and reported.
 func (e *Engine) reducePrivate(b *book) (bool, error) {
-	path := b.led.header.PrivateDir
-	if !filepath.IsAbs(path) || filepath.Base(path) != "stutter-"+b.check {
-		return false, fmt.Errorf("%w: %s", errNotItsRoot, path)
+	path, exists, err := e.recordedPrivate(b)
+	if err != nil {
+		return false, err
 	}
 
-	if _, err := e.host.lstat(path); errors.Is(err, fs.ErrNotExist) {
+	if !exists {
 		return false, b.hostPathGone(path)
-	}
-
-	if err := e.host.private(path); err != nil {
-		return false, fmt.Errorf("%w: %s: %w", ErrPrivateDir, path, err)
 	}
 
 	if err := reduceToLogs(path); err != nil {
@@ -317,6 +312,26 @@ func (e *Engine) reducePrivate(b *book) (bool, error) {
 	}
 
 	return false, b.hostPathGone(path)
+}
+
+// recordedPrivate re-validates the private directory another check's ledger records: absolute,
+// named for that check, and — when it exists — a private directory of this user on a local
+// filesystem.
+func (e *Engine) recordedPrivate(b *book) (string, bool, error) {
+	path := b.led.header.PrivateDir
+	if !filepath.IsAbs(path) || filepath.Base(path) != "stutter-"+b.check {
+		return path, false, fmt.Errorf("%w: %s", errNotItsRoot, path)
+	}
+
+	if _, err := e.host.lstat(path); errors.Is(err, fs.ErrNotExist) {
+		return path, false, nil
+	}
+
+	if err := e.host.private(path); err != nil {
+		return path, false, fmt.Errorf("%w: %s: %w", ErrPrivateDir, path, err)
+	}
+
+	return path, true, nil
 }
 
 // reduceToLogs removes every entry of a private directory but the invocation log and the logs
@@ -377,16 +392,27 @@ func (e *Engine) deleteFreeTemps(dir string) int {
 
 // listUnledgered lists every resource carrying the check label whose check has no ledger here.
 func (e *Engine) listUnledgered(ctx context.Context, ledgered map[string]bool, result *SweepResult) {
-	items, err := e.listLabelled(ctx, rules.LabelCheck)
+	unledgered, err := e.unledgered(ctx, ledgered)
 	if err != nil {
 		result.Failed = append(result.Failed, Listed{Name: "listing: " + err.Error()})
 	}
 
+	result.Unledgered = unledgered
+}
+
+// unledgered groups, by check ID, every resource carrying the check label whose check has no
+// ledger here.
+func (e *Engine) unledgered(ctx context.Context, ledgered map[string]bool) (map[string][]Listed, error) {
+	items, err := e.listLabelled(ctx, rules.LabelCheck)
+	out := map[string][]Listed{}
+
 	for _, item := range items {
 		if !ledgered[item.Check] {
-			result.Unledgered[item.Check] = append(result.Unledgered[item.Check], item)
+			out[item.Check] = append(out[item.Check], item)
 		}
 	}
+
+	return out, err
 }
 
 // listing is how one resource type is listed by label.
@@ -470,11 +496,8 @@ func (e *Engine) decodeListing(ctx context.Context, typ ResourceType, out []byte
 			item.Type = ResourceAnonymousVolume
 		}
 
+		// One line per tag: each reference is listed, and removed, on its own.
 		if typ == ResourceImage {
-			if slices.ContainsFunc(items, func(seen Listed) bool { return seen.ID == report.ID }) {
-				continue
-			}
-
 			if err := e.imageLabels(ctx, &item, report.Tag); err != nil {
 				return items, err
 			}
