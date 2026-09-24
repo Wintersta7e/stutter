@@ -26,18 +26,16 @@ func TestAClosedLedgerIsFreeWhileChildrenSpawn(t *testing.T) {
 		spawned  atomic.Int64
 	)
 
-	for range 1 {
-		spawners.Go(func() {
-			for ctx.Err() == nil {
-				_, err := runner.call(ctx, request{verb: verbInfo, args: []arg{{val: infoTemplate}}})
-				if err == nil {
-					spawned.Add(1)
-				} else if ctx.Err() == nil {
-					t.Errorf("spawn: %v", err)
-				}
+	spawners.Go(func() {
+		for ctx.Err() == nil {
+			_, err := runner.call(ctx, request{verb: verbInfo, args: []arg{{val: infoTemplate}}})
+			if err == nil {
+				spawned.Add(1)
+			} else if ctx.Err() == nil {
+				t.Errorf("spawn: %v", err)
 			}
-		})
-	}
+		}
+	})
 
 	const trials = 100
 
