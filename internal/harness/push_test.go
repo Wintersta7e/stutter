@@ -70,13 +70,16 @@ func startPushed(ctx context.Context, at harness.Addresses, config policy.Config
 		return nil, fmt.Errorf("open jetstream: %w", err)
 	}
 
+	// The consumer is the configuration the check was handed, which is what legality is read from.
 	if _, err := stream.CreateOrUpdatePushConsumer(ctx, corpus.StreamName, jetstream.ConsumerConfig{
 		Durable:        observedConsumer,
 		DeliverSubject: pushSubject,
+		FilterSubjects: config.FilterSubjects,
 		AckPolicy:      jetstream.AckExplicitPolicy,
 		AckWait:        config.AckWait,
+		BackOff:        config.BackOff,
 		MaxDeliver:     config.MaxDeliver,
-		MaxAckPending:  pushBatch,
+		MaxAckPending:  config.MaxAckPending,
 	}); err != nil {
 		return nil, fmt.Errorf("create the push consumer: %w", err)
 	}
@@ -152,9 +155,12 @@ func TestAPushConsumerIsHeldToOneMessageInFlight(t *testing.T) {
 
 	var service *pushed
 
-	built, _ := quirkySandbox(t, observedConfig(), quirks{}, func(settings *harness.Config) {
+	config := observedConfig()
+	config.MaxAckPending = pushBatch
+
+	built, _ := quirkySandbox(t, config, quirks{}, func(settings *harness.Config) {
 		settings.Start = func(ctx context.Context, at harness.Addresses) (harness.Consumer, error) {
-			started, err := startPushed(ctx, at, observedConfig())
+			started, err := startPushed(ctx, at, config)
 			if err != nil {
 				return nil, err
 			}

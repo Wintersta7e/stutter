@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -25,10 +26,11 @@ const (
 	argvLogVar = "STUTTER_SHIM_ARGV"
 )
 
-// engineAnswers is what a docker shim prints for each precondition call.
+// engineAnswers is what a docker shim prints for each precondition call. extra holds further case
+// arms, for the calls a test makes after the preconditions.
 type engineAnswers struct {
-	context, version, info string
-	versionExit            int
+	context, version, info, extra string
+	versionExit                   int
 }
 
 func healthyAnswers() engineAnswers {
@@ -44,16 +46,23 @@ func (a engineAnswers) script() string {
 		"context) printf '%s\\n' '" + a.context + "' ;;\n" +
 		"version) printf '%s\\n' '" + a.version + "'; exit " + strconv.Itoa(a.versionExit) + " ;;\n" +
 		"info) printf '%s\\n' '" + a.info + "' ;;\n" +
+		a.extra +
 		"*) exit 64 ;;\n" +
 		"esac\n"
 }
 
-// writeShim writes an executable `docker` script into dir.
+// writeShim writes an executable `docker` script into dir. It holds the fork lock while the file is
+// open for writing: a child another parallel test forks meanwhile would inherit the descriptor until
+// it execs, and executing the shim then fails with "text file busy".
 func writeShim(t *testing.T, dir, script string) {
 	t.Helper()
 
+	syscall.ForkLock.Lock()
 	//nolint:gosec // a test shim must be executable to stand in for the docker CLI.
-	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+	err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755)
+	syscall.ForkLock.Unlock()
+
+	if err != nil {
 		t.Fatalf("write shim: %v", err)
 	}
 }

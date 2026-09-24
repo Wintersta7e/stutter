@@ -136,9 +136,10 @@ type Config struct {
 	Policy policy.Config
 	// Quiesce is how long an attribution window stays open after a handler returns.
 	Quiesce time.Duration
-	// Drain is how long an observed run waits for the bus to stay silent before calling the corpus
-	// drained. Zero derives one from the recorded configuration's redelivery deadlines. It is unused
-	// when Stutter dispatches, because there the driver knows when it has stopped delivering.
+	// Drain lengthens how long an observed run waits in silence for messages still owed. Zero derives
+	// the floor from Policy's redelivery deadlines (DrainFloor); a value below the floor is refused, so
+	// the wait can only be lengthened. It is unused when Stutter dispatches, because there the driver
+	// knows when it has stopped delivering.
 	Drain time.Duration
 	// Startup is how long a service that consumes for itself may take to create a consumer on the
 	// corpus stream before the corpus is published regardless. Zero uses DefaultStartup.
@@ -175,6 +176,10 @@ func New(cfg Config) (*Sandbox, error) {
 		return nil, errNoService
 	}
 
+	if floor := DrainFloor(cfg.Policy, cfg.Quiesce); cfg.Start != nil && cfg.Drain > 0 && cfg.Drain < floor {
+		return nil, fmt.Errorf("%w: Drain %s is below the floor of %s", ErrDrainBelowFloor, cfg.Drain, floor)
+	}
+
 	var upstream string
 
 	if cfg.PostgresDSN != "" {
@@ -207,6 +212,27 @@ func New(cfg Config) (*Sandbox, error) {
 		certificates: certificates,
 		upstream:     upstream,
 	}, nil
+}
+
+// Timings are the waits a sandbox's observed runs use, as the values in force: a default where nothing
+// was set, never a zero.
+type Timings struct {
+	// Startup is how long a service may take to create its consumer.
+	Startup time.Duration
+	// Quiesce is how long an attribution window stays open after a handler's last word.
+	Quiesce time.Duration
+	// Drain is the owed-silence limit's static part: Config.Drain, or the floor Policy derives.
+	Drain time.Duration
+}
+
+// Timings reports the waits this sandbox's observed runs use.
+func (s *Sandbox) Timings() Timings {
+	drain := s.cfg.Drain
+	if drain <= 0 {
+		drain = DrainFloor(s.cfg.Policy, s.cfg.Quiesce)
+	}
+
+	return Timings{Startup: s.startupLimit(), Quiesce: s.quiesce(), Drain: drain}
 }
 
 // Reset returns the service's dependencies to the starting position.
@@ -308,11 +334,15 @@ func (s *Sandbox) advertise(addr string) string {
 }
 
 // egress is the proxies standing in front of the service's dependencies.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
 type egress struct {
 	httpRun *httpproxy.Run
 	served  chan error
 	at      Addresses
 	closers []func(context.Context) error
+	// taken counts the Serve results a wait took before teardown: the proxies that stopped early.
+	taken int
 }
 
 // start registers a proxy and begins serving it.
@@ -354,6 +384,9 @@ func (e *egress) settle(ctx context.Context, runErr error) error {
 
 // close tears the proxies down. A proxy that died mid-run would otherwise present as a handler that
 // simply stopped producing effects, so its error is surfaced rather than discarded.
+//
+// Only the results still to come are drained: one a wait took early already ended that wait, and is
+// the run's error.
 func (e *egress) close(ctx context.Context) error {
 	var err error
 
@@ -361,7 +394,7 @@ func (e *egress) close(ctx context.Context) error {
 		err = errors.Join(err, closer(ctx))
 	}
 
-	for range len(e.closers) {
+	for range len(e.closers) - e.taken {
 		err = errors.Join(err, <-e.served)
 	}
 

@@ -82,13 +82,20 @@ func (s *Sandbox) Holds() []FillHold {
 // A handler that publishes into its own stream would otherwise land inside the corpus's numbering. The
 // hold is timed from the moment it opens; past its bound the run stops at once, without waiting for
 // the rest of the corpus to be published. Every hold is recorded, stopped or not.
-func (s *Sandbox) fill(ctx context.Context, run *observedRun, target string, messages []corpus.Message) error {
+func (s *Sandbox) fill(
+	ctx context.Context,
+	run *observedRun,
+	target string,
+	messages []corpus.Message,
+	admitted int,
+) error {
 	held, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
 	run.hold.begin(target, s.cfg.Policy.Deadline(1), cancel)
+	run.publishing()
 
-	err := s.publish(held, run, target, messages)
+	err := s.publish(held, run, target, messages, admitted)
 
 	record := run.hold.end()
 	record.Messages = len(messages)
@@ -114,7 +121,13 @@ func (s *Sandbox) fill(ctx context.Context, run *observedRun, target string, mes
 //
 // The translation is installed before the first publish: the proxy notes a delivery as it reads it,
 // and a service consuming for itself is handed a message before Fill hears back where it landed.
-func (s *Sandbox) publish(ctx context.Context, run *observedRun, target string, messages []corpus.Message) error {
+func (s *Sandbox) publish(
+	ctx context.Context,
+	run *observedRun,
+	target string,
+	messages []corpus.Message,
+	admitted int,
+) error {
 	first, err := s.cfg.Corpus.Next(ctx)
 	if err != nil {
 		return fmt.Errorf("number the corpus: %w", err)
@@ -132,7 +145,7 @@ func (s *Sandbox) publish(ctx context.Context, run *observedRun, target string, 
 		return nil
 	}
 
-	return s.pending(ctx, target, messages)
+	return s.pending(ctx, target, admitted)
 }
 
 // pending checks the consumer under test has exactly the run's messages its filter admits still to be
@@ -141,13 +154,11 @@ func (s *Sandbox) publish(ctx context.Context, run *observedRun, target string, 
 // A stream limit or age can discard a staged message, and a delivery policy can skip one, before the
 // service is ever handed it; a run over part of the corpus reads as a handler that did less. Messages
 // already in the stream would reach it beside the corpus. Either way the run stops, saying which.
-func (s *Sandbox) pending(ctx context.Context, target string, messages []corpus.Message) error {
-	count, filters, err := s.cfg.Corpus.Pending(ctx, target)
+func (s *Sandbox) pending(ctx context.Context, target string, want int) error {
+	count, _, err := s.cfg.Corpus.Pending(ctx, target)
 	if err != nil {
 		return fmt.Errorf("read what consumer %q has pending: %w", target, err)
 	}
-
-	want := len(corpus.Admitted(messages, filters))
 
 	if count < want {
 		count, err = caughtUp(ctx, count, want, func(ctx context.Context) (int, error) {

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ackPrefix opens every JetStream acknowledgement subject.
@@ -17,6 +18,15 @@ const ackInProgress = "+WPI"
 
 // ackNegative asks the server to redeliver the message now.
 const ackNegative = "-NAK"
+
+// The payloads that settle a message, as the server matches them: the first two exactly, the last two
+// by prefix.
+const (
+	ackPositive = "+ACK"
+	ackOK       = "+OK"
+	ackNext     = "+NXT"
+	ackTerm     = "+TERM"
+)
 
 // Acknowledgement subjects come in two shapes. Both end with the same seven fields; the longer one
 // carries a domain and an account hash in front of them.
@@ -68,6 +78,51 @@ func (a Ack) InProgress() bool {
 // duration, and one with a delay refuses the delivery exactly as a bare one does.
 func (a Ack) Negative() bool {
 	return strings.HasPrefix(string(a.Payload), ackNegative)
+}
+
+// Settles reports whether the acknowledgement settles the message, exactly as the server decides it
+// (nats-server v2.14.6, server/consumer.go, processAck): an empty payload, "+ACK" or "+OK" exactly, or
+// anything opening "+NXT" or "+TERM". A payload the server does not match — "+ACK " with a trailing
+// space, say — is ignored by it and leaves the message owed, so it settles nothing here either.
+func (a Ack) Settles() bool {
+	payload := string(a.Payload)
+
+	return payload == "" || payload == ackPositive || payload == ackOK ||
+		strings.HasPrefix(payload, ackNext) || strings.HasPrefix(payload, ackTerm)
+}
+
+// NakDelay is how long a NAK asks the server to wait before redelivering, parsed as the server parses
+// it (server/consumer.go, processNak): the argument after "-NAK", as JSON {"delay": <nanoseconds>} when
+// it opens with a brace and as a Go duration otherwise. It is zero for anything that is not a NAK, and
+// for an argument that does not parse, which the server treats as a plain NAK.
+func (a Ack) NakDelay() time.Duration {
+	if !a.Negative() {
+		return 0
+	}
+
+	argument := strings.TrimSpace(strings.TrimPrefix(string(a.Payload), ackNegative))
+	if argument == "" {
+		return 0
+	}
+
+	if strings.HasPrefix(argument, "{") {
+		var options struct {
+			Delay time.Duration `json:"delay"`
+		}
+
+		if err := json.Unmarshal([]byte(argument), &options); err != nil {
+			return 0
+		}
+
+		return options.Delay
+	}
+
+	delay, err := time.ParseDuration(argument)
+	if err != nil {
+		return 0
+	}
+
+	return delay
 }
 
 // apiResponse is the shape every JetStream API reply shares. The presence of the error object decides

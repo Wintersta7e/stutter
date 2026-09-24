@@ -21,12 +21,13 @@ var errShortStat = errors.New("the process's stat line has no start time")
 // defaultHostFS is the real host.
 func defaultHostFS() hostFS {
 	return hostFS{
-		statfs:  fsType,
-		tryLock: tryLock,
-		sync:    (*os.File).Sync,
-		lstat:   os.Lstat,
-		owner:   ownerOf,
-		euid:    os.Geteuid(),
+		statfs:    fsType,
+		tryLock:   tryLock,
+		sync:      (*os.File).Sync,
+		lstat:     os.Lstat,
+		owner:     ownerOf,
+		startTime: startTime,
+		euid:      os.Geteuid(),
 	}
 }
 
