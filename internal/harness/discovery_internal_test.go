@@ -252,3 +252,19 @@ func assertNeverFrozen(t *testing.T, sandbox *Sandbox) {
 		t.Error("the next run was answered from a frozen reply, want it to capture")
 	}
 }
+
+// A service that stopped by itself before any consumer existed is E11 however the wait for it ended: the
+// discard reads an exit that landed after the startup limit ended the wait.
+func TestAServiceThatStoppedByItselfIsE11HoweverTheWaitEnded(t *testing.T) {
+	t.Parallel()
+
+	stopped := Discovery{Exit: replay.Exit{Code: 1, Exited: true}}
+	if err := stopped.verdict(); !errors.Is(err, ErrExitedBeforeConsumer) {
+		t.Errorf("verdict() of a service that stopped by itself = %v, want %v", err, ErrExitedBeforeConsumer)
+	}
+
+	running := Discovery{Exit: replay.Exit{Code: 137}}
+	if err := running.verdict(); err != nil {
+		t.Errorf("verdict() of a service Stutter stopped = %v, want none: the check runs unnamed", err)
+	}
+}

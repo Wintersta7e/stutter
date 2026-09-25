@@ -256,7 +256,7 @@ func (b *bare) conclude(ctx context.Context, found Discovery, ended interruption
 	found.Exit, found.Setup = exit, b.recorder.SetupCount()
 	found.Refusals, found.ClosedAfterInfo = b.recorder.Refusals(), b.recorder.ClosedAfterInfoCount()
 
-	if err := found.verdict(ended); err != nil {
+	if err := found.verdict(); err != nil {
 		return found, fmt.Errorf("%s: %w", b.stage, err)
 	}
 
@@ -299,16 +299,17 @@ func (s *Sandbox) judgeNames(
 }
 
 // verdict is what discovery found as an exit row: none when a consumer exists on the corpus stream,
-// or when none exists anywhere and the service is still running — the check then runs unnamed, and its
-// observation gate says what never happened.
-func (d Discovery) verdict(ended interruption) error {
+// or when none exists anywhere and the service had not stopped by itself when its start was discarded —
+// the check then runs unnamed, and its observation gate says what never happened. An exit that lands
+// after the startup limit ended the wait is still read by the discard, and still an exit.
+func (d Discovery) verdict() error {
 	switch {
 	case len(d.Consumers) > 0:
 		return nil
 	case len(d.Elsewhere) > 0:
 		return fmt.Errorf("%w: %s; the stream the check was pointed at is likely not the one it consumes from",
 			ErrConsumesElsewhere, strings.Join(d.Elsewhere, ", "))
-	case ended == targetExited:
+	case d.Exit.Exited:
 		return fmt.Errorf("%w: %s", ErrExitedBeforeConsumer, d.diagnosis())
 	default:
 		return nil
