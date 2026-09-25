@@ -37,7 +37,7 @@ func (c ConsumerCheck) reasonLines() []string {
 	var lines []string
 
 	if c.Reason != "" {
-		lines = append(lines, detailIndent+oneLine(c.Reason))
+		lines = append(lines, detailIndent+withoutDurations(oneLine(c.Reason)))
 	}
 
 	if c.Report.Setup == nil {
@@ -46,7 +46,7 @@ func (c ConsumerCheck) reasonLines() []string {
 
 	for _, line := range setupLines(c.Report.Setup, c.Report.Completed) {
 		if line != "" {
-			lines = append(lines, detailIndent+oneLine(line))
+			lines = append(lines, detailIndent+withoutDurations(oneLine(line)))
 		}
 	}
 

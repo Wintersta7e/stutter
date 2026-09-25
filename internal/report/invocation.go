@@ -1,7 +1,13 @@
 package report
 
 import (
+	"cmp"
+	"fmt"
+	"io"
+	"regexp"
 	"slices"
+	"strconv"
+	"strings"
 
 	"github.com/Wintersta7e/stutter/internal/gate"
 )
@@ -148,6 +154,12 @@ type Invocation struct {
 	Unnamed *ConsumerCheck
 	// Consumers are the discovered consumers, one each, in name order.
 	Consumers []ConsumerCheck
+	// Scrub are strings stdout never carries — the check's ID and its private directory — which a
+	// producer's error text may name. Each is replaced by a fixed token when rendered.
+	Scrub []string
+	// GatesOnly means the check ran the gates alone and injected nothing: no consumer can have passed,
+	// failed or warned.
+	GatesOnly bool
 }
 
 // Judged returns every consumer check as the verdict reads it: an unstable consumer holds each other
@@ -184,6 +196,180 @@ func (i Invocation) ExitCode() int {
 	default:
 		return ExitPass
 	}
+}
+
+// Render writes the compose report: the header, the scan line, one block per discovered consumer in
+// name order, the unnamed check's block, every finding in one list, and the closing line. It reads
+// the same judged view ExitCode reads, so the report and the exit code cannot disagree.
+//
+// stdout is diffable between runs: the check's ID and private directory are replaced wherever a
+// producer's error text names them, and so is a measured duration in a reason.
+func (i Invocation) Render(w io.Writer) error {
+	if _, err := io.WriteString(w, i.scrub(strings.Join(i.lines(), "\n")+"\n")); err != nil {
+		return fmt.Errorf("write report: %w", err)
+	}
+
+	return nil
+}
+
+func (i Invocation) lines() []string {
+	lines := i.Header.lines()
+
+	if i.Setup != nil {
+		return append(lines, i.setupLines()...)
+	}
+
+	judged := i.Judged()
+	slices.SortStableFunc(judged, func(a, b ConsumerCheck) int { return cmp.Compare(a.Name, b.Name) })
+
+	total := i.corpusMessages()
+	lines = append(lines, "", scanText(len(judged), total))
+
+	for _, consumer := range judged {
+		lines = append(lines, "")
+		lines = append(lines, consumer.lines(total)...)
+	}
+
+	if i.Unnamed != nil {
+		unnamed := *i.Unnamed
+		unnamed.Name = cmp.Or(unnamed.Name, unnamedName)
+
+		lines = append(lines, "")
+		lines = append(lines, unnamed.lines(total)...)
+	}
+
+	lines = append(lines, i.findingLines(judged)...)
+
+	if i.nothingJudged() {
+		lines = append(lines, "", nothingJudged)
+	}
+
+	return append(lines, "", i.closingLine(judged))
+}
+
+// setupLines render a check that could not be carried out as a whole. Any consumer check that
+// completed before it has its verdict withheld, never shown.
+func (i Invocation) setupLines() []string {
+	lines := []string{"", wholeCheckHead + withoutDurations(oneLine(i.Setup.Error()))}
+
+	completed := 0
+
+	for _, consumer := range i.Consumers {
+		if consumer.Outcome == OutcomeChecked && consumer.Report.Setup == nil {
+			completed++
+		}
+	}
+
+	if completed > 0 {
+		lines = append(lines, "", withheldVerdicts(completed))
+	}
+
+	return lines
+}
+
+// findingLines render every consumer's findings as one list, in the reference path's order, each
+// naming its consumer, followed by the guard-dependence note when one applies.
+func (i Invocation) findingLines(judged []ConsumerCheck) []string {
+	var findings []Finding
+
+	for _, consumer := range judged {
+		findings = append(findings, consumer.Report.Findings...)
+	}
+
+	if i.Unnamed != nil {
+		findings = append(findings, i.Unnamed.Report.Findings...)
+	}
+
+	order(findings)
+
+	var lines []string
+
+	for _, finding := range findings {
+		lines = append(lines, "")
+		lines = append(lines, composeFindingLines(finding)...)
+	}
+
+	if note := composeGuardDependentLines(findings); note != nil {
+		lines = append(lines, "")
+		lines = append(lines, note...)
+	}
+
+	return lines
+}
+
+// nothingJudged reports a check whose every consumer was left out or could not be covered.
+func (i Invocation) nothingJudged() bool {
+	counts := i.counts()
+
+	return counts[BucketNotCovered]+counts[BucketNotSelected] == len(i.Consumers) && i.Unnamed == nil
+}
+
+// closingLine counts every discovered consumer by bucket, sums them, and names the unnamed check apart.
+// Gate mode injected nothing, so it shows no pass, fail or warn bucket.
+func (i Invocation) closingLine(judged []ConsumerCheck) string {
+	counts := make(map[Bucket]int)
+	for _, consumer := range judged {
+		counts[consumer.Bucket()]++
+	}
+
+	buckets := []Bucket{
+		BucketNotSelected, BucketNotCovered, BucketSetup, BucketGate, BucketFail, BucketWarn, BucketHeld, BucketPass,
+	}
+
+	parts := make([]string, 0, len(buckets))
+
+	for _, bucket := range buckets {
+		injected := bucket == BucketPass || bucket == BucketFail || bucket == BucketWarn
+		if i.GatesOnly && injected {
+			continue
+		}
+
+		parts = append(parts, string(bucket)+" "+strconv.Itoa(counts[bucket]))
+	}
+
+	line := closingLabel + " " + strings.Join(parts, ", ") + closingText(len(judged))
+	if i.Unnamed != nil {
+		line += unnamedClosing(i.Unnamed.Bucket())
+	}
+
+	return line
+}
+
+// corpusMessages is how many messages the corpus holds, as loaded.
+func (i Invocation) corpusMessages() int {
+	if i.Header != nil && i.Header.Corpus != nil {
+		return len(i.Header.Corpus.Messages)
+	}
+
+	most := 0
+	for _, consumer := range i.Consumers {
+		most = max(most, consumer.Admitted)
+	}
+
+	return most
+}
+
+// scrub replaces every string stdout never carries with a fixed token, the longest first, so a
+// private directory naming the check's ID is replaced whole.
+func (i Invocation) scrub(text string) string {
+	scrubbed := slices.Clone(i.Scrub)
+	slices.SortFunc(scrubbed, func(a, b string) int { return cmp.Compare(len(b), len(a)) })
+
+	for _, value := range scrubbed {
+		if value != "" {
+			text = strings.ReplaceAll(text, value, scrubbedToken)
+		}
+	}
+
+	return text
+}
+
+// goDuration matches a duration as Go prints one: 1.5s, 200ms, 1m0s, 2h3m4s.
+var goDuration = regexp.MustCompile(`\b\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h)(?:\d+(?:\.\d+)?(?:ns|us|µs|ms|s|m|h))*\b`)
+
+// withoutDurations replaces every duration in a producer's text: a measured one differs on every run.
+func withoutDurations(text string) string {
+	return goDuration.ReplaceAllString(text, durationToken)
 }
 
 // counts is how many judged checks landed in each bucket, the unnamed check included.

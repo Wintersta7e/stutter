@@ -2,6 +2,7 @@ package report_test
 
 import (
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -228,5 +229,239 @@ func TestAnUnstableSiblingHoldsFailToWarn(t *testing.T) {
 
 	if failing("orders").Report.Findings[0].Status != report.StatusFail {
 		t.Error("the fixture's finding is not a FAIL, so nothing here could have been held back")
+	}
+}
+
+func rendered(t *testing.T, inv report.Invocation) string {
+	t.Helper()
+
+	var out strings.Builder
+	if err := inv.Render(&out); err != nil {
+		t.Fatalf("Render() error = %v", err)
+	}
+
+	return out.String()
+}
+
+// closing parses the closing line: each bucket's count, and the discovered total it states.
+func closing(t *testing.T, text string) (map[string]int, int) {
+	t.Helper()
+
+	var line string
+
+	for candidate := range strings.Lines(text) {
+		if strings.HasPrefix(candidate, "Consumers:") {
+			line = strings.TrimSpace(candidate)
+		}
+	}
+
+	if line == "" {
+		t.Fatalf("no closing line in:\n%s", text)
+	}
+
+	counts := make(map[string]int)
+	body, total, found := strings.Cut(strings.TrimPrefix(line, "Consumers:"), "=")
+
+	if !found {
+		t.Fatalf("the closing line %q states no total", line)
+	}
+
+	for part := range strings.SplitSeq(body, ",") {
+		fields := strings.Fields(part)
+		if len(fields) < 2 {
+			continue
+		}
+
+		count, err := strconv.Atoi(fields[len(fields)-1])
+		if err != nil {
+			t.Fatalf("closing line %q: %q is not a count", line, part)
+		}
+
+		counts[strings.Join(fields[:len(fields)-1], " ")] = count
+	}
+
+	discovered, err := strconv.Atoi(strings.Fields(total)[0])
+	if err != nil {
+		t.Fatalf("closing line %q: the total is not a count", line)
+	}
+
+	return counts, discovered
+}
+
+// TestClosingLineSumsToTheDiscoveredTotal: every discovered consumer is counted in exactly one
+// bucket, and the unnamed check is named apart from them.
+func TestClosingLineSumsToTheDiscoveredTotal(t *testing.T) {
+	t.Parallel()
+
+	unnamed := gated("")
+	inv := report.Invocation{
+		Consumers: []report.ConsumerCheck{
+			passing("a"), passing("b"), failing("c"), notCovered("d"), notSelected("e"),
+		},
+		Unnamed: &unnamed,
+	}
+
+	text := rendered(t, inv)
+	counts, discovered := closing(t, text)
+
+	sum := 0
+	for _, count := range counts {
+		sum += count
+	}
+
+	t.Logf("sum=%d discovered=%d", sum, discovered)
+
+	if sum != len(inv.Consumers) || discovered != len(inv.Consumers) {
+		t.Errorf("bucket counts sum to %d and the line states %d discovered, want %d:\n%s",
+			sum, discovered, len(inv.Consumers), text)
+	}
+
+	if sum == 0 {
+		t.Fatal("the closing line counts nothing")
+	}
+
+	if !strings.Contains(text, "unnamed check") {
+		t.Errorf("the unnamed check is not named apart from the discovered consumers:\n%s", text)
+	}
+}
+
+// TestStdoutCarriesNoCheckIDDirectoryOrDuration: stdout is diffable between CI runs.
+func TestStdoutCarriesNoCheckIDDirectoryOrDuration(t *testing.T) {
+	t.Parallel()
+
+	const (
+		checkID    = "c0ffee42"
+		privateDir = "/tmp/stutter-c0ffee42"
+		measured   = "1.234567s"
+	)
+
+	interrupted := setUp("orders")
+	interrupted.Reason = "the run stopped after " + measured + ": container stutter-" + checkID + "-target exited"
+	interrupted.Report = report.SetupFailed(errors.New("its log is " + privateDir + "/logs/target.log"))
+
+	failed := failing("billing")
+	failed.Report.Findings[0].Notes = []string{"stutter-" + checkID + "-restore-db was replaced"}
+
+	text := rendered(t, report.Invocation{
+		Consumers: []report.ConsumerCheck{failed, interrupted},
+		Scrub:     []string{checkID, privateDir},
+	})
+
+	ids, dirs, durations := strings.Count(text, checkID), strings.Count(text, privateDir), strings.Count(text, measured)
+	t.Logf("check-id=%d dir=%d duration=%d bytes=%d", ids, dirs, durations, len(text))
+
+	if ids+dirs+durations != 0 {
+		t.Errorf("stdout carries the check ID %d, the directory %d and a duration %d times:\n%s",
+			ids, dirs, durations, text)
+	}
+
+	if len(text) == 0 {
+		t.Fatal("nothing was rendered")
+	}
+}
+
+// TestNoConsumerRendersTheUnnamedBlockAndNoPass: a service with no consumer gets one unnamed check,
+// which is never a discovered consumer and never a pass.
+func TestNoConsumerRendersTheUnnamedBlockAndNoPass(t *testing.T) {
+	t.Parallel()
+
+	unnamed := report.ConsumerCheck{
+		Outcome: report.OutcomeChecked, Reason: "the bus refused 1 request",
+		Report: report.New(report.Scan{Consumers: 1, Messages: 3}, unobservedGates(), nil),
+	}
+	inv := report.Invocation{Unnamed: &unnamed}
+	text := rendered(t, inv)
+
+	for line := range strings.Lines(text) {
+		if strings.HasPrefix(line, string(report.StatusPass)) {
+			t.Errorf("a check with no consumer renders a PASS line: %q", line)
+		}
+	}
+
+	if !strings.Contains(text, "unnamed check") || !strings.Contains(text, string(report.GateObservation)) {
+		t.Errorf("the unnamed block with its observation diagnosis is missing:\n%s", text)
+	}
+
+	if _, discovered := closing(t, text); discovered != 0 {
+		t.Errorf("the closing line states %d discovered consumers, want 0", discovered)
+	}
+
+	if got := inv.ExitCode(); got != report.ExitGateViolated {
+		t.Errorf("ExitCode() = %d, want %d", got, report.ExitGateViolated)
+	}
+}
+
+// TestGateModeRendersNoPassFailOrWarnBucket: gate mode injects nothing, so nothing passed, failed or
+// warned.
+func TestGateModeRendersNoPassFailOrWarnBucket(t *testing.T) {
+	t.Parallel()
+
+	gatesOnly := held("orders")
+	gatesOnly.Report.GatesOnly = true
+
+	text := rendered(
+		t,
+		report.Invocation{Consumers: []report.ConsumerCheck{gatesOnly, gated("billing")}, GatesOnly: true},
+	)
+	counts, _ := closing(t, text)
+
+	for _, bucket := range []report.Bucket{report.BucketPass, report.BucketFail, report.BucketWarn} {
+		if _, shown := counts[string(bucket)]; shown {
+			t.Errorf("gate mode's closing line shows the %q bucket:\n%s", bucket, text)
+		}
+	}
+
+	for line := range strings.Lines(text) {
+		for _, status := range []report.Status{report.StatusPass, report.StatusFail, report.StatusWarn} {
+			if strings.HasPrefix(line, string(status)) {
+				t.Errorf("gate mode renders a line opening %s: %q", status, line)
+			}
+		}
+	}
+}
+
+// TestNothingJudgedPrintsEveryReason: a check that judged no consumer exits 3 and says why for each.
+func TestNothingJudgedPrintsEveryReason(t *testing.T) {
+	t.Parallel()
+
+	consumers := []report.ConsumerCheck{notCovered("audit"), notSelected("billing"), notCovered("orders")}
+	consumers[2].Reason = "it reads stream PAYMENTS, not the corpus stream"
+	inv := report.Invocation{Consumers: consumers}
+	text := rendered(t, inv)
+
+	for _, consumer := range consumers {
+		if !strings.Contains(text, consumer.Reason) {
+			t.Errorf("consumer %s's reason %q is not printed:\n%s", consumer.Name, consumer.Reason, text)
+		}
+	}
+
+	if got := inv.ExitCode(); got != report.ExitSetupError {
+		t.Errorf("ExitCode() = %d, want %d", got, report.ExitSetupError)
+	}
+}
+
+// TestASiblingReservationIsRendered: the rendered report and the exit code read the same view.
+func TestASiblingReservationIsRendered(t *testing.T) {
+	t.Parallel()
+
+	inv := report.Invocation{Consumers: []report.ConsumerCheck{
+		failing("orders"), unstable("billing", gate.ClassDivergentSet),
+	}}
+	text := rendered(t, inv)
+
+	var finding string
+
+	for line := range strings.Lines(text) {
+		if strings.Contains(line, "orders") && strings.Contains(line, "duplicate delivery") {
+			finding = line
+		}
+	}
+
+	if !strings.HasPrefix(finding, string(report.StatusWarn)) {
+		t.Errorf("the held finding renders as %q, want WARN (exit %d):\n%s", finding, inv.ExitCode(), text)
+	}
+
+	if !strings.Contains(text, "billing") || !strings.Contains(text, string(gate.ClassDivergentSet)) {
+		t.Errorf("the reservation naming billing and %s is not rendered:\n%s", gate.ClassDivergentSet, text)
 	}
 }

@@ -141,3 +141,40 @@ const reachSentence = "Stutter's proxies are reachable from every container on t
 
 // setupEgressSentence discloses that setup is not observed.
 const setupEgressSentence = "jobs and dependencies may reach the network during setup, unobserved"
+
+// scanText opens a compose report below its header: the discovered consumers, and the corpus they were
+// checked over — never "recorded", which a hand-written corpus is not.
+func scanText(consumers, messages int) string {
+	return "Scanned " + plural(consumers, "discovered consumer") + " over " + plural(messages, "corpus message") + "."
+}
+
+// unnamedName stands in for the name of the check a service with no consumer gets.
+const unnamedName = "(unnamed check)"
+
+// closingLabel opens the closing line, which counts every discovered consumer by bucket.
+const closingLabel = "Consumers:"
+
+// closingText is the closing line's tail: the discovered total the bucket counts sum to.
+func closingText(discovered int) string {
+	return " = " + strconv.Itoa(discovered) + " discovered"
+}
+
+// unnamedClosing names the unnamed check apart from the discovered consumers.
+func unnamedClosing(bucket Bucket) string {
+	return "; the unnamed check: " + string(bucket)
+}
+
+// nothingJudged says why a check that judged no consumer is a setup error, not a pass.
+const nothingJudged = "No consumer was judged, so this check is not a pass: each consumer's reason is above."
+
+// withheldVerdicts follows a whole-check setup error that struck after consumer checks completed.
+func withheldVerdicts(completed int) string {
+	return plural(completed, "consumer check") + " completed before this; their verdicts are withheld."
+}
+
+// Tokens standing in for what stdout never carries: the check's own identity and a measured duration.
+const (
+	scrubbedToken  = "<check>"
+	durationToken  = "<duration>"
+	wholeCheckHead = "Setup failed: "
+)

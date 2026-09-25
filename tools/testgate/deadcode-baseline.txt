@@ -731,3 +731,17 @@ github.com/Wintersta7e/stutter/internal/provision.volumeName
 github.com/Wintersta7e/stutter/internal/provision.volumeOptions
 github.com/Wintersta7e/stutter/internal/provision.writableBinds
 github.com/Wintersta7e/stutter/internal/provision/rules.Kinds
+# Rendering a compose check as one report: called by `stutter check --compose` before teardown.
+github.com/Wintersta7e/stutter/internal/report.Invocation.Render
+github.com/Wintersta7e/stutter/internal/report.Invocation.closingLine
+github.com/Wintersta7e/stutter/internal/report.Invocation.corpusMessages
+github.com/Wintersta7e/stutter/internal/report.Invocation.findingLines
+github.com/Wintersta7e/stutter/internal/report.Invocation.lines
+github.com/Wintersta7e/stutter/internal/report.Invocation.nothingJudged
+github.com/Wintersta7e/stutter/internal/report.Invocation.scrub
+github.com/Wintersta7e/stutter/internal/report.Invocation.setupLines
+github.com/Wintersta7e/stutter/internal/report.closingText
+github.com/Wintersta7e/stutter/internal/report.scanText
+github.com/Wintersta7e/stutter/internal/report.unnamedClosing
+github.com/Wintersta7e/stutter/internal/report.withheldVerdicts
+github.com/Wintersta7e/stutter/internal/report.withoutDurations
