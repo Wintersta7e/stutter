@@ -52,7 +52,7 @@ func TestEveryRunPrintsOneRunLine(t *testing.T) {
 	var stderr strings.Builder
 
 	inner := &scriptedSession{span: 3 * time.Millisecond, fails: func(name string) bool { return name == brokenRun }}
-	timed := &timedSession{inner: inner, consumer: "orders", out: newLockedWriter(&stderr)}
+	timed := &timedSession{inner: inner, consumer: testService, out: newLockedWriter(&stderr)}
 
 	runs := []struct {
 		mutation replay.Mutation
@@ -92,7 +92,7 @@ func TestEveryRunPrintsOneRunLine(t *testing.T) {
 			continue
 		}
 
-		if parts[1] != "orders" {
+		if parts[1] != testService {
 			t.Errorf("run line %q names consumer %q, want orders", line, parts[1])
 		}
 
