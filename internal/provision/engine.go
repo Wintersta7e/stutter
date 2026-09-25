@@ -56,6 +56,9 @@ type Engine struct {
 	identity   Identity
 	id         string
 	private    string
+	// wslDistro is the WSL distribution this process runs in, empty outside WSL: Docker Desktop reports a
+	// bind's source under it.
+	wslDistro  string
 	host       hostFS
 	down       Teardown
 	swept      SweepResult
@@ -111,6 +114,7 @@ func openWith(ctx context.Context, opts Options, deps openDeps) (*Engine, error)
 		run: run, host: deps.host, identity: identity, id: id, keep: opts.Keep,
 		private: filepath.Join(temp, "stutter-"+id), interfaces: localAddrs,
 		exited: map[int]chan struct{}{}, held: map[string]int{}, closing: make(chan struct{}),
+		wslDistro: lookupEnv(deps.env, "WSL_DISTRO_NAME"),
 	}
 
 	led, err := createLedger(state, deps.host, header{

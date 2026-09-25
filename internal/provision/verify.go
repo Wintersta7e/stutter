@@ -1,6 +1,8 @@
 package provision
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -85,6 +87,18 @@ func verifyPrivileges(r containerReport) error {
 	}
 
 	return nil
+}
+
+// desktopBinds is where Docker Desktop's WSL integration places a bind source for its engine. Measured
+// on Docker Desktop 4.85: a bind made after another mount is reported there, at
+// <desktopBinds>/<distribution>/<SHA-256 of the source as given>, not at its source.
+const desktopBinds = "/run/desktop/mnt/host/wsl/docker-desktop-bind-mounts"
+
+// desktopBindSource is where Docker Desktop reports source bound from WSL distribution distro.
+func desktopBindSource(distro, source string) string {
+	sum := sha256.Sum256([]byte(source))
+
+	return filepath.Join(desktopBinds, distro, hex.EncodeToString(sum[:]))
 }
 
 func verifyMounts(r containerReport, x expectation) error {
