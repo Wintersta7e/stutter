@@ -198,7 +198,10 @@ func TestEveryArgumentRefusalExitsBeforeDocker(t *testing.T) {
 			t.Errorf("%s: stderr does not name %s:\n%s", testCase.row, testCase.names, stderr.String())
 		}
 
-		reached := slices.ContainsFunc([]string{"docker", "engine", "Cannot connect"}, func(word string) bool {
+		// What a refusal that reached the engine would say: the precondition, the daemon, the socket.
+		reached := slices.ContainsFunc([]string{
+			"engine precondition", "Cannot connect", "nonexistent.sock",
+		}, func(word string) bool {
 			return strings.Contains(stderr.String(), word)
 		})
 		if reached || stdout.Len() > 0 {

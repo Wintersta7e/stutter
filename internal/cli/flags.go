@@ -23,8 +23,19 @@ const (
 	commandClean = "clean"
 )
 
-// flagCorpus names the corpus directory's flag.
-const flagCorpus = "corpus"
+// Flag names several places read: the flag set, the refusals, the help.
+const (
+	flagCorpus   = "corpus"
+	flagService  = "service"
+	flagStream   = "stream"
+	flagProfile  = "profile"
+	flagConsumer = "consumer"
+	flagRoutes   = "routes"
+	flagQuiesce  = "quiesce"
+	flagStartup  = "startup"
+	flagDrain    = "drain"
+	flagMaxRuns  = "max-runs"
+)
 
 var (
 	// errGivenTwice means a flag that takes one value was given more than once: Go's flag package keeps
@@ -51,11 +62,11 @@ var (
 
 // composeOnly are the flags only the compose path reads.
 var composeOnly = []string{ //nolint:gochecknoglobals // a fixed table, not mutable state.
-	"service", "stream", flagCorpus, "profile", "consumer", "startup", "drain", "keep", "routes",
+	flagService, flagStream, flagCorpus, flagProfile, flagConsumer, flagStartup, flagDrain, "keep", flagRoutes,
 }
 
 // timingFlags are the flags that set a wait, in the order the header names them.
-var timingFlags = []string{"startup", "quiesce", "drain"} //nolint:gochecknoglobals // a fixed table.
+var timingFlags = []string{flagStartup, flagQuiesce, flagDrain} //nolint:gochecknoglobals // a fixed table.
 
 // onceString is a string flag that may be given once.
 type onceString struct {
@@ -184,20 +195,20 @@ func newFlagSet(command string, parsed *settings, stderr io.Writer) *flag.FlagSe
 	set.Usage = func() {}
 
 	set.Var(&parsed.compose, "compose", "a compose file; repeat for several, merged in the order given")
-	set.Var(&parsed.service, "service", "the compose service under test")
-	set.Var(&parsed.stream, "stream", "the stream the service consumes the corpus from")
+	set.Var(&parsed.service, flagService, "the compose service under test")
+	set.Var(&parsed.stream, flagStream, "the stream the service consumes the corpus from")
 	set.Var(&parsed.corpus, flagCorpus, "the corpus directory: one file per message")
-	set.Var(&parsed.profiles, "profile", "a compose profile to activate; repeatable")
-	set.Var(&parsed.consumers, "consumer", "a discovered consumer to check; repeatable")
-	set.Var(&parsed.routes, "routes", "a JSON file of stub replies for external hosts")
-	set.Var(&parsed.quiesce, "quiesce", "how long a message's window stays open after its handler returns")
-	set.Var(&parsed.startup, "startup", "how long the service may take to create its consumer")
-	set.Var(&parsed.drain, "drain", "how long a run waits in silence for messages still owed")
+	set.Var(&parsed.profiles, flagProfile, "a compose profile to activate; repeatable")
+	set.Var(&parsed.consumers, flagConsumer, "a discovered consumer to check; repeatable")
+	set.Var(&parsed.routes, flagRoutes, "a JSON file of stub replies for external hosts")
+	set.Var(&parsed.quiesce, flagQuiesce, "how long a message's window stays open after its handler returns")
+	set.Var(&parsed.startup, flagStartup, "how long the service may take to create its consumer")
+	set.Var(&parsed.drain, flagDrain, "how long a run waits in silence for messages still owed")
 	set.BoolVar(&parsed.keep, "keep", false, "keep the check's resources for stutter clean")
 	set.Var(&parsed.postgres, "postgres", "the reference path's scratch Postgres")
 
 	if command == commandCheck {
-		set.Var(&parsed.maxRuns, "max-runs", "each consumer check's cap on faulted runs; 0 for every legal pair")
+		set.Var(&parsed.maxRuns, flagMaxRuns, "each consumer check's cap on faulted runs")
 	}
 
 	return set
@@ -253,7 +264,7 @@ func (s settings) refuse() error {
 func (s settings) refuseCompose() error {
 	var missing []string
 
-	for name, value := range map[string]onceString{"service": s.service, "stream": s.stream, flagCorpus: s.corpus} {
+	for name, value := range map[string]onceString{flagService: s.service, flagStream: s.stream, flagCorpus: s.corpus} {
 		if !value.set {
 			missing = append(missing, "--"+name)
 		}

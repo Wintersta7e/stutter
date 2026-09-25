@@ -28,35 +28,10 @@ const (
 	referenceRetries = 6
 )
 
-const usage = `stutter — delivery-fault testing for message-bus consumers.
-
-Usage:
-  stutter check --postgres <dsn>   Replay with every legal fault and report what diverged
-  stutter gate  --postgres <dsn>   Run only the gates: is this service stable enough to test?
-  stutter version                  Print the build identity
-
-Flags for check and gate:
-  --postgres <dsn>    Reachable Postgres connection string. Stutter replays into it and wipes
-                      its own fixture rows between runs, so point it at a scratch database.
-  --max-runs <n>      Cap mutated runs (default 3; 0 means every legal message-and-fault pair)
-  --consumer <name>   A discovered consumer to check, on the compose path; repeatable
-
-Exit codes:
-  0  check: every consumer passed and the gates held
-     gate:  the gates held (gate injects no faults, so it never reports a pass)
-  1  at least one failure
-  2  a gate was violated, so no findings were computed — this is not a test failure
-  3  setup error, or the command could not be run
-
-The only service stutter can provision today is its own reference consumer: one non-idempotent
-handler, one idempotent control, and one guarded control. Running it against your own service needs
-compose provisioning, which is not built yet.
-`
-
 // Run executes one command and returns the process exit code.
 func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fmt.Fprint(stderr, usage)
+		fmt.Fprint(stderr, usage())
 
 		return exitUsage
 	}
@@ -73,14 +48,14 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	case commandClean:
 		return cleanCommand(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
-		fmt.Fprint(stdout, usage)
+		fmt.Fprint(stdout, usage())
 
 		return 0
 	case "relay":
 		// Hidden: a relay container runs this binary as its entrypoint, and a user has no use for it.
 		return relay.Run(ctx, args[1:], stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "stutter: unknown command %q\n\n%s", args[0], usage)
+		fmt.Fprintf(stderr, "stutter: unknown command %q\n\n%s", args[0], usage())
 
 		return exitUsage
 	}
