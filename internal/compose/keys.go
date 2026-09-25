@@ -256,21 +256,3 @@ func (k keyTable) known(path string) bool {
 
 	return ok || k.inner[path]
 }
-
-// covered reports a path under a subtree rule, which classifies everything beneath it.
-func (k keyTable) covered(path string) bool {
-	parts := strings.Split(path, ".")
-	for n := len(parts) - 1; n >= 1; n-- {
-		if rule, ok := k.rules[strings.Join(parts[:n], ".")]; ok && rule.subtree {
-			return true
-		}
-	}
-
-	return false
-}
-
-// classifies reports whether the table has a verdict for path: its own rule, a subtree above it,
-// or — for a structural node — rules beneath it.
-func (k keyTable) classifies(path string) bool {
-	return k.known(path) || k.covered(path)
-}

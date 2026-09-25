@@ -139,3 +139,11 @@ func TestAHostPortSomethingListensOnIsNotFree(t *testing.T) {
 		t.Errorf("port %d is taken by a listener but reads as free", port)
 	}
 }
+
+// reservedHostPort reports whether port is reserved in this process.
+func reservedHostPort(port uint16) bool {
+	hostPorts.mu.Lock()
+	defer hostPorts.mu.Unlock()
+
+	return hostPorts.taken[port]
+}

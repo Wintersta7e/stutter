@@ -6,12 +6,3 @@ github.com/Wintersta7e/stutter/internal/proxy/nats.Listen
 github.com/Wintersta7e/stutter/internal/replay.Concurrent.Fault
 github.com/Wintersta7e/stutter/internal/report.Report.String
 github.com/Wintersta7e/stutter/internal/toy.Qty
-# Reached by no production caller once `stutter check --compose` is wired: each is called only by its
-# package's own tests. Named for removal or a production caller, never wired here.
-github.com/Wintersta7e/stutter/internal/compose.keyTable.classifies
-github.com/Wintersta7e/stutter/internal/compose.keyTable.covered
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.advertised
-github.com/Wintersta7e/stutter/internal/provision.Engine.pinnedID
-github.com/Wintersta7e/stutter/internal/provision.Engine.release
-github.com/Wintersta7e/stutter/internal/provision.reservedHostPort
-github.com/Wintersta7e/stutter/internal/provision.resourceFlag

@@ -564,11 +564,3 @@ func (s *ListenerSet) forget(conn net.Conn) {
 
 	delete(s.conns, conn)
 }
-
-// advertised is the verified address containers dial the listeners at; zero before verification.
-func (s *ListenerSet) advertised() netip.Addr {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.advertise
-}

@@ -49,3 +49,11 @@ func TestOneAuthorityServesEveryConsumerCheck(t *testing.T) {
 		t.Error("a sandbox without the listener set did not mint its own CA")
 	}
 }
+
+// advertised is the verified address containers dial the listeners at; zero before verification.
+func (s *ListenerSet) advertised() netip.Addr {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.advertise
+}

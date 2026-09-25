@@ -77,11 +77,15 @@ func TestAFillPastItsHoldBoundStopsTheRun(t *testing.T) {
 // TestFillIsHeldAgainstASelfPublishingHandler: a handler that publishes into the stream it consumes
 // would land its output between the corpus's own messages while they are still being published, and
 // the corpus would no longer be numbered as staged. Held, it cannot act until the corpus is in.
+//
+//nolint:paralleltest,tparallel // ten sandboxes filling at once on four CPUs pushed a hold past its bound.
 func TestFillIsHeldAgainstASelfPublishingHandler(t *testing.T) {
 	t.Parallel()
 
 	const (
-		repeats    = 10
+		repeats = 10
+		// Fill pipelines its publishes, so the corpus must outrun that window: with the hold removed, the
+		// handler's output first landed at message 230 or later.
 		corpusSize = 500
 	)
 
@@ -93,8 +97,6 @@ func TestFillIsHeldAgainstASelfPublishingHandler(t *testing.T) {
 
 	for repeat := range repeats {
 		t.Run(fmt.Sprintf("repeat %d", repeat+1), func(t *testing.T) {
-			t.Parallel()
-
 			config := observedConfig()
 			config.AckWait = 5 * time.Second
 			config.FilterSubjects = []string{toy.SubjectOrderCreated}
