@@ -169,6 +169,8 @@ type Scan struct {
 type Health struct {
 	// Refusals are the requests the bus declined before the first delivery.
 	Refusals []effect.Refusal
+	// SilentSeqs are the messages that produced no effect, in corpus order: the ones Silent counts.
+	SilentSeqs []uint64
 	// Exit is how the service ended a clean run it exited by itself after every message was done
 	// (E26): recorded beside the verdict, never a verdict of its own. Zero when it did not exit.
 	Exit replay.Exit
@@ -314,6 +316,8 @@ type Report struct {
 	Setup error
 	// Health is the clean run's, rendered beside the verdict it qualifies. Nil when not measured.
 	Health *Health
+	// Files names the corpus file each message sequence came from, when the corpus was read from files.
+	Files map[uint64]string
 	// Gates are the checks that ran. A report naming no gates claims none ran.
 	Gates []GateCheck
 	// Findings are the divergences that were ruled on. Always empty when a gate was violated.
@@ -325,6 +329,9 @@ type Report struct {
 	// Silenced counts divergences a declared invariant classified as acceptable. Counted rather
 	// than dropped silently, so a run that silenced everything does not read as a clean one.
 	Silenced int
+	// Completed counts the runs that finished before a setup error: a setup error after runs is not
+	// a check where nothing was replayed.
+	Completed int
 	// GatesOnly means the check stopped after the gates and injected nothing. Its closing line then
 	// says so instead of PASS.
 	GatesOnly bool

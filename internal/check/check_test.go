@@ -439,7 +439,7 @@ func TestCleanRunHealthIsReported(t *testing.T) {
 		t.Fatal("Health = nil, want the clean run's counts")
 	}
 
-	want := report.Health{Messages: 3, Delivered: 3, Effects: 2, Silent: 1}
+	want := report.Health{Messages: 3, Delivered: 3, Effects: 2, Silent: 1, SilentSeqs: []uint64{3}}
 	if !reflect.DeepEqual(*result.Health, want) {
 		t.Errorf("Health = %+v, want %+v", *result.Health, want)
 	}
