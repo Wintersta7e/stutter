@@ -277,3 +277,28 @@ func (e *Engine) pinnedID(id string) bool {
 
 	return ok
 }
+
+// A failed build names the services it was building: one compose build makes them all, and "the build
+// failed" alone leaves the user to guess which of them broke.
+func TestAFailedBuildNamesItsServices(t *testing.T) {
+	t.Parallel()
+
+	engine, _ := openFakeEngine(t)
+
+	_, err := engine.Build(t.Context(), BuildSpec{
+		Render: func(map[string]string, map[string]map[string]string) ([]byte, error) {
+			return []byte("not a build model"), nil
+		},
+		Dir:      t.TempDir(),
+		Services: map[string]rules.Kind{testService: rules.KindTarget, svcMigrate: rules.KindJob},
+	})
+	if !errors.Is(err, ErrImage) {
+		t.Fatalf("Build = %v, want ErrImage", err)
+	}
+
+	for _, service := range []string{testService, svcMigrate} {
+		if !strings.Contains(err.Error(), service) {
+			t.Errorf("Build error %q does not name service %s", err, service)
+		}
+	}
+}

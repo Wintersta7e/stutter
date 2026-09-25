@@ -612,10 +612,25 @@ func (e *Engine) runBuild(
 	}
 
 	if err != nil {
-		return fmt.Errorf("%w: the build failed; its output is in %s: %w", ErrImage, logPath, err)
+		return fmt.Errorf("%w: the build of %s failed; its output is in %s: %w", ErrImage, builtServices(recs),
+			logPath, err)
 	}
 
 	return nil
+}
+
+// builtServices names the services one compose build was making, as its failure reports them.
+func builtServices(recs []record) string {
+	names := make([]string, 0, len(recs))
+	for _, rec := range recs {
+		names = append(names, rec.service)
+	}
+
+	if len(names) == 1 {
+		return "service " + names[0]
+	}
+
+	return "services " + strings.Join(names, ", ")
 }
 
 // resolveAll settles the intents of a failed build by reference: an image that landed anyway with
