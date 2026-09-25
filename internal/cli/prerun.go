@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"cmp"
 	"context"
+	"crypto/rand"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/compose"
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/harness"
+	"github.com/Wintersta7e/stutter/internal/policy"
 	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
@@ -59,8 +61,9 @@ type composeRun struct {
 	consumers []string
 	// timingFlags name each timing flag given.
 	timingFlags []string
-	// startup is --startup; zero leaves it to the harness's default.
+	// startup and quiesce are --startup and --quiesce; zero leaves each to its owner's default.
 	startup time.Duration
+	quiesce time.Duration
 	keep    bool
 }
 
@@ -68,40 +71,59 @@ type composeRun struct {
 //
 // Field order is dictated by govet's fieldalignment check, not by reading order.
 type composeCheck struct {
-	// images are the pinned images, by service.
-	images map[string]compose.Image
-	// restored is where the latest restore put each dependency endpoint.
-	restored map[string]netip.AddrPort
+	// before and after are the bus surveyed at B0 and after the probe start.
+	before corpus.Survey
+	after  corpus.Survey
+	engine *provision.Engine
+	// discover is the discovery start: harness.Discover.
+	discover func(ctx context.Context, cfg harness.Config) (harness.Discovery, error)
+	stderr   *lockedWriter
+	header   *report.Header
 	// upstreamMap turns one start's restores and the bus's addresses into the listener set's upstreams:
 	// the topology's, once it is open.
 	upstreamMap func(restored map[string]netip.AddrPort, bus, monitor netip.AddrPort) (
 		map[string]netip.AddrPort, error)
-	stderr   *lockedWriter
-	header   *report.Header
-	engine   *provision.Engine
 	model    *compose.Model
 	deps     *provision.Dependencies
 	topology *topology.Topology
 	bus      *corpus.Corpus
+	// probed is what the probe start learned; nil when the stream existed at B0.
+	probed *harness.Probe
+	// restored is where the latest restore put each dependency endpoint.
+	restored map[string]netip.AddrPort
+	// images are the pinned images, by service.
+	images   map[string]compose.Image
 	identity provision.Identity
 	networks topology.Networks
+	// b0 and b1 are the bus checkpoints: before any start, and once the stream's owner is settled.
+	b0 corpus.Checkpoint
+	b1 corpus.Checkpoint
 	// caPath is the check's CA file on the host.
 	caPath         string
 	classification compose.Classification
 	relayImage     compose.Image
 	layout         topology.Layout
-	run            composeRun
-	prints         compose.Prints
-	loaded         corpus.Loaded
-	targetSpec     compose.Spec
-	mu             sync.Mutex
+	// hashKey keys every run's raw-effect hash: one per check.
+	hashKey []byte
+	prints  compose.Prints
+	loaded  corpus.Loaded
+	run     composeRun
+	// found is what discovery learned: the consumer checks are made from it.
+	found      harness.Discovery
+	targetSpec compose.Spec
+	mu         sync.Mutex
 }
 
 func newComposeCheck(run composeRun, stderr *lockedWriter) *composeCheck {
-	return &composeCheck{run: run, stderr: stderr, header: &report.Header{Given: report.Given{
-		Stream: run.stream, Corpus: run.corpus, Routes: run.routes, Compose: run.compose, Profiles: run.profiles,
-		Consumers: run.consumers, Timings: run.timingFlags,
-	}}}
+	return &composeCheck{
+		run:      run,
+		stderr:   stderr,
+		discover: harness.Discover,
+		header: &report.Header{Given: report.Given{
+			Stream: run.stream, Corpus: run.corpus, Routes: run.routes, Compose: run.compose, Profiles: run.profiles,
+			Consumers: run.consumers, Timings: run.timingFlags,
+		}},
+	}
 }
 
 // prerunSteps are everything before the first consumer check, in order. Every refusal comes before
@@ -132,6 +154,13 @@ func (c *composeCheck) prerunSteps() []step {
 		{name: "ca-file", run: c.writeCAFile},
 		{name: "relays", run: c.startRelays},
 		{name: "bus", run: c.openBus},
+		{name: "seed", run: c.seed},
+		{name: "jobs", run: c.jobs},
+		{name: "snapshot", run: c.snapshot},
+		{name: "checkpoint-b0", run: c.checkpointB0},
+		{name: "probe", run: c.probe},
+		{name: "checkpoint-b1", run: c.checkpointB1},
+		{name: "discovery", run: c.discovery},
 	}
 }
 
@@ -177,6 +206,11 @@ func (c *composeCheck) open(ctx context.Context) error {
 
 	c.stderr.line(checkStartLine(engine.CheckID(), engine.PrivateDir()))
 	c.stderr.line(sweepLine(engine.Sweep()))
+
+	c.hashKey = make([]byte, hashKeyLen)
+	if _, err := rand.Read(c.hashKey); err != nil {
+		return fmt.Errorf("generate the effect hash key: %w", err)
+	}
 
 	return nil
 }
@@ -445,6 +479,178 @@ func (c *composeCheck) openBus(ctx context.Context) error {
 	c.bus = bus
 
 	return c.engine.LogHostPath(dir) //nolint:wrapcheck // named with its step by prepare.
+}
+
+func (c *composeCheck) seed(ctx context.Context) error {
+	return c.deps.Seed(ctx) //nolint:wrapcheck // named with its step by prepare.
+}
+
+// jobs runs the discovered jobs inside the seed-phase bracket, when there are any.
+func (c *composeCheck) jobs(ctx context.Context) error {
+	return runJobs(ctx, c.deps.Discovered(), c.openSeedBus, c.deps.Jobs, c.topology.EndSeedBus)
+}
+
+// openSeedBus opens the path jobs reach the bus by during the seed phase, unrecorded.
+func (c *composeCheck) openSeedBus(ctx context.Context) error {
+	client, err := addrPortOf(c.bus.URL())
+	if err != nil {
+		return err
+	}
+
+	return c.topology.SeedBus(ctx, client, c.bus.MonitorAddr()) //nolint:wrapcheck // named by prepare.
+}
+
+// runJobs runs the jobs between opening and closing the seed bus, which is closed whether they succeed
+// or not. With no job to run, nothing is opened.
+func runJobs(ctx context.Context, discovered []string, open, run, closeBus func(context.Context) error) error {
+	if len(discovered) == 0 {
+		return nil
+	}
+
+	if err := open(ctx); err != nil {
+		return err
+	}
+
+	return errors.Join(run(ctx), closeBus(ctx))
+}
+
+// snapshot proves every seed clean and commits it; the seed records are the header's account of what
+// every start begins from.
+func (c *composeCheck) snapshot(ctx context.Context) error {
+	if err := c.deps.Snapshot(ctx); err != nil {
+		return err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	records := c.deps.Records()
+	c.header.Seeds = &records
+
+	return nil
+}
+
+// checkpointB0 takes the bus before any start of the service, and surveys it: a stream present now
+// was made by a job.
+func (c *composeCheck) checkpointB0(ctx context.Context) error {
+	var err error
+
+	c.b0, err = c.checkpoint(ctx, provision.HostB0)
+	if err != nil {
+		return err
+	}
+
+	c.before, err = c.bus.Survey(ctx)
+
+	return err //nolint:wrapcheck // named with its step by prepare.
+}
+
+// needsProbe reports a stream absent at B0: whether the service makes it is learned by starting it.
+func needsProbe(survey corpus.Survey) bool {
+	return !survey.Exists()
+}
+
+// probe runs the probe start from B0, when the stream is absent, and surveys the bus it left.
+func (c *composeCheck) probe(ctx context.Context) error {
+	if !needsProbe(c.before) {
+		return nil
+	}
+
+	began := time.Now()
+	probed, err := harness.ProbeStart(ctx, c.startConfig(rules.KindProbe, &c.b0))
+	c.stderr.line(runLine("", runProbe, policy.FaultNone, time.Since(began), 0))
+
+	if err != nil {
+		return err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	c.probed = &probed
+	c.after, err = c.bus.Survey(ctx)
+
+	return err //nolint:wrapcheck // named with its step by prepare.
+}
+
+// checkpointB1 settles who owns the stream — a job, the service, or Stutter — from B0 again, and takes
+// the checkpoint discovery and every run start from.
+func (c *composeCheck) checkpointB1(ctx context.Context) error {
+	after := c.before
+
+	if c.probed != nil {
+		if err := c.bus.Restore(ctx, c.b0); err != nil {
+			return err //nolint:wrapcheck // named with its step by prepare.
+		}
+
+		after = c.after
+	}
+
+	if err := c.bus.Establish(ctx, c.before, after, c.loaded.Messages); err != nil {
+		return err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	var err error
+
+	c.b1, err = c.checkpoint(ctx, provision.HostB1)
+
+	return err
+}
+
+// checkpoint copies the bus store into the check-private entry name.
+func (c *composeCheck) checkpoint(ctx context.Context, name provision.HostName) (corpus.Checkpoint, error) {
+	dir, err := c.engine.HostPath(name)
+	if err != nil {
+		return corpus.Checkpoint{}, err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	checkpoint, err := c.bus.Checkpoint(ctx, dir)
+	if err != nil {
+		return corpus.Checkpoint{}, err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	return checkpoint, c.engine.LogHostPath(dir) //nolint:wrapcheck // named with its step by prepare.
+}
+
+// discovery reads the consumers the service creates, from B1 — unless the probe start saw the stream
+// appear and read them already, on the same start.
+func (c *composeCheck) discovery(ctx context.Context) error {
+	if c.probed != nil && c.probed.Discovery != nil {
+		c.found = *c.probed.Discovery
+
+		return nil
+	}
+
+	began := time.Now()
+	found, err := c.discover(ctx, c.startConfig(rules.KindDiscovery, &c.b1))
+	c.stderr.line(runLine("", runDiscovery, policy.FaultNone, time.Since(began), 0))
+	c.found = found
+
+	return err
+}
+
+// startConfig is the harness configuration every start of the check shares: its bus, its listeners, a
+// target container of kind, the dependencies restored before every start, the check's hash key and
+// the timings given. baseline is the bus checkpoint the start restores.
+func (c *composeCheck) startConfig(kind rules.Kind, baseline *corpus.Checkpoint) harness.Config {
+	return harness.Config{
+		Corpus: c.bus, Listeners: c.topology.Listeners(), Start: c.target().startAs(kind), Baseline: baseline,
+		Reset: c.restore, HashKey: c.hashKey, Startup: c.run.startup, Quiesce: c.run.quiesce,
+	}
+}
+
+// target is the service under test's container, as every start places it.
+func (c *composeCheck) target() *target {
+	return &target{
+		engine: c.engine, topology: c.topology, deps: c.deps, model: c.model, service: c.run.service,
+		ca: c.caPath, image: c.images[c.run.service],
+	}
+}
+
+// restore replaces every started dependency before a start, and keeps where each came back.
+func (c *composeCheck) restore(ctx context.Context) error {
+	restored, err := c.deps.Restore(ctx)
+	if err != nil {
+		return err //nolint:wrapcheck // the harness names the reset.
+	}
+
+	c.setRestored(restored)
+
+	return nil
 }
 
 // upstreams is the listener set's upstream source: the latest restore, and where the bus is now —

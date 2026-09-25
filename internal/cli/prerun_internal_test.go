@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"net/netip"
 	"os"
@@ -17,6 +19,7 @@ import (
 	"time"
 
 	"github.com/Wintersta7e/stutter/internal/corpus"
+	"github.com/Wintersta7e/stutter/internal/harness"
 )
 
 // preRunOrder is the pre-run order: every refusal, then the engine and the ledger, the corpus and the
@@ -24,9 +27,10 @@ import (
 // networks and the classification containers, the frozen endpoint split, then the listeners, the
 // verified address, the CA file, the relays and the bus.
 var preRunOrder = []string{
-	"preconditions", "static-self", "host-networking", "open", "corpus", "model", "classify", "fingerprint",
+	"preconditions", "static-self", "host-networking", "open", "corpus", "model", "classify", stepFingerprint,
 	"refusals", "images", "reclassify", "bus-urls", "relay-image", "networks", stepClassificationContainers,
-	stepDependencies, stepLayout, "listeners", "verify", "ca-file", "relays", "bus",
+	stepDependencies, stepLayout, "listeners", "verify", "ca-file", "relays", "bus", "seed", stepJobs, stepSnapshot,
+	stepCheckpointB0, stepProbe, stepCheckpointB1, "discovery",
 }
 
 // Step names several ordering rules name.
@@ -34,6 +38,12 @@ const (
 	stepClassificationContainers = "classification-containers"
 	stepDependencies             = "dependencies"
 	stepLayout                   = "layout"
+	stepCheckpointB0             = "checkpoint-b0"
+	stepCheckpointB1             = "checkpoint-b1"
+	stepProbe                    = "probe"
+	stepFingerprint              = "fingerprint"
+	stepJobs                     = "jobs"
+	stepSnapshot                 = "snapshot"
 )
 
 func stepNames(steps []step) []string {
@@ -74,7 +84,7 @@ func TestThePreRunOrderIsTheSpecOrder(t *testing.T) {
 			"preconditions", "static-self", "host-networking",
 		}, []string{"open"}},
 		{"the start walk and the key refusals precede the first mutation", []string{
-			"fingerprint", "refusals",
+			stepFingerprint, "refusals",
 		}, []string{"images"}},
 		{"a TLS bus URL is refused before anything starts", []string{"bus-urls"}, []string{"relay-image"}},
 		{"classification runs between the networks and the listeners", []string{"networks"}, []string{
@@ -85,6 +95,14 @@ func TestThePreRunOrderIsTheSpecOrder(t *testing.T) {
 		}, []string{"listeners"}},
 		{"the CA file follows the verified address", []string{"verify"}, []string{"ca-file"}},
 		{"the bus opens after the relays", []string{"relays"}, []string{"bus"}},
+		{"seed, jobs and snapshot run in that order before B0", []string{"seed"}, []string{
+			stepJobs, stepSnapshot, stepCheckpointB0,
+		}},
+		{"jobs precede the snapshot", []string{stepJobs}, []string{stepSnapshot}},
+		{"the snapshot precedes B0", []string{stepSnapshot}, []string{stepCheckpointB0}},
+		{"the start walk precedes the probe start", []string{stepFingerprint}, []string{stepProbe}},
+		{"the probe start restores B0", []string{stepCheckpointB0}, []string{stepProbe}},
+		{"discovery restores B1", []string{stepCheckpointB1}, []string{"discovery"}},
 	}
 
 	for _, rule := range rules {
@@ -234,5 +252,104 @@ func TestTheCAFileIsOnePemBlockReadOnly(t *testing.T) {
 	twice := filepath.Join(t.TempDir(), "ca.pem")
 	if err := writeCA(twice, append(slices.Clone(certificate), certificate...)); err == nil {
 		t.Error("two certificates were written as the check's CA")
+	}
+}
+
+// TestTheSeedBusBracketClosesOnEveryPath: jobs reach the bus only through the seed bus, which is closed
+// whether they succeed or not — and never opened when there is no job.
+func TestTheSeedBusBracketClosesOnEveryPath(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		jobsErr    error
+		name       string
+		discovered []string
+		wantOpened int
+	}{
+		{name: "no job", wantOpened: 0},
+		{name: "jobs succeed", discovered: []string{"migrate"}, wantOpened: 1},
+		{name: "a job fails", discovered: []string{"migrate"}, jobsErr: errRunFailed, wantOpened: 1},
+	} {
+		var opened, ran, closed int
+
+		err := runJobs(t.Context(), testCase.discovered,
+			func(context.Context) error { opened++; return nil },
+			func(context.Context) error { ran++; return testCase.jobsErr },
+			func(context.Context) error { closed++; return nil },
+		)
+
+		if !errors.Is(err, testCase.jobsErr) || (testCase.jobsErr == nil) != (err == nil) {
+			t.Errorf("%s: runJobs = %v, want %v", testCase.name, err, testCase.jobsErr)
+		}
+
+		if opened != testCase.wantOpened || ran != testCase.wantOpened || closed != testCase.wantOpened {
+			t.Errorf("%s: opened %d, ran %d, closed %d; want %d each", testCase.name, opened, ran, closed,
+				testCase.wantOpened)
+		}
+	}
+}
+
+// TestAJobOwnedStreamSkipsTheProbe: a stream that exists at B0 was made by a job, and the probe start
+// only ever asks who makes it.
+func TestAJobOwnedStreamSkipsTheProbe(t *testing.T) {
+	t.Parallel()
+
+	bus, err := corpus.Open(t.Context(), filepath.Join(t.TempDir(), "store"), "ORDERS")
+	if err != nil {
+		t.Fatalf("open the bus: %v", err)
+	}
+
+	t.Cleanup(bus.Close)
+
+	absent, err := bus.Survey(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !needsProbe(absent) {
+		t.Error("a stream absent at B0 skips the probe start")
+	}
+
+	messages := []corpus.Message{{Subject: "orders.created", Payload: []byte("{}"), Seq: 1}}
+	if err = bus.Establish(t.Context(), absent, absent, messages); err != nil {
+		t.Fatalf("make the stream: %v", err)
+	}
+
+	present, err := bus.Survey(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if needsProbe(present) {
+		t.Error("a stream present at B0 runs the probe start")
+	}
+}
+
+// TestAProbeThatBecameDiscoveryIsNotRepeated: a probe start that saw the stream appear read the
+// consumers already, on the same start; a second start would only cost time.
+func TestAProbeThatBecameDiscoveryIsNotRepeated(t *testing.T) {
+	t.Parallel()
+
+	discovered := harness.Discovery{Consumers: []harness.Found{{Name: "reserve"}}}
+	calls := 0
+
+	check := newComposeCheck(composeRun{}, nil)
+	check.probed = &harness.Probe{Created: true, Discovery: &discovered}
+	check.discover = func(context.Context, harness.Config) (harness.Discovery, error) {
+		calls++
+
+		return harness.Discovery{}, nil
+	}
+
+	if err := check.discovery(t.Context()); err != nil {
+		t.Fatalf("discovery: %v", err)
+	}
+
+	if calls != 0 {
+		t.Errorf("discovery ran %d more starts after the probe start doubled as it", calls)
+	}
+
+	if len(check.found.Consumers) != 1 || check.found.Consumers[0].Name != "reserve" {
+		t.Errorf("the kept discovery is %+v, want the probe start's", check.found)
 	}
 }

@@ -842,3 +842,18 @@ github.com/Wintersta7e/stutter/internal/cli.composeCheck.writeCAFile
 github.com/Wintersta7e/stutter/internal/cli.newComposeCheck
 github.com/Wintersta7e/stutter/internal/cli.sweepLine
 github.com/Wintersta7e/stutter/internal/cli.writeCA
+# Seeding, stream ownership, the probe start and discovery: run by `stutter check --compose` before its consumer checks.
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.checkpoint
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.checkpointB0
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.checkpointB1
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.discovery
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.jobs
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.openSeedBus
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.probe
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.restore
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.seed
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.snapshot
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.startConfig
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.target
+github.com/Wintersta7e/stutter/internal/cli.needsProbe
+github.com/Wintersta7e/stutter/internal/cli.runJobs

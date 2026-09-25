@@ -47,8 +47,6 @@ type started struct {
 
 // startAs is the harness Start for one kind of start: the probe start, discovery, or a run's target.
 // A start that fails after its container was created removes it, so the next start can take its name.
-//
-//nolint:unused // the compose branch's pre-run steps and consumer checks call it once it is wired.
 func (t *target) startAs(kind rules.Kind) harness.Start {
 	return func(ctx context.Context, _ harness.Addresses) (harness.Consumer, error) {
 		var made started
