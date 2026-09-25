@@ -91,3 +91,12 @@ github.com/Wintersta7e/stutter/internal/proxy/http.routesError
 github.com/Wintersta7e/stutter/internal/proxy/http.text
 # Summing the per-host stub tally over consumer checks: called by `stutter check --compose` for its header.
 github.com/Wintersta7e/stutter/internal/proxy/http.SumTallies
+# Aggregating consumer checks into one verdict: called by `stutter check --compose` after its last consumer check.
+github.com/Wintersta7e/stutter/internal/report.ConsumerCheck.Bucket
+github.com/Wintersta7e/stutter/internal/report.ConsumerCheck.heldBy
+github.com/Wintersta7e/stutter/internal/report.ConsumerCheck.instability
+github.com/Wintersta7e/stutter/internal/report.Invocation.ExitCode
+github.com/Wintersta7e/stutter/internal/report.Invocation.Judged
+github.com/Wintersta7e/stutter/internal/report.Invocation.counts
+github.com/Wintersta7e/stutter/internal/report.Report.attempted
+github.com/Wintersta7e/stutter/internal/report.siblingReservation

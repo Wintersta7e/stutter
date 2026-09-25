@@ -284,6 +284,28 @@ type Finding struct {
 	Reservations []string
 }
 
+// Coverage is how far one fault was tried against a consumer: whether it was legal at all, and for a
+// legal one how every message-and-fault pair was spent. A pair is attempted, unexpressed or cut by
+// the budget, exactly one of the three, so a coverage line always adds up.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type Coverage struct {
+	// Fault is the fault this line covers.
+	Fault policy.Fault
+	// Clause is the configuration that licensed the fault, or the one that refused it.
+	Clause string
+	// Pairs is how many message-and-fault pairs a legal fault had: one per message.
+	Pairs int
+	// Attempted counts the pairs a run was made for.
+	Attempted int
+	// Unexpressed counts the pairs the session could not express the fault for.
+	Unexpressed int
+	// CutByBudget counts the pairs never reached because the run budget ran out.
+	CutByBudget int
+	// Legal reports the consumer's configuration permitting the fault.
+	Legal bool
+}
+
 // Report is a completed run, ready to render and to exit on.
 //
 // Field order is dictated by govet's fieldalignment check, not by reading order.
@@ -296,6 +318,8 @@ type Report struct {
 	Gates []GateCheck
 	// Findings are the divergences that were ruled on. Always empty when a gate was violated.
 	Findings []Finding
+	// Coverage is one line per fault the check considers, in the order it tried them.
+	Coverage []Coverage
 	// Scan is how much ground the run covered.
 	Scan Scan
 	// Silenced counts divergences a declared invariant classified as acceptable. Counted rather
