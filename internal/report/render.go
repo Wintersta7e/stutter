@@ -49,7 +49,7 @@ func (r Report) String() string {
 
 func (r Report) lines() []string {
 	if r.Setup != nil {
-		return setupLines(r.Setup)
+		return setupLines(r.Setup, r.Completed)
 	}
 
 	lines := []string{scanLine(r.Scan)}
@@ -87,6 +87,12 @@ func (r Report) lines() []string {
 // Both render as WARN, and without this they read identically — so the one that has a next step
 // gets ignored alongside the one that does not.
 func guardDependentLines(findings []Finding) []string {
+	return guardDependentNote(findings,
+		"divergence was acceptable. Override the stub named above to get a firm verdict.")
+}
+
+// guardDependentNote is the guard-dependence note, closing with the next step its reader can take.
+func guardDependentNote(findings []Finding, nextStep string) []string {
 	warnings, guarded := 0, 0
 
 	for _, finding := range findings {
@@ -119,18 +125,20 @@ func guardDependentLines(findings []Finding) []string {
 	return []string{
 		pad("NOTE", statusColumn) + share + verb +
 			"guard-dependent: Stutter could not decide, rather than deciding the",
-		detailIndent + "divergence was acceptable. Override the stub named above to get a firm verdict.",
+		detailIndent + nextStep,
 	}
 }
 
-// setupLines renders a run that never started. Nothing was replayed, so saying exactly that is the
-// whole message: a setup error is not evidence about the consumers under test.
-func setupLines(err error) []string {
-	return []string{
-		"Setup failed: " + err.Error(),
-		"",
-		"Nothing was replayed, so no gate ran and no findings were computed.",
+// setupLines renders a check that could not be carried out. A setup error is not evidence about the
+// consumers under test, so no verdict follows it; before any run completed nothing was replayed, and
+// saying exactly that is the whole message, but after runs completed that sentence would be false.
+func setupLines(err error, completed int) []string {
+	closing := "Nothing was replayed, so no gate ran and no findings were computed."
+	if completed > 0 {
+		closing = setupAfterRuns(completed)
 	}
+
+	return []string{"Setup failed: " + err.Error(), "", closing}
 }
 
 func scanLine(scan Scan) string {

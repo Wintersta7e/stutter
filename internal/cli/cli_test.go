@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Wintersta7e/stutter/internal/cli"
@@ -48,15 +49,15 @@ func TestCommandSurface(t *testing.T) {
 		{name: "unknown command names it", args: []string{"wibble"}, wantErr: `unknown command "wibble"`, wantCode: 3},
 		{name: "version exits clean", args: []string{"version"}, wantCode: 0},
 		{
-			name:     "check without a database is a setup error",
+			name:     "check naming nothing to check names both paths",
 			args:     []string{"check"},
-			wantErr:  "--postgres is required",
+			wantErr:  "--compose",
 			wantCode: 3,
 		},
 		{
-			name:     "gate without a database is a setup error",
+			name:     "gate naming nothing to check names both paths",
 			args:     []string{"gate"},
-			wantErr:  "--postgres is required",
+			wantErr:  "--postgres",
 			wantCode: 3,
 		},
 		{
@@ -103,14 +104,31 @@ func TestVersionWritesSomething(t *testing.T) {
 	}
 }
 
-// TestUsageIsHonestAboutProvisioning keeps the help text from promising a capability that does not
-// exist. Stutter cannot yet point at a user's own service, and the usage must say so.
+// TestUsageIsHonestAboutProvisioning keeps the help text to what the compose path does and needs: the
+// four names, what a service must already do for zero declaration and the override file for the rest,
+// the hosts and engines it runs on, and the two faults a compose service can be given.
 func TestUsageIsHonestAboutProvisioning(t *testing.T) {
 	t.Parallel()
 
-	if got := run(t, "help"); !strings.Contains(got.stdout, "not built yet") {
-		t.Errorf("usage does not disclose that compose provisioning is missing:\n%s", got.stdout)
+	help := run(t, "help").stdout
+
+	tokens := []string{
+		"--compose", "--service", "--stream", "--corpus", "x-stutter", "service_completed_successfully",
+		"sslmode=require", "privileged", "volumes_from", "HTTP/1.1", "Linux", "WSL2", "Compose",
+		"STUTTER_TEST_DOCKER", "duplicate", "crash_before_ack",
 	}
+
+	for _, token := range tokens {
+		if !strings.Contains(help, token) {
+			t.Errorf("help does not carry %q", token)
+		}
+	}
+
+	if strings.Contains(help, "not built yet") {
+		t.Error("help still says compose provisioning is not built")
+	}
+
+	t.Logf("tokens=%d", len(tokens))
 }
 
 // TestRelayIsAHiddenCommand keeps the relay out of the user's view while the binary still runs it: a
@@ -229,5 +247,49 @@ func TestGateAgainstAReferenceConsumer(t *testing.T) {
 
 	if held != 1 {
 		t.Errorf("%d lines open with %q, want exactly one:\n%s", held, report.StatusHeld, got.stdout)
+	}
+}
+
+// TestConsumerIsComposeOnly: --consumer selects among discovered consumers, which only the compose
+// path has; on the reference path it is refused before anything is dialled.
+func TestConsumerIsComposeOnly(t *testing.T) {
+	t.Parallel()
+
+	var config net.ListenConfig
+
+	listener, err := config.Listen(t.Context(), "tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var accepted atomic.Int32
+
+	go func() {
+		for {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+
+			accepted.Add(1)
+
+			_ = conn.Close()
+		}
+	}()
+
+	got := run(t, "check", "--postgres", "postgres://u:p@"+listener.Addr().String()+"/db", "--consumer", "x")
+
+	if closeErr := listener.Close(); closeErr != nil {
+		t.Fatal(closeErr)
+	}
+
+	t.Logf("accepts=%d", accepted.Load())
+
+	if got.code != 3 || !strings.Contains(got.stderr, "--consumer") {
+		t.Errorf("exit = %d, stderr = %q; want 3 naming --consumer", got.code, got.stderr)
+	}
+
+	if accepted.Load() != 0 {
+		t.Errorf("the refused check dialled the database %d times", accepted.Load())
 	}
 }

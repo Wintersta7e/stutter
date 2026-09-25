@@ -102,6 +102,9 @@ type Options struct {
 	// Invariants are the user's standing answers about which repeated work matters. Empty leaves
 	// every divergence to the protocol default, which is the zero-declaration starting point.
 	Invariants []Invariant
+	// Files names the corpus file each sequence came from, when the corpus was read from files. Every
+	// report carries it, and a repro names the file beside each sequence. Nil names none.
+	Files map[uint64]string
 	// Consumer names the consumer under test, for attribution.
 	Consumer string
 	// Config is the recorded consumer configuration. It decides which faults are legal.
@@ -133,15 +136,17 @@ func Run(ctx context.Context, session Session, opts Options) (report.Report, err
 type check struct {
 	session  Session
 	comparer *gate.Comparer
-	// unexpressed are the faults the session refused to express, each skipped after its first refusal.
-	unexpressed []policy.Fault
-	opts        Options
+	// coverage is one line per fault the hunt considered; the fault being hunted owns the last one.
+	coverage []report.Coverage
+	opts     Options
 	// passes counts every replay, including the reference pair and shrink candidates. It only names
 	// consumers uniquely.
 	passes int
 	// injected counts mutated runs, which is what MaxRuns caps. Counting every pass instead would
 	// let the reference pair alone exhaust a small budget and silently inject nothing.
 	injected int
+	// completed counts the runs that returned, whatever they were for.
+	completed int
 }
 
 func (c *check) execute(ctx context.Context) (report.Report, error) {
@@ -149,7 +154,7 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 
 	clean, err := c.cleanPair(ctx)
 	if err != nil {
-		return report.SetupFailed(err), nil
+		return c.setupFailed(err), nil
 	}
 
 	reference, repeat := clean[0], clean[1]
@@ -170,6 +175,7 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 	gated := report.New(scan, gates, nil)
 	gated.Health = &health
 	gated.GatesOnly = c.opts.GatesOnly
+	gated.Files = c.opts.Files
 
 	if len(gated.Violations()) > 0 || c.opts.GatesOnly {
 		return gated, nil
@@ -184,13 +190,24 @@ func (c *check) execute(ctx context.Context) (report.Report, error) {
 	}
 
 	if err != nil {
-		return report.SetupFailed(err), nil
+		return c.setupFailed(err), nil
 	}
 
 	built := report.New(scan, gates, divergences)
 	built.Health = &health
+	built.Files = c.opts.Files
+	built.Coverage = c.coverage
 
 	return built, nil
+}
+
+// setupFailed reports a check that could not be carried out, counting the runs that completed first.
+func (c *check) setupFailed(err error) report.Report {
+	failed := report.SetupFailed(err)
+	failed.Files = c.opts.Files
+	failed.Completed = c.completed
+
+	return failed
 }
 
 // cleanPair runs the reference and repeat clean runs, refusing either one nothing can be compared
@@ -248,11 +265,11 @@ func (c *check) health(reference, repeat replay.Result, compared []effect.Effect
 		acted[item.MessageSeq] = struct{}{}
 	}
 
-	silent := 0
+	var silent []uint64
 
 	for _, seq := range c.opts.Messages {
 		if _, did := acted[seq]; !did {
-			silent++
+			silent = append(silent, seq)
 		}
 	}
 
@@ -261,7 +278,8 @@ func (c *check) health(reference, repeat replay.Result, compared []effect.Effect
 		Delivered:       reference.Delivered,
 		Failed:          reference.Failed,
 		Effects:         len(compared),
-		Silent:          silent,
+		Silent:          len(silent),
+		SilentSeqs:      silent,
 		Setup:           reference.Setup,
 		Late:            reference.Late,
 		Refusals:        reference.Refusals,
@@ -276,25 +294,39 @@ func (c *check) health(reference, repeat replay.Result, compared []effect.Effect
 	}
 }
 
-// hunt injects every permitted fault against every message, within the run budget.
+// hunt injects every permitted fault against every message, within the run budget, and accounts for
+// every fault it considered in the coverage: illegal, or each pair attempted, unexpressed or cut.
 func (c *check) hunt(ctx context.Context, reference replay.Result) ([]report.Divergence, error) {
-	var found []report.Divergence
+	var (
+		found []report.Divergence
+		spent bool
+	)
 
 	for _, fault := range faultOrder {
-		if !c.opts.Config.Permits(fault).Permitted {
+		verdict := c.opts.Config.Permits(fault)
+		line := report.Coverage{Fault: fault, Clause: verdict.Clause, Legal: verdict.Permitted}
+
+		if verdict.Permitted {
+			line.Pairs = len(c.opts.Messages)
+		}
+
+		if spent {
+			line.CutByBudget = line.Pairs
+		}
+
+		c.coverage = append(c.coverage, line)
+
+		if !verdict.Permitted || spent {
 			continue
 		}
 
-		diverged, spent, err := c.huntFault(ctx, reference, fault)
+		diverged, exhausted, err := c.huntFault(ctx, reference, fault)
 		if err != nil {
 			return nil, err
 		}
 
 		found = append(found, diverged...)
-
-		if spent {
-			break
-		}
+		spent = exhausted
 	}
 
 	return found, nil
@@ -304,7 +336,7 @@ func (c *check) hunt(ctx context.Context, reference replay.Result) ([]report.Div
 //
 // A fault the session cannot express is refused alike for every message, and each attempt costs a
 // reset before the refusal: after the first, the fault is skipped for the rest of the consumer's
-// messages and noted as unexpressed, so it is paid for once and never once per message.
+// messages and counted as unexpressed, so it is paid for once and never once per message.
 func (c *check) huntFault(
 	ctx context.Context,
 	reference replay.Result,
@@ -312,14 +344,18 @@ func (c *check) huntFault(
 ) ([]report.Divergence, bool, error) {
 	var found []report.Divergence
 
-	for _, seq := range c.opts.Messages {
+	line := &c.coverage[len(c.coverage)-1]
+
+	for index, seq := range c.opts.Messages {
 		if c.opts.MaxRuns > 0 && c.injected >= c.opts.MaxRuns {
+			line.CutByBudget += len(c.opts.Messages) - index
+
 			return found, true, nil
 		}
 
 		divergence, diverged, err := c.attempt(ctx, reference, fault, seq)
 		if errors.Is(err, replay.ErrUnsupported) {
-			c.unexpressed = append(c.unexpressed, fault)
+			line.Unexpressed += len(c.opts.Messages) - index
 
 			return found, false, nil
 		}
@@ -360,6 +396,7 @@ func (c *check) attempt(
 
 	// Counted only once the run happened, so a fault the session refused costs the budget nothing.
 	c.injected++
+	c.coverage[len(c.coverage)-1].Attempted++
 
 	// Every comparison and every position taken from one uses the rejected-free view: the gate
 	// reports an ordinal within the sequence it was given, so indexing a different one would name a
@@ -547,7 +584,7 @@ func (c *check) shrink(ctx context.Context, mutation replay.Mutation) (string, e
 		return "", fmt.Errorf("shrink %s: %w", mutation.Fault(), err)
 	}
 
-	return describeRepro(minimal, stats), nil
+	return describeRepro(minimal, stats, c.opts.Files), nil
 }
 
 // pass resets the session and replays once. Every pass gets a distinct consumer name: reusing one
@@ -569,6 +606,8 @@ func (c *check) pass(
 	if err != nil {
 		return replay.Result{}, fmt.Errorf("run %s: %w", name, err)
 	}
+
+	c.completed++
 
 	return result, nil
 }
@@ -667,20 +706,11 @@ func summarise(outcome gate.Result) string {
 	}
 }
 
-func describeRepro(minimal shrink.Candidate, stats shrink.Stats) string {
-	repro := "messages " + joinSeqs(minimal.Messages)
+func describeRepro(minimal shrink.Candidate, stats shrink.Stats, files map[uint64]string) string {
+	repro := "messages " + report.Sequences(minimal.Messages, files)
 	if !stats.Minimal() {
 		return repro + " (search hit its attempt cap; smaller may exist)"
 	}
 
 	return repro
-}
-
-func joinSeqs(seqs []uint64) string {
-	parts := make([]string, 0, len(seqs))
-	for _, seq := range seqs {
-		parts = append(parts, "#"+strconv.FormatUint(seq, 10))
-	}
-
-	return strings.Join(parts, ", ")
 }

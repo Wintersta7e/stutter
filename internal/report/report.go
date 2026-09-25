@@ -169,6 +169,8 @@ type Scan struct {
 type Health struct {
 	// Refusals are the requests the bus declined before the first delivery.
 	Refusals []effect.Refusal
+	// SilentSeqs are the messages that produced no effect, in corpus order: the ones Silent counts.
+	SilentSeqs []uint64
 	// Exit is how the service ended a clean run it exited by itself after every message was done
 	// (E26): recorded beside the verdict, never a verdict of its own. Zero when it did not exit.
 	Exit replay.Exit
@@ -284,6 +286,28 @@ type Finding struct {
 	Reservations []string
 }
 
+// Coverage is how far one fault was tried against a consumer: whether it was legal at all, and for a
+// legal one how every message-and-fault pair was spent. A pair is attempted, unexpressed or cut by
+// the budget, exactly one of the three, so a coverage line always adds up.
+//
+// Field order is dictated by govet's fieldalignment check, not by reading order.
+type Coverage struct {
+	// Fault is the fault this line covers.
+	Fault policy.Fault
+	// Clause is the configuration that licensed the fault, or the one that refused it.
+	Clause string
+	// Pairs is how many message-and-fault pairs a legal fault had: one per message.
+	Pairs int
+	// Attempted counts the pairs a run was made for.
+	Attempted int
+	// Unexpressed counts the pairs the session could not express the fault for.
+	Unexpressed int
+	// CutByBudget counts the pairs never reached because the run budget ran out.
+	CutByBudget int
+	// Legal reports the consumer's configuration permitting the fault.
+	Legal bool
+}
+
 // Report is a completed run, ready to render and to exit on.
 //
 // Field order is dictated by govet's fieldalignment check, not by reading order.
@@ -292,15 +316,22 @@ type Report struct {
 	Setup error
 	// Health is the clean run's, rendered beside the verdict it qualifies. Nil when not measured.
 	Health *Health
+	// Files names the corpus file each message sequence came from, when the corpus was read from files.
+	Files map[uint64]string
 	// Gates are the checks that ran. A report naming no gates claims none ran.
 	Gates []GateCheck
 	// Findings are the divergences that were ruled on. Always empty when a gate was violated.
 	Findings []Finding
+	// Coverage is one line per fault the check considers, in the order it tried them.
+	Coverage []Coverage
 	// Scan is how much ground the run covered.
 	Scan Scan
 	// Silenced counts divergences a declared invariant classified as acceptable. Counted rather
 	// than dropped silently, so a run that silenced everything does not read as a clean one.
 	Silenced int
+	// Completed counts the runs that finished before a setup error: a setup error after runs is not
+	// a check where nothing was replayed.
+	Completed int
 	// GatesOnly means the check stopped after the gates and injected nothing. Its closing line then
 	// says so instead of PASS.
 	GatesOnly bool

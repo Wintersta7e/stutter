@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 	"crypto/rand"
-	"errors"
+	"encoding/hex"
 	"fmt"
 	"os"
 
@@ -14,12 +14,17 @@ import (
 	"github.com/Wintersta7e/stutter/internal/toy"
 )
 
-// errNoDatabase means the command was run without somewhere to replay against.
-var errNoDatabase = errors.New("--postgres is required: stutter replays into a real database")
-
-// referenceSKU is the stock item the reference consumer moves. Fixture state is scoped to it, so a
-// run does not disturb anything else in the database it is pointed at.
+// referenceSKU prefixes the stock item the reference consumer moves. Fixture state is scoped to one
+// item per invocation, so a run disturbs nothing else in the database it is pointed at — another
+// invocation's fixture included.
 const referenceSKU = "STUTTER-REFERENCE-WIDGET"
+
+// referenceConsumer is the consumer the reference path's findings attribute to: the one consumer the
+// reference corpus is checked against, named, never a flag.
+const referenceConsumer = "reserve_stock"
+
+// skuSuffixLen is how many random bytes make one invocation's stock item its own.
+const skuSuffixLen = 8
 
 const (
 	referenceQty = 3
@@ -35,7 +40,12 @@ func execute(ctx context.Context, parsed settings, gatesOnly bool) (report.Repor
 
 	defer cleanup()
 
-	messages, err := publishReference(ctx, store)
+	sku, err := newReferenceSKU()
+	if err != nil {
+		return report.Report{}, err
+	}
+
+	messages, err := publishReference(ctx, store, sku)
 	if err != nil {
 		return report.Report{}, err
 	}
@@ -47,16 +57,21 @@ func execute(ctx context.Context, parsed settings, gatesOnly bool) (report.Repor
 
 	config := referenceConfig()
 
-	sandbox, err := harness.New(toy.SandboxConfig(store, parsed.postgres, referenceSKU, config, key))
+	sandboxConfig := toy.SandboxConfig(store, parsed.postgres.value, sku, config, key)
+	if parsed.quiesce.set {
+		sandboxConfig.Quiesce = parsed.quiesce.value
+	}
+
+	sandbox, err := harness.New(sandboxConfig)
 	if err != nil {
 		return report.Report{}, fmt.Errorf("provision the sandbox: %w", err)
 	}
 
 	result, err := check.Run(ctx, sandbox, check.Options{
 		Messages:  messages,
-		Consumer:  parsed.consumer,
+		Consumer:  referenceConsumer,
 		Config:    config,
-		MaxRuns:   parsed.maxRuns,
+		MaxRuns:   parsed.maxRuns.value,
 		GatesOnly: gatesOnly,
 	})
 	if err != nil {
@@ -90,14 +105,14 @@ func startCorpus(ctx context.Context) (*corpus.Corpus, func(), error) {
 
 // publishReference writes the reference corpus: one message per handler, so a report shows a
 // failure and its controls side by side rather than a failure alone.
-func publishReference(ctx context.Context, store *corpus.Corpus) ([]uint64, error) {
+func publishReference(ctx context.Context, store *corpus.Corpus, sku string) ([]uint64, error) {
 	written := []struct {
 		subject string
 		payload []byte
 	}{
-		{toy.SubjectOrderCreated, order("REF-1", referenceQty)},
-		{toy.SubjectStockSet, order("REF-2", absoluteQty)},
-		{toy.SubjectOrderGuarded, order("REF-3", referenceQty)},
+		{toy.SubjectOrderCreated, order("REF-1", sku, referenceQty)},
+		{toy.SubjectStockSet, order("REF-2", sku, absoluteQty)},
+		{toy.SubjectOrderGuarded, order("REF-3", sku, referenceQty)},
 	}
 
 	messages := make([]uint64, 0, len(written))
@@ -114,6 +129,16 @@ func publishReference(ctx context.Context, store *corpus.Corpus) ([]uint64, erro
 	return messages, nil
 }
 
-func order(id string, qty int) []byte {
-	return fmt.Appendf(nil, `{"order_id":%q,"sku":%q,"qty":%d}`, id, referenceSKU, qty)
+func order(id, sku string, qty int) []byte {
+	return fmt.Appendf(nil, `{"order_id":%q,"sku":%q,"qty":%d}`, id, sku, qty)
+}
+
+// newReferenceSKU is one invocation's own stock item.
+func newReferenceSKU() (string, error) {
+	suffix := make([]byte, skuSuffixLen)
+	if _, err := rand.Read(suffix); err != nil {
+		return "", fmt.Errorf("generate the fixture's stock item: %w", err)
+	}
+
+	return referenceSKU + "-" + hex.EncodeToString(suffix), nil
 }
