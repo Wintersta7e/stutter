@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"path"
 	"slices"
 
 	"github.com/Wintersta7e/stutter/internal/compose"
@@ -91,7 +89,9 @@ func (t *target) startSteps(kind rules.Kind, made *started) []step {
 			return err //nolint:wrapcheck // named with its step by startAs.
 		}},
 		{name: "copy-in", run: func(ctx context.Context) error {
-			return copyIn(ctx, t.engine, made.container, made.spec.CopyIn)
+			err := t.engine.CopyInConfigs(ctx, made.container, made.spec.CopyIn)
+
+			return err //nolint:wrapcheck // named with its step by startAs.
 		}},
 		{name: "audit", run: func(ctx context.Context) error { return t.audit(ctx, made) }},
 		{name: "start", run: func(ctx context.Context) error {
@@ -145,27 +145,6 @@ func (t *target) audit(ctx context.Context, made *started) error {
 
 	if _, _, err := compose.Audit(made.spec, t.image, got); err != nil {
 		return err //nolint:wrapcheck // named with its step by startAs.
-	}
-
-	return nil
-}
-
-// copyIn copies a service's `content:` and `environment:` configs and secrets into its container
-// before it starts, one directory at a time.
-func copyIn(ctx context.Context, engine *provision.Engine, c *provision.Container, files []compose.CopyIn) error {
-	byDir := map[string][]provision.File{}
-
-	for _, file := range files {
-		dir := path.Dir(file.Target)
-		byDir[dir] = append(byDir[dir], provision.File{
-			Path: path.Base(file.Target), Data: file.Data(), Mode: file.Mode, UID: file.UID, GID: file.GID,
-		})
-	}
-
-	for _, dir := range slices.Sorted(maps.Keys(byDir)) {
-		if err := engine.CopyIn(ctx, c, dir, byDir[dir]); err != nil {
-			return err //nolint:wrapcheck // named with its step by startAs.
-		}
 	}
 
 	return nil
