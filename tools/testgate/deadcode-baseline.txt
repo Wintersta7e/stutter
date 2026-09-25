@@ -745,3 +745,16 @@ github.com/Wintersta7e/stutter/internal/report.scanText
 github.com/Wintersta7e/stutter/internal/report.unnamedClosing
 github.com/Wintersta7e/stutter/internal/report.withheldVerdicts
 github.com/Wintersta7e/stutter/internal/report.withoutDurations
+# Timing every run on stderr and the compose branch's stderr lines: printed by `stutter check --compose`.
+github.com/Wintersta7e/stutter/internal/cli.checkStartLine
+github.com/Wintersta7e/stutter/internal/cli.interruptLine
+github.com/Wintersta7e/stutter/internal/cli.keepLine
+github.com/Wintersta7e/stutter/internal/cli.keptText
+github.com/Wintersta7e/stutter/internal/cli.lockedWriter.Write
+github.com/Wintersta7e/stutter/internal/cli.lockedWriter.line
+github.com/Wintersta7e/stutter/internal/cli.logLine
+github.com/Wintersta7e/stutter/internal/cli.newLockedWriter
+github.com/Wintersta7e/stutter/internal/cli.runClass
+github.com/Wintersta7e/stutter/internal/cli.runLine
+github.com/Wintersta7e/stutter/internal/cli.timedSession.Reset
+github.com/Wintersta7e/stutter/internal/cli.timedSession.Run
