@@ -142,6 +142,8 @@ type Invocation struct {
 	// Setup is non-nil when the check could not be carried out as a whole: before the first consumer
 	// check, or a change that withholds every verdict. Nothing else here is then a verdict.
 	Setup error
+	// Header is what the check was pointed at, what it changed and what it cannot observe.
+	Header *Header
 	// Unnamed is the one check a service with no consumer gets; never counted as a discovered consumer.
 	Unnamed *ConsumerCheck
 	// Consumers are the discovered consumers, one each, in name order.

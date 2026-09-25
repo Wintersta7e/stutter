@@ -98,3 +98,46 @@ func illegalCoverage(fault, clause string) string {
 
 // noLegalFault closes the coverage of a consumer whose configuration licenses no fault.
 const noLegalFault = "0 legal faults: nothing was injected against this consumer, so this is not a pass"
+
+// Header row labels. Every row of a compose report's header opens with its label, so a reader and a
+// test alike can find and count the rows.
+const (
+	rowInputs       = "Compose:"
+	rowDeclarations = "Declared:"
+	rowEngine       = "Engine:"
+	rowImage        = "Image:"
+	rowHostMode     = "Host mode:"
+	rowDependencies = "Dependencies:"
+	rowSeeds        = "Seeds:"
+	rowSpec         = "Spec changes:"
+	rowCorpus       = "Corpus:"
+	rowHosts        = "External hosts:"
+	rowDisclosure   = "Not observed:"
+	rowReach        = "Reach:"
+	rowSetupEgress  = "Setup egress:"
+)
+
+// halfCloseLimit is disclosed beside host-alias mode, where it applies.
+const halfCloseLimit = "a reply sent after the client's half-close is lost on this engine's host path; " +
+	"it can hide a finding in an opaque dependency and never make one"
+
+// The disclosure block's fixed sentences: what a compose check never observes.
+const (
+	disclosureUDP      = "UDP traffic: never proxied, so never compared"
+	disclosureLoopback = "the service's own loopback: traffic inside its container is never seen"
+	disclosureLiterals = "hosts named by IP literal or loopback bypass DNS and reach no proxy"
+)
+
+// reservedPorts discloses the stub relay's own source ports, which the catch-all never answers.
+func reservedPorts(first, last uint16) string {
+	return "ports " + strconv.Itoa(int(first)) + "–" + strconv.Itoa(int(last)) +
+		" of external hosts: the stub relay's own source ports, never answered"
+}
+
+// reachSentence states that the proxies are reachable from every container on the engine while a
+// check runs, and that only the check's own connections are served.
+const reachSentence = "Stutter's proxies are reachable from every container on the engine during a check; " +
+	"a connection without this check's token is refused and counted"
+
+// setupEgressSentence discloses that setup is not observed.
+const setupEgressSentence = "jobs and dependencies may reach the network during setup, unobserved"
