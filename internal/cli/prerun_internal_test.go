@@ -310,7 +310,7 @@ func TestAJobOwnedStreamSkipsTheProbe(t *testing.T) {
 		t.Error("a stream absent at B0 skips the probe start")
 	}
 
-	messages := []corpus.Message{{Subject: "orders.created", Payload: []byte("{}"), Seq: 1}}
+	messages := []corpus.Message{{Subject: subjectCreated, Payload: []byte("{}"), Seq: 1}}
 	if err = bus.Establish(t.Context(), absent, absent, messages); err != nil {
 		t.Fatalf("make the stream: %v", err)
 	}
@@ -335,7 +335,7 @@ func TestAProbeThatBecameDiscoveryIsNotRepeated(t *testing.T) {
 
 	check := newComposeCheck(composeRun{}, nil)
 	check.probed = &harness.Probe{Created: true, Discovery: &discovered}
-	check.discover = func(context.Context, harness.Config) (harness.Discovery, error) {
+	check.discover = func(context.Context) (harness.Discovery, error) {
 		calls++
 
 		return harness.Discovery{}, nil

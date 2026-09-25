@@ -857,3 +857,22 @@ github.com/Wintersta7e/stutter/internal/cli.composeCheck.startConfig
 github.com/Wintersta7e/stutter/internal/cli.composeCheck.target
 github.com/Wintersta7e/stutter/internal/cli.needsProbe
 github.com/Wintersta7e/stutter/internal/cli.runJobs
+# One consumer check per discovered consumer, in name order: run by `stutter check --compose`.
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.buildSandbox
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.checkOne
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.checkOptions
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.consumerChecks
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.discoverStart
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.fileOf
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.sandboxes
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.setupReason
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.summarise
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.unnamedCheck
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.writeHold
+github.com/Wintersta7e/stutter/internal/cli.fillCollisionReason
+github.com/Wintersta7e/stutter/internal/cli.holdLines
+github.com/Wintersta7e/stutter/internal/cli.planConsumers
+github.com/Wintersta7e/stutter/internal/cli.planOne
+github.com/Wintersta7e/stutter/internal/cli.sandboxConfig
+github.com/Wintersta7e/stutter/internal/cli.unnamedReason
+github.com/Wintersta7e/stutter/internal/cli.unselected

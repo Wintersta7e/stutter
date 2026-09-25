@@ -22,6 +22,7 @@ import (
 	"github.com/Wintersta7e/stutter/internal/policy"
 	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
+	httpproxy "github.com/Wintersta7e/stutter/internal/proxy/http"
 	natsproxy "github.com/Wintersta7e/stutter/internal/proxy/nats"
 	"github.com/Wintersta7e/stutter/internal/proxy/pg"
 	"github.com/Wintersta7e/stutter/internal/relay"
@@ -53,18 +54,27 @@ type composeRun struct {
 	stream  string
 	corpus  string
 	routes  string
-	// compose are the --compose files as given; files are the same, absolute.
-	compose []string
-	files   []string
+	// timingFlags name each timing flag given.
+	timingFlags []string
+	// files are the --compose files, absolute, in the order given.
+	files []string
 	// profiles and consumers are --profile and --consumer, in the order given.
 	profiles  []string
 	consumers []string
-	// timingFlags name each timing flag given.
-	timingFlags []string
-	// startup and quiesce are --startup and --quiesce; zero leaves each to its owner's default.
+	// compose are the --compose files as given.
+	compose []string
+	// httpDefault and httpRoutes are the --routes file, decoded.
+	httpRoutes  []httpproxy.Route
+	httpDefault httpproxy.Response
+	// startup, quiesce and drain are the timing flags; zero leaves each to its owner's default.
 	startup time.Duration
 	quiesce time.Duration
+	drain   time.Duration
+	// maxRuns is each consumer check's own budget of faulted runs.
+	maxRuns int
 	keep    bool
+	// gatesOnly is the gate command.
+	gatesOnly bool
 }
 
 // composeCheck is one compose check's state, built step by step in the pre-run order.
@@ -75,8 +85,11 @@ type composeCheck struct {
 	before corpus.Survey
 	after  corpus.Survey
 	engine *provision.Engine
-	// discover is the discovery start: harness.Discover.
-	discover func(ctx context.Context, cfg harness.Config) (harness.Discovery, error)
+	// newSandbox builds one consumer check's sandbox; logHold writes one hold to the invocation log.
+	newSandbox func(plan consumerPlan) (sandbox, error)
+	logHold    func(hold provision.Hold) error
+	// discover is the discovery start from B1.
+	discover func(ctx context.Context) (harness.Discovery, error)
 	stderr   *lockedWriter
 	header   *report.Header
 	// upstreamMap turns one start's restores and the bus's addresses into the listener set's upstreams:
@@ -115,15 +128,19 @@ type composeCheck struct {
 }
 
 func newComposeCheck(run composeRun, stderr *lockedWriter) *composeCheck {
-	return &composeCheck{
-		run:      run,
-		stderr:   stderr,
-		discover: harness.Discover,
+	c := &composeCheck{
+		run:    run,
+		stderr: stderr,
 		header: &report.Header{Given: report.Given{
 			Stream: run.stream, Corpus: run.corpus, Routes: run.routes, Compose: run.compose, Profiles: run.profiles,
 			Consumers: run.consumers, Timings: run.timingFlags,
 		}},
 	}
+	c.discover = c.discoverStart
+	c.newSandbox = c.buildSandbox
+	c.logHold = c.writeHold
+
+	return c
 }
 
 // prerunSteps are everything before the first consumer check, in order. Every refusal comes before
@@ -616,11 +633,16 @@ func (c *composeCheck) discovery(ctx context.Context) error {
 	}
 
 	began := time.Now()
-	found, err := c.discover(ctx, c.startConfig(rules.KindDiscovery, &c.b1))
+	found, err := c.discover(ctx)
 	c.stderr.line(runLine("", runDiscovery, policy.FaultNone, time.Since(began), 0))
 	c.found = found
 
 	return err
+}
+
+// discoverStart is discovery's own start of the service, from B1.
+func (c *composeCheck) discoverStart(ctx context.Context) (harness.Discovery, error) {
+	return harness.Discover(ctx, c.startConfig(rules.KindDiscovery, &c.b1)) //nolint:wrapcheck // named by prepare.
 }
 
 // startConfig is the harness configuration every start of the check shares: its bus, its listeners, a
