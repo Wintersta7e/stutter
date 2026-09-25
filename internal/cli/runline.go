@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/Wintersta7e/stutter/internal/check"
 	"github.com/Wintersta7e/stutter/internal/policy"
+	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
@@ -120,6 +125,23 @@ func runLine(consumer, class string, fault policy.Fault, elapsed, span time.Dura
 // stdout never carries.
 func checkStartLine(checkID, privateDir string) string {
 	return "stutter: check id=" + checkID + " dir=" + privateDir
+}
+
+// sweepLine is what the sweep of dead checks found and did when the check opened: ledgers swept,
+// skipped and unreadable, removals that failed, and resources carrying a check label no ledger here
+// names, by check ID — listed, never removed.
+func sweepLine(sweep provision.SweepResult) string {
+	var line strings.Builder
+
+	line.WriteString("stutter: sweep swept=" + strconv.Itoa(len(sweep.Swept)) + " skipped=" +
+		strconv.Itoa(len(sweep.Skipped)) + " corrupt=" + strconv.Itoa(len(sweep.Corrupt)) + " failed=" +
+		strconv.Itoa(len(sweep.Failed)))
+
+	for _, id := range slices.Sorted(maps.Keys(sweep.Unledgered)) {
+		line.WriteString(" unledgered=" + id + ":" + strconv.Itoa(len(sweep.Unledgered[id])))
+	}
+
+	return line.String()
 }
 
 // logLine names one kept log file, never its content.

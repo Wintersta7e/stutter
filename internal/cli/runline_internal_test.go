@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wintersta7e/stutter/internal/provision"
 	"github.com/Wintersta7e/stutter/internal/replay"
 )
 
@@ -200,6 +201,9 @@ func TestTheStderrLinesNameWhatTheyPromise(t *testing.T) {
 		logLine(log):                 {"stutter: log " + log},
 		keepLine(checkID):            {"stutter: keep ", "id=" + checkID, "stutter clean --check " + checkID},
 		interruptLine():              {"stutter: ", "second interrupt", "stutter clean"},
+		sweepLine(provision.SweepResult{
+			Swept: []string{"a"}, Unledgered: map[string][]provision.Listed{"b": {{}, {}}},
+		}): {"stutter: sweep ", "swept=1", "unledgered=b:2"},
 	}
 
 	for line, wants := range cases {
