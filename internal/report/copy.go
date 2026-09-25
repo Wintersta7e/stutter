@@ -66,12 +66,14 @@ func bucketWord(bucket Bucket) string {
 	}
 }
 
-// admittedText is how many corpus messages a consumer's filters admit, and where the faults it is
-// checked under come from: its configuration as discovered from the running service.
+// admittedText is how many corpus messages a consumer's filters admit.
 func admittedText(admitted, total int) string {
-	return strconv.Itoa(admitted) + " of " + plural(total, "corpus message") +
-		" admitted; faults licensed by its discovered configuration"
+	return strconv.Itoa(admitted) + " of " + plural(total, "corpus message") + " admitted"
 }
+
+// licensedByDiscovery says where a discovered consumer's faults come from: its configuration as read back
+// from the running service. The unnamed check has no consumer, so it never says this.
+const licensedByDiscovery = "; faults licensed by its discovered configuration"
 
 // notJudgedLabel opens the line naming the messages that produced no effect on the clean run.
 const notJudgedLabel = "NOT JUDGED"

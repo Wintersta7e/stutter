@@ -496,11 +496,13 @@ func (h *Header) disclosure() []string {
 		lines = append(lines, detailIndent+host.Service+" "+host.Key+" names "+host.Host+", which bypasses DNS")
 	}
 
+	started := h.Classification.Started()
+
 	for _, dep := range h.Classification.Deps {
 		switch {
 		case dep.Role == compose.RoleSibling:
 			lines = append(lines, detailIndent+dep.Service+" is another consumer of the bus: stubbed, never started")
-		case slices.ContainsFunc(dep.Endpoints, opaque):
+		case slices.Contains(started, dep.Service) && slices.ContainsFunc(dep.Endpoints, opaque):
 			lines = append(lines, detailIndent+dep.Service+" is observed as bytes only: a divergence there is "+
 				"reported but not described")
 		default:

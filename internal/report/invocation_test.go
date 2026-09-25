@@ -382,6 +382,14 @@ func TestNoConsumerRendersTheUnnamedBlockAndNoPass(t *testing.T) {
 		t.Errorf("the unnamed block with its observation diagnosis is missing:\n%s", text)
 	}
 
+	if !strings.Contains(text, unnamed.Reason) {
+		t.Errorf("the unnamed block does not say why it ran, naming what the bus refused:\n%s", text)
+	}
+
+	if strings.Contains(text, "discovered configuration") {
+		t.Errorf("the unnamed block claims a discovered configuration, with no consumer discovered:\n%s", text)
+	}
+
 	if _, discovered := closing(t, text); discovered != 0 {
 		t.Errorf("the closing line states %d discovered consumers, want 0", discovered)
 	}
