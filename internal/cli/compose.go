@@ -218,7 +218,11 @@ func retention(ctx context.Context, inv report.Invocation, discoveryLog string) 
 		}
 	}
 
-	add(discoveryLog)
+	// Discovery's start always leaves a log; it is implicated only when discovery stopped the check.
+	if inv.Setup != nil {
+		add(discoveryLog)
+	}
+
 	add(exitLog(inv.Setup))
 
 	setUp := false
