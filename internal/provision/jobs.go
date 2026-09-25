@@ -101,7 +101,7 @@ func (d *Dependencies) auditAndRun(
 		return fmt.Errorf("%w: job %s: %w", ErrSeed, job, auditErr)
 	}
 
-	if copyErr := copyIn(ctx, eng, c, spec.CopyIn); copyErr != nil {
+	if copyErr := eng.CopyInConfigs(ctx, c, spec.CopyIn); copyErr != nil {
 		return setupFailure(ErrSeed, "copy into job "+job, copyErr)
 	}
 

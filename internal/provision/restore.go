@@ -115,7 +115,7 @@ func (d *Dependencies) bringUp(ctx context.Context, dep *dependency, plan storag
 		return restoreFailure(dep, "audit the restore's mounts", auditErr)
 	}
 
-	if copyErr := copyIn(ctx, eng, c, dep.spec.CopyIn); copyErr != nil {
+	if copyErr := eng.CopyInConfigs(ctx, c, dep.spec.CopyIn); copyErr != nil {
 		return restoreFailure(dep, "copy into the restore", copyErr)
 	}
 

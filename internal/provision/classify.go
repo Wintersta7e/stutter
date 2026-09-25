@@ -111,7 +111,7 @@ func classifyService(
 func askOnce(
 	ctx context.Context, eng *Engine, deadline time.Time, c *Container, spec compose.Spec, ports []uint16,
 ) (map[uint16]pg.Answer, error) {
-	if err := copyIn(ctx, eng, c, spec.CopyIn); err != nil {
+	if err := eng.CopyInConfigs(ctx, c, spec.CopyIn); err != nil {
 		return nil, setupFailure(ErrSeed, "copy into the classification container of "+spec.Service, err)
 	}
 
@@ -183,9 +183,9 @@ func composeMounts(model *compose.Model, service string, img compose.Image) (com
 	return spec, nil
 }
 
-// copyIn copies a service's `content:` and `environment:` configs and secrets into its container,
-// before it starts, one directory at a time.
-func copyIn(ctx context.Context, eng *Engine, c *Container, files []compose.CopyIn) error {
+// CopyInConfigs copies a service's `content:` and `environment:` configs and secrets into its
+// container, before it starts, one directory at a time.
+func (e *Engine) CopyInConfigs(ctx context.Context, c *Container, files []compose.CopyIn) error {
 	byDir := map[string][]File{}
 
 	for _, file := range files {
@@ -196,7 +196,7 @@ func copyIn(ctx context.Context, eng *Engine, c *Container, files []compose.Copy
 	}
 
 	for _, dir := range slices.Sorted(maps.Keys(byDir)) {
-		if err := eng.CopyIn(ctx, c, dir, byDir[dir]); err != nil {
+		if err := e.CopyIn(ctx, c, dir, byDir[dir]); err != nil {
 			return err
 		}
 	}

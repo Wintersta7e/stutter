@@ -170,7 +170,7 @@ func (d *Dependencies) seedOne(ctx context.Context, dep *dependency) error {
 		dep.record.InitScripts = d.initScripts(ctx, dep)
 	}
 
-	if err := copyIn(ctx, eng, seed, dep.spec.CopyIn); err != nil {
+	if err := eng.CopyInConfigs(ctx, seed, dep.spec.CopyIn); err != nil {
 		return setupFailure(ErrSeed, "copy into the seed container of "+service, err)
 	}
 
