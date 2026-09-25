@@ -876,3 +876,16 @@ github.com/Wintersta7e/stutter/internal/cli.planOne
 github.com/Wintersta7e/stutter/internal/cli.sandboxConfig
 github.com/Wintersta7e/stutter/internal/cli.unnamedReason
 github.com/Wintersta7e/stutter/internal/cli.unselected
+# The compose sequence, from provisioning to teardown: `stutter check --compose` itself.
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.check
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.decide
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.finalSteps
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.keptLines
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.teardownSteps
+github.com/Wintersta7e/stutter/internal/cli.composeCheck.wholeCheck
+github.com/Wintersta7e/stutter/internal/cli.endWalk
+github.com/Wintersta7e/stutter/internal/cli.exitLog
+github.com/Wintersta7e/stutter/internal/cli.retention
+github.com/Wintersta7e/stutter/internal/cli.runCompose
+github.com/Wintersta7e/stutter/internal/cli.unnamedOf
+github.com/Wintersta7e/stutter/internal/cli.watchInterrupt

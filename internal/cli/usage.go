@@ -44,3 +44,8 @@ func unnamedReason(refusals []string, closedAfterInfo int) string {
 
 	return reason + "; " + strconv.Itoa(closedAfterInfo) + " bus connections closed after the greeting without a byte"
 }
+
+// interruptedSetup names an interrupt that came before any consumer check could run.
+//
+//nolint:unused // the compose check names an interrupt with it once the command line is wired.
+const interruptedSetup = "interrupted before the first consumer check"

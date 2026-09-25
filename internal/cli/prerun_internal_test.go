@@ -29,7 +29,7 @@ import (
 var preRunOrder = []string{
 	"preconditions", "static-self", "host-networking", "open", "corpus", "model", "classify", stepFingerprint,
 	"refusals", "images", "reclassify", "bus-urls", "relay-image", "networks", stepClassificationContainers,
-	stepDependencies, stepLayout, "listeners", "verify", "ca-file", "relays", "bus", "seed", stepJobs, stepSnapshot,
+	stepDependencies, stepLayout, "listeners", "verify", "ca-file", "relays", stepBus, "seed", stepJobs, stepSnapshot,
 	stepCheckpointB0, stepProbe, stepCheckpointB1, "discovery",
 }
 
@@ -44,6 +44,7 @@ const (
 	stepFingerprint              = "fingerprint"
 	stepJobs                     = "jobs"
 	stepSnapshot                 = "snapshot"
+	stepBus                      = "bus"
 )
 
 func stepNames(steps []step) []string {
@@ -94,7 +95,7 @@ func TestThePreRunOrderIsTheSpecOrder(t *testing.T) {
 			stepClassificationContainers, stepDependencies, stepLayout,
 		}, []string{"listeners"}},
 		{"the CA file follows the verified address", []string{"verify"}, []string{"ca-file"}},
-		{"the bus opens after the relays", []string{"relays"}, []string{"bus"}},
+		{"the bus opens after the relays", []string{"relays"}, []string{stepBus}},
 		{"seed, jobs and snapshot run in that order before B0", []string{"seed"}, []string{
 			stepJobs, stepSnapshot, stepCheckpointB0,
 		}},

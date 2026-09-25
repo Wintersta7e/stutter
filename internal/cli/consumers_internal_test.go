@@ -221,7 +221,7 @@ func TestAConsumerAdmittingNothingIsNeverRun(t *testing.T) {
 	t.Parallel()
 
 	found := harness.Discovery{Consumers: []harness.Found{
-		{Name: "idle", Policy: licensing("inventory.>")}, {Name: "orders", Policy: licensing("orders.>")},
+		{Name: "idle", Policy: licensing("inventory.>")}, {Name: testService, Policy: licensing("orders.>")},
 	}}
 	check, built := fakeCheck(found, composeRun{maxRuns: 1})
 
