@@ -985,6 +985,10 @@ func (e *Engine) expect(spec ContainerSpec, anonymous map[string]bool, hostPorts
 	for _, m := range spec.Spec.Mounts {
 		if m.Kind == compose.MountBind {
 			x.binds[filepath.Clean(m.Source)] = true
+
+			if e.wslDistro != "" {
+				x.binds[desktopBindSource(e.wslDistro, m.Source)] = true
+			}
 		}
 	}
 
