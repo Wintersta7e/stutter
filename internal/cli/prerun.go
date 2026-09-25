@@ -41,6 +41,8 @@ const selfExecutable = "/proc/self/exe"
 var (
 	// errCAShape means the listener set's CA was not exactly one certificate.
 	errCAShape = errors.New("the check's CA is not exactly one PEM certificate")
+	// errImageAbsent means a service's pull_policy is never and the engine does not hold its image.
+	errImageAbsent = errors.New("pull_policy is never and the image is not on the engine")
 	// errUnresolved means the second classification started a service whose image was never
 	// resolved: the first pass would never have started it.
 	errUnresolved = errors.New("a service to start has no resolved image")
@@ -105,7 +107,9 @@ type composeCheck struct {
 	// restored is where the latest restore put each dependency endpoint.
 	restored map[string]netip.AddrPort
 	// images are the pinned images, by service.
-	images   map[string]compose.Image
+	images map[string]compose.Image
+	// local are the images the engine held before anything was resolved, by service.
+	local    map[string]compose.Image
 	identity provision.Identity
 	networks topology.Networks
 	// b0 and b1 are the bus checkpoints: before any start, and once the stream's owner is settled.
@@ -258,12 +262,74 @@ func (c *composeCheck) parseModel(ctx context.Context) error {
 	return nil
 }
 
-// classifyLocal is the first classification pass. It is given no image: an image present locally is
-// pinned without a pull when its service is resolved, so the second pass sees the same evidence.
-func (c *composeCheck) classifyLocal(context.Context) error {
-	c.images = map[string]compose.Image{}
+// classifyLocal is the first classification pass, on the images the engine holds now: read, never
+// pulled, for every service naming one. What it finds also decides how each started service's image is
+// pinned.
+func (c *composeCheck) classifyLocal(ctx context.Context) error {
+	local, err := localImages(ctx, c.model.Images(c.model.Services()), c.engine.LocalImage)
+	if err != nil {
+		return err
+	}
+
+	c.local = local
+	c.images = maps.Clone(local)
 
 	return c.classify(nil)
+}
+
+// localImages reads, by service, every image the engine holds of those refs name. A service naming no
+// image is not asked about; one whose image is absent is left out.
+func localImages(
+	ctx context.Context,
+	refs []compose.ImageRef,
+	lookup func(ctx context.Context, ref string) (compose.Image, bool, error),
+) (map[string]compose.Image, error) {
+	local := map[string]compose.Image{}
+
+	for _, ref := range refs {
+		if ref.Ref == "" {
+			continue
+		}
+
+		image, present, err := lookup(ctx, ref.Ref)
+		if err != nil {
+			return nil, fmt.Errorf("read the image of %s: %w", ref.Service, err)
+		}
+
+		if present {
+			local[ref.Service] = image
+		}
+	}
+
+	return local, nil
+}
+
+// imageStep is how one started service's image is pinned.
+type imageStep uint8
+
+const (
+	// imageResolve pins the image the model names: the engine's own when present, pulled when absent.
+	imageResolve imageStep = iota + 1
+	// imageBuild builds it, under a reference the check reserved.
+	imageBuild
+)
+
+// imageStepFor decides how a started service's image is pinned, from whether the engine holds it: a
+// service with a build and no image, or pull_policy build, is built; one with both an image and a build
+// builds only when its image is absent; pull_policy never refuses an absent image rather than pull it.
+func imageStepFor(ref compose.ImageRef, present bool) (imageStep, error) {
+	switch {
+	case ref.Build && (ref.Ref == "" || ref.Policy == compose.PullBuild):
+		return imageBuild, nil
+	case present:
+		return imageResolve, nil
+	case ref.Policy == compose.PullNever:
+		return 0, fmt.Errorf("%w: service %s, image %s", errImageAbsent, ref.Service, ref.Ref)
+	case ref.Build:
+		return imageBuild, nil
+	default:
+		return imageResolve, nil
+	}
 }
 
 func (c *composeCheck) classify(answers map[string]map[uint16]pg.Answer) error {
@@ -296,8 +362,9 @@ func (c *composeCheck) refuse(context.Context) error {
 	return c.model.Refusals(c.classification.Started(), rules.Namespace, c.prints) //nolint:wrapcheck // named.
 }
 
-// resolveImages pins every started service's image: built where the model builds it, resolved
-// otherwise. It is the first mutation.
+// resolveImages pins every started service's image as its pull policy says, reading what the first
+// pass found on the engine: built, or resolved — pulled only where a pull is allowed. It is the first
+// mutation.
 func (c *composeCheck) resolveImages(ctx context.Context) error {
 	refs := c.model.Images(c.classification.Started())
 	built := map[string]rules.Kind{}
@@ -307,7 +374,14 @@ func (c *composeCheck) resolveImages(ctx context.Context) error {
 			c.header.Target = ref
 		}
 
-		if ref.Build && (ref.Ref == "" || ref.Policy == compose.PullBuild) {
+		_, present := c.local[ref.Service]
+
+		step, err := imageStepFor(ref, present)
+		if err != nil {
+			return err
+		}
+
+		if step == imageBuild {
 			built[ref.Service] = c.kindOf(ref.Service)
 
 			continue

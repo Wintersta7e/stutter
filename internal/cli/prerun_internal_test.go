@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wintersta7e/stutter/internal/compose"
 	"github.com/Wintersta7e/stutter/internal/corpus"
 	"github.com/Wintersta7e/stutter/internal/harness"
 )
@@ -353,4 +354,100 @@ func TestAProbeThatBecameDiscoveryIsNotRepeated(t *testing.T) {
 	if len(check.found.Consumers) != 1 || check.found.Consumers[0].Name != "reserve" {
 		t.Errorf("the kept discovery is %+v, want the probe start's", check.found)
 	}
+}
+
+// imageOrders is the service under test's image in the image fixtures.
+const imageOrders = "orders:1"
+
+// TestTheFirstPassSeesOnlyImagesAlreadyOnTheEngine: the first classification reads what the engine
+// holds now, without pulling, for every service naming an image — and one that names none is not asked.
+func TestTheFirstPassSeesOnlyImagesAlreadyOnTheEngine(t *testing.T) {
+	t.Parallel()
+
+	present := map[string]compose.Image{"postgres:18": {ID: "sha256:pg"}, imageOrders: {ID: "sha256:orders"}}
+
+	var asked []string
+
+	lookup := func(_ context.Context, ref string) (compose.Image, bool, error) {
+		asked = append(asked, ref)
+		image, found := present[ref]
+
+		return image, found, nil
+	}
+
+	refs := []compose.ImageRef{
+		{Service: testService, Ref: imageOrders},
+		{Service: "db", Ref: "postgres:18"},
+		{Service: "cache", Ref: "redis:7"},
+		{Service: "worker", Build: true},
+	}
+
+	local, err := localImages(t.Context(), refs, lookup)
+	if err != nil {
+		t.Fatalf("localImages: %v", err)
+	}
+
+	if len(local) != 2 || local[testService].ID != "sha256:orders" || local["db"].ID != "sha256:pg" {
+		t.Errorf("local images = %v, want the two the engine holds, by service", local)
+	}
+
+	if slices.Contains(asked, "") || len(asked) != 3 {
+		t.Errorf("asked the engine for %q, want the three named images", asked)
+	}
+}
+
+// TestImageResolutionFollowsThePullPolicy: pull_policy never forbids a pull, build builds, and a
+// service with both an image and a build builds only when its image is absent.
+func TestImageResolutionFollowsThePullPolicy(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		ref     compose.ImageRef
+		want    imageStep
+		present bool
+		refused bool
+	}{
+		{name: "build with no image", ref: compose.ImageRef{Build: true}, want: imageBuild},
+		{
+			name: "pull_policy build", ref: compose.ImageRef{Ref: imageOrders, Build: true, Policy: compose.PullBuild},
+			present: true, want: imageBuild,
+		},
+		{name: "image and build, present", ref: compose.ImageRef{
+			Ref: imageOrders, Build: true,
+			Policy: compose.PullMissing,
+		}, present: true, want: imageResolve},
+		{name: "image and build, absent", ref: compose.ImageRef{
+			Ref: imageOrders, Build: true,
+			Policy: compose.PullMissing,
+		}, want: imageBuild},
+		{
+			name: "never, present", ref: compose.ImageRef{Ref: imageOrders, Policy: compose.PullNever}, present: true,
+			want: imageResolve,
+		},
+		{name: "never, absent", ref: compose.ImageRef{Ref: imageOrders, Policy: compose.PullNever}, refused: true},
+		{
+			name: "missing, absent", ref: compose.ImageRef{Ref: imageOrders, Policy: compose.PullMissing},
+			want: imageResolve,
+		},
+	}
+
+	for _, testCase := range cases {
+		testCase.ref.Service = testService
+
+		got, err := imageStepFor(testCase.ref, testCase.present)
+		if testCase.refused {
+			if !errors.Is(err, errImageAbsent) || !strings.Contains(err.Error(), testService) {
+				t.Errorf("%s: = (%v, %v), want %v naming the service", testCase.name, got, err, errImageAbsent)
+			}
+
+			continue
+		}
+
+		if err != nil || got != testCase.want {
+			t.Errorf("%s: = (%v, %v), want %v", testCase.name, got, err, testCase.want)
+		}
+	}
+
+	t.Logf("cases=%d", len(cases))
 }
