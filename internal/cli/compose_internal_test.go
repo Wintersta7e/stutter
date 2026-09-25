@@ -94,6 +94,19 @@ func TestLogsAreKeptWheneverAnOutcomeNamesOne(t *testing.T) {
 			t.Errorf("%s: the implicated logs %v do not include %s", testCase.name, logs, failedLog)
 		}
 	}
+
+	// Discovery's log is implicated only when discovery is what stopped the check.
+	const discoveryLog = "/tmp/stutter-c0ffee42/logs/discovery-15.log"
+
+	passing := report.Invocation{Consumers: []report.ConsumerCheck{passed}}
+	if got, logs := retention(t.Context(), passing, discoveryLog); got != provision.DiscardLogs || len(logs) != 0 {
+		t.Errorf("a passing check whose discovery left a log = (%v, %v), want nothing kept or named", got, logs)
+	}
+
+	stopped := report.Invocation{Setup: errors.New("the service exited before creating any consumer")}
+	if _, logs := retention(t.Context(), stopped, discoveryLog); !slices.Contains(logs, discoveryLog) {
+		t.Errorf("a check discovery stopped names logs %v, want %s among them", logs, discoveryLog)
+	}
 }
 
 // TestTheReportIsRenderedBeforeTeardown: the verdict is on stdout before anything is torn down, so a

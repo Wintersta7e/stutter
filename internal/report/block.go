@@ -12,15 +12,24 @@ import (
 // each fault was tried. Its findings render after every block, in one list across consumers.
 func (c ConsumerCheck) lines(total int) []string {
 	bucket := c.Bucket()
-	lines := []string{trim(pad(bucketWord(bucket), statusColumn) + pad(c.Name, consumerColumn) +
-		admittedText(c.Admitted, total))}
+
+	head := pad(bucketWord(bucket), statusColumn) + pad(c.Name, consumerColumn) + admittedText(c.Admitted, total)
+	if c.Name != unnamedName {
+		head += licensedByDiscovery
+	}
+
+	lines := []string{trim(head)}
 
 	switch bucket { //nolint:exhaustive // every checked bucket renders the same way, below.
 	case BucketNotSelected, BucketNotCovered, BucketSetup:
 		return append(lines, c.reasonLines()...)
 	case BucketGate:
+		lines = append(lines, c.checkedReason()...)
+
 		return append(lines, c.Report.violationLines()...)
 	}
+
+	lines = append(lines, c.checkedReason()...)
 
 	checked := c.Report
 	lines = append(lines, gatesHeldLine(checked.Gates))
@@ -29,6 +38,16 @@ func (c ConsumerCheck) lines(total int) []string {
 	lines = append(lines, checked.notJudgedLines()...)
 
 	return append(lines, checked.coverageLines()...)
+}
+
+// checkedReason is the reason line a checked consumer carries, when it has one: why the unnamed check
+// ran, and what the bus refused the service.
+func (c ConsumerCheck) checkedReason() []string {
+	if c.Reason == "" {
+		return nil
+	}
+
+	return []string{detailIndent + withoutDurations(oneLine(c.Reason))}
 }
 
 // reasonLines say why a consumer was not checked, or where its check stopped. A setup error after runs

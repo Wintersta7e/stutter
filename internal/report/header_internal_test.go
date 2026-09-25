@@ -303,3 +303,28 @@ func TestHeaderRendersWhatTheFlagsChanged(t *testing.T) {
 		t.Errorf("the timings do not render as the harness used them, for the flags given only:\n%s", declared)
 	}
 }
+
+// TestOnlyAStartedDependencyIsDisclosedAsOpaque: a service Stutter does not start is observed by no
+// proxy at all, so it is never named as one observed as bytes.
+func TestOnlyAStartedDependencyIsDisclosedAsOpaque(t *testing.T) {
+	t.Parallel()
+
+	header := &Header{Classification: &compose.Classification{Deps: []compose.Dependency{
+		{Service: "bus", Role: compose.RoleBus, Endpoints: []compose.Endpoint{
+			{Port: 4222, Protocol: compose.ProtocolNATS}, {Port: 8222, Protocol: compose.ProtocolOpaque},
+		}},
+		{Service: cacheService, Role: compose.RoleOther, Endpoints: []compose.Endpoint{
+			{Port: 6379, Protocol: compose.ProtocolOpaque},
+		}},
+	}}}
+
+	rendered := strings.Join(rowOf(header.lines(), rowDisclosure), "\n")
+
+	if strings.Contains(rendered, "bus is observed") {
+		t.Errorf("the disclosure names the bus, which Stutter never starts, as observed:\n%s", rendered)
+	}
+
+	if !strings.Contains(rendered, cacheService+" is observed as bytes") {
+		t.Errorf("the disclosure omits the started opaque dependency:\n%s", rendered)
+	}
+}
