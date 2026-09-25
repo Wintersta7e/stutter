@@ -773,9 +773,17 @@ func TestATargetThatExitsBeforeAnyConsumerIsASetupError(t *testing.T) {
 		return 1
 	}
 
-	found, err := harness.Discover(startContext(t), startConfig(store, checkpoint, service))
+	// Under a loaded gate this start once ended at the 5 s limit the other starts use (5.31 s), before the
+	// service's exit was seen. The limit sits past nats.go's 5 s JetStream API timeout and below the
+	// test's deadline, and a failure says how long the start took and how the service ended.
+	config := startConfig(store, checkpoint, service)
+	config.Startup = 15 * time.Second
+	began := time.Now()
+
+	found, err := harness.Discover(startContext(t), config)
 	if !errors.Is(err, harness.ErrExitedBeforeConsumer) {
-		t.Fatalf("Discover() error = %v, want %v", err, harness.ErrExitedBeforeConsumer)
+		t.Fatalf("Discover() error = %v after %s, exit %+v; want %v", err, time.Since(began), found.Exit,
+			harness.ErrExitedBeforeConsumer)
 	}
 
 	t.Logf("E11: %v", err)
