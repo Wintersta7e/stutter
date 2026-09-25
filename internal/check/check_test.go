@@ -56,7 +56,10 @@ type session struct {
 	// readGuard are messages whose handler looks its claim up before writing, and looks again when the
 	// message is redelivered. Whether it writes again too is nonIdempotent's business.
 	readGuard map[uint64]bool
-	messages  []uint64
+	// busGuard are messages whose handler claims a key on the bus: on redelivery the claim is refused
+	// and the client looks the key up, as nats.go's KeyValue.Create does after every refused create.
+	busGuard map[uint64]bool
+	messages []uint64
 	// bus is what the bus did on every run: its refusals and counts are copied into each result.
 	bus         replay.Result
 	resets      int
@@ -129,6 +132,10 @@ func (s *session) Run(
 				effects = append(effects, claimLookup(seq))
 			}
 
+			if s.busGuard[seq] {
+				effects = append(effects, busLookup(seq))
+			}
+
 			if s.nonIdempotent[seq] && (!s.flaky || !strings.HasPrefix(name, "shrink")) {
 				effects = append(effects, write(seq))
 			}
@@ -194,6 +201,15 @@ func claimLookup(seq uint64) effect.Effect {
 	return effect.Effect{
 		Kind:       effect.KindPostgres,
 		Canonical:  fmt.Sprintf("SELECT 1 FROM processed WHERE id = %d", seq),
+		MessageSeq: seq,
+		Read:       true,
+	}
+}
+
+func busLookup(seq uint64) effect.Effect {
+	return effect.Effect{
+		Kind:       effect.KindNATS,
+		Canonical:  fmt.Sprintf("kv.get processed.%d", seq),
 		MessageSeq: seq,
 		Read:       true,
 	}
@@ -503,6 +519,56 @@ func TestAGuardThatMissesStillFails(t *testing.T) {
 
 	if got := result.ExitCode(); got != report.ExitFail {
 		t.Errorf("ExitCode() = %d, want %d: a guard that read and then wrote again was let through\n%s",
+			got, report.ExitFail, result)
+	}
+}
+
+// TestABusReadAloneIsNotReported: a key/value claim refused on redelivery is followed by the client's
+// own lookup of the key. A bus read changes nothing and can call nothing that does, so a divergence
+// made only of bus reads is no finding at all.
+func TestABusReadAloneIsNotReported(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.nonIdempotent = nil
+	scripted.busGuard = map[uint64]bool{1: true}
+
+	opts := options(scripted)
+	opts.MaxRuns = 1
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(scripted.names) < 3 {
+		t.Fatalf("ran %v, want a faulted run beside the reference pair", scripted.names)
+	}
+
+	if got := result.ExitCode(); got != report.ExitPass || len(result.Findings) != 0 {
+		t.Errorf("ExitCode() = %d with findings %+v, want %d and none: a bus lookup was reported\n%s",
+			got, result.Findings, report.ExitPass, result)
+	}
+}
+
+// TestABusGuardThatMissesStillFails: the bus read is dropped from the comparison, the write that
+// follows it is not.
+func TestABusGuardThatMissesStillFails(t *testing.T) {
+	t.Parallel()
+
+	scripted := newSession()
+	scripted.busGuard = map[uint64]bool{1: true}
+
+	opts := options(scripted)
+	opts.MaxRuns = 1
+
+	result, err := check.Run(t.Context(), scripted, opts)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if got := result.ExitCode(); got != report.ExitFail {
+		t.Errorf("ExitCode() = %d, want %d: a guard that looked the key up and wrote again was let through\n%s",
 			got, report.ExitFail, result)
 	}
 }

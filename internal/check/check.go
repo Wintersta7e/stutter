@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -398,11 +399,11 @@ func (c *check) attempt(
 	c.injected++
 	c.coverage[len(c.coverage)-1].Attempted++
 
-	// Every comparison and every position taken from one uses the rejected-free view: the gate
-	// reports an ordinal within the sequence it was given, so indexing a different one would name a
-	// different effect in the finding.
-	referenceEffects := effect.Compared(reference.Effects)
-	mutatedEffects := effect.Compared(mutated.Effects)
+	// Every comparison and every position taken from one uses the judged view: the gate reports an
+	// ordinal within the sequence it was given, so indexing a different one would name a different
+	// effect in the finding.
+	referenceEffects := judged(reference.Effects)
+	mutatedEffects := judged(mutated.Effects)
 
 	outcome := c.comparer.Compare(referenceEffects, mutatedEffects)
 	if outcome.OK() {
@@ -456,6 +457,18 @@ func notReproducible(fault policy.Fault, seq uint64, outcome gate.Result) error 
 			Index:   -1,
 		},
 	}}
+}
+
+// judged is the view a faulted run is compared and shrunk in: what no dependency refused, less the
+// reads the bus served. A bus lookup changes nothing and can call nothing that does — unlike a SELECT,
+// which can call a function that writes — and nats.go's KeyValue.Create makes one after every refused
+// create, so every working key/value guard would otherwise report its own redelivered claim, and a
+// broken one would be described by that lookup rather than by the write behind it. The determinism
+// gate keeps the stricter view.
+func judged(effects []effect.Effect) []effect.Effect {
+	return slices.DeleteFunc(effect.Compared(effects), func(observed effect.Effect) bool {
+		return observed.Read && observed.Kind == effect.KindNATS
+	})
 }
 
 // readsOnly reports whether everything that differs between two runs' effects for one message is a
@@ -572,7 +585,7 @@ func (c *check) shrink(ctx context.Context, mutation replay.Mutation) (string, e
 			return false, err
 		}
 
-		return !c.comparer.Compare(effect.Compared(clean.Effects), effect.Compared(faulted.Effects)).OK(), nil
+		return !c.comparer.Compare(judged(clean.Effects), judged(faulted.Effects)).OK(), nil
 	}
 
 	start := shrink.Candidate{Messages: c.opts.Messages, Mutations: []replay.Mutation{mutation}}

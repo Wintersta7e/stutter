@@ -370,18 +370,12 @@ func TestGuardedHandlerIsNotReported(t *testing.T) {
 		t.Fatal("no fault was injected, so a clean report proves nothing about the guard")
 	}
 
-	for _, found := range result.Findings {
-		if found.Status == report.StatusFail {
-			t.Errorf("a correctly guarded handler was reported as failing:\n%s", result)
-		}
-
-		// The guard's second claim is REFUSED by the bus: nothing is stored and the handler does
-		// nothing. A finding whose diverged effect is that refused claim is a working guard reported
-		// as a bug — the false positive release gate 1 forbids, and it fires on every message of any
-		// service whose dedupe guard is a key/value claim.
-		if strings.Contains(found.Mutated, "kv.create") {
-			t.Errorf("the guard's refused claim was reported as a divergence:\n%s", result)
-		}
+	// The guard's second claim is REFUSED by the bus, and the client then looks the key up: nothing is
+	// stored and the handler does nothing. Any finding here — the refused claim, or the lookup behind it
+	// reported as a reads-only warning — is a working guard reported to its owner, on every message of
+	// any service whose dedupe guard is a key/value claim.
+	if len(result.Findings) != 0 {
+		t.Errorf("a correctly guarded handler has %d findings, want a clean report:\n%s", len(result.Findings), result)
 	}
 }
 
