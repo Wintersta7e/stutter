@@ -707,25 +707,10 @@ func summarise(outcome gate.Result) string {
 }
 
 func describeRepro(minimal shrink.Candidate, stats shrink.Stats, files map[uint64]string) string {
-	repro := "messages " + joinSeqs(minimal.Messages, files)
+	repro := "messages " + report.Sequences(minimal.Messages, files)
 	if !stats.Minimal() {
 		return repro + " (search hit its attempt cap; smaller may exist)"
 	}
 
 	return repro
-}
-
-// joinSeqs names each sequence, followed by the corpus file it came from wherever one is known.
-func joinSeqs(seqs []uint64, files map[uint64]string) string {
-	parts := make([]string, 0, len(seqs))
-	for _, seq := range seqs {
-		part := "#" + strconv.FormatUint(seq, 10)
-		if file, named := files[seq]; named {
-			part += " (" + file + ")"
-		}
-
-		parts = append(parts, part)
-	}
-
-	return strings.Join(parts, ", ")
 }

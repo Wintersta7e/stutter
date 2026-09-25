@@ -100,3 +100,16 @@ github.com/Wintersta7e/stutter/internal/report.Invocation.Judged
 github.com/Wintersta7e/stutter/internal/report.Invocation.counts
 github.com/Wintersta7e/stutter/internal/report.Report.attempted
 github.com/Wintersta7e/stutter/internal/report.siblingReservation
+# One block per consumer check and the compose path's notes: rendered by `stutter check --compose`.
+github.com/Wintersta7e/stutter/internal/report.ConsumerCheck.lines
+github.com/Wintersta7e/stutter/internal/report.ConsumerCheck.reasonLines
+github.com/Wintersta7e/stutter/internal/report.Report.coverageLines
+github.com/Wintersta7e/stutter/internal/report.Report.notJudgedLines
+github.com/Wintersta7e/stutter/internal/report.admittedText
+github.com/Wintersta7e/stutter/internal/report.bucketWord
+github.com/Wintersta7e/stutter/internal/report.composeFindingLines
+github.com/Wintersta7e/stutter/internal/report.composeGuardDependentLines
+github.com/Wintersta7e/stutter/internal/report.composeNote
+github.com/Wintersta7e/stutter/internal/report.illegalCoverage
+github.com/Wintersta7e/stutter/internal/report.legalCoverage
+github.com/Wintersta7e/stutter/internal/report.notJudgedText
