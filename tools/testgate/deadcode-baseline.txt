@@ -56,7 +56,6 @@ github.com/Wintersta7e/stutter/internal/harness.startOnly
 # The invocation listener set and its endpoint keys: opened by the compose path once per check.
 github.com/Wintersta7e/stutter/internal/harness.EndpointKey
 github.com/Wintersta7e/stutter/internal/harness.ListenerSet.acceptance
-github.com/Wintersta7e/stutter/internal/harness.ListenerSet.advertised
 github.com/Wintersta7e/stutter/internal/harness.OpenListeners
 github.com/Wintersta7e/stutter/internal/harness.ParseEndpointKey
 github.com/Wintersta7e/stutter/internal/harness.catchAllPort

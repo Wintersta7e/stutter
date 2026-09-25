@@ -217,21 +217,3 @@ func (e *Engine) discard() error {
 
 	return errors.Join(append(errs, e.book.led.remove())...)
 }
-
-// release closes the invocation log and releases the ledger's lock, leaving both on disk. It stands
-// in for Close where a test wants the check's files left as a crash would leave them.
-func (e *Engine) release() error {
-	released := false
-
-	e.closeOnce.Do(func() {
-		released = true
-
-		close(e.closing)
-	})
-
-	if !released {
-		return nil
-	}
-
-	return errors.Join(e.log.close(), e.book.led.close())
-}

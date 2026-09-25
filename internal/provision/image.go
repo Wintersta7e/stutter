@@ -129,13 +129,6 @@ func (e *Engine) pinnedRef(ref string) (compose.Image, bool) {
 	return image, ok
 }
 
-// pinnedID reports an image ID this check pinned: resolved, built, imported or committed.
-func (e *Engine) pinnedID(id string) bool {
-	_, ok := e.pinnedImage(id)
-
-	return ok
-}
-
 // pinnedImage returns the image this check pinned under id.
 func (e *Engine) pinnedImage(id string) (compose.Image, bool) {
 	e.mu.Lock()

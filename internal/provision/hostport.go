@@ -104,14 +104,6 @@ func ReleaseHostPort(port uint16) {
 	delete(hostPorts.taken, port)
 }
 
-// reservedHostPort reports whether port is reserved in this process.
-func reservedHostPort(port uint16) bool {
-	hostPorts.mu.Lock()
-	defer hostPorts.mu.Unlock()
-
-	return hostPorts.taken[port]
-}
-
 // portBand is a range of ports, lo to hi inclusive.
 type portBand struct {
 	lo, hi int

@@ -663,3 +663,21 @@ func tarHeaders(t *testing.T, data []byte) int {
 		}
 	}
 }
+
+// resourceFlag names the create flag that carries a compose.Resources field. "" is a field compose
+// itself passes to no container: a CPU reservation is a swarm option.
+func resourceFlag(field string) (string, bool) {
+	flag, ok := map[string]string{
+		"Ulimits": "--ulimit", "StorageOpt": "--storage-opt", "Blkio": "--blkio-weight",
+		"MemSwappiness": "--memory-swappiness", "Cpuset": "--cpuset-cpus", "CgroupParent": "--cgroup-parent",
+		"CPUs": flagCPUs, "LimitCPUs": flagCPUs, "ReserveCPUs": "", "CPUCount": "--cpu-count",
+		"CPUPercent": "--cpu-percent", "CPUPeriod": "--cpu-period", "CPUQuota": "--cpu-quota",
+		"CPURTPeriod": "--cpu-rt-period", "CPURTRuntime": "--cpu-rt-runtime", "CPUShares": "--cpu-shares",
+		"MemLimit": flagMemory, "MemReservation": flagReservation, "MemSwap": "--memory-swap",
+		"ShmSize": "--shm-size", "LimitMemory": flagMemory, "ReserveMemory": flagReservation,
+		"OOMScoreAdj": "--oom-score-adj", "PidsLimit": flagPids, "LimitPids": flagPids,
+		"OOMKillDisable": "--oom-kill-disable",
+	}[field]
+
+	return flag, ok
+}

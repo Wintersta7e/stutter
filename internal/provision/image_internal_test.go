@@ -270,3 +270,10 @@ func TestImportAndCommitPinWhatTheyMake(t *testing.T) {
 		t.Error("an image the check made is not pinned")
 	}
 }
+
+// pinnedID reports an image ID this check pinned: resolved, built, imported or committed.
+func (e *Engine) pinnedID(id string) bool {
+	_, ok := e.pinnedImage(id)
+
+	return ok
+}
