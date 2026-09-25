@@ -22,8 +22,6 @@ var errBindChanged = errors.New("a bind source changed during the check, so ever
 // runCompose is a whole compose check: the pre-run steps, one consumer check per consumer, the end
 // fingerprint walk, the report on stdout, then the teardown and its stderr lines. The report is
 // rendered BEFORE the teardown, so a second interrupt during teardown still leaves the verdict.
-//
-//nolint:unused // `stutter check --compose` calls it once the command line is wired.
 func runCompose(ctx context.Context, run composeRun, stdout, stderr io.Writer) int {
 	out := newLockedWriter(stderr)
 
@@ -58,8 +56,6 @@ func watchInterrupt(ctx context.Context, out *lockedWriter) (func() bool, <-chan
 
 // check runs everything that decides the verdict: the pre-run steps, the consumer checks and the end
 // walk. A failure before the first consumer check is the whole check's.
-//
-//nolint:unused // runCompose calls it once the command line is wired.
 func (c *composeCheck) check(ctx context.Context) report.Invocation {
 	inv := c.decide(ctx)
 
@@ -71,8 +67,6 @@ func (c *composeCheck) check(ctx context.Context) report.Invocation {
 }
 
 // decide runs the steps the verdict rests on, and says what they decided.
-//
-//nolint:unused // check calls it once the command line is wired.
 func (c *composeCheck) decide(ctx context.Context) report.Invocation {
 	inv := report.Invocation{Header: c.header, GatesOnly: c.run.gatesOnly}
 
@@ -106,8 +100,6 @@ func (c *composeCheck) decide(ctx context.Context) report.Invocation {
 }
 
 // wholeCheck is a failure before any consumer check could run, named as an interrupt when it was one.
-//
-//nolint:unused // check calls it once the command line is wired.
 func (*composeCheck) wholeCheck(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return fmt.Errorf("%s: %w", interruptedSetup, err)

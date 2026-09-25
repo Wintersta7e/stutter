@@ -182,8 +182,6 @@ func (c *composeCheck) prerunSteps() []step {
 }
 
 // prepare runs the pre-run steps in order and stops at the first that fails, naming it.
-//
-//nolint:unused // the compose sequence calls it once `stutter check --compose` is wired.
 func (c *composeCheck) prepare(ctx context.Context) error {
 	for _, each := range c.prerunSteps() {
 		if err := each.run(ctx); err != nil {

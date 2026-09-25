@@ -6,7 +6,6 @@ package cli
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 	"time"
@@ -22,9 +21,8 @@ import (
 const exitUsage = 3
 
 const (
-	defaultMaxRuns  = 3
-	defaultConsumer = "reserve_stock"
-	hashKeyLen      = 32
+	defaultMaxRuns = 3
+	hashKeyLen     = 32
 	// referenceAckWait is short so a delay fault crosses it in seconds rather than minutes.
 	referenceAckWait = time.Second
 	referenceRetries = 6
@@ -41,7 +39,7 @@ Flags for check and gate:
   --postgres <dsn>    Reachable Postgres connection string. Stutter replays into it and wipes
                       its own fixture rows between runs, so point it at a scratch database.
   --max-runs <n>      Cap mutated runs (default 3; 0 means every legal message-and-fault pair)
-  --consumer <name>   Name that findings attribute to (default reserve_stock)
+  --consumer <name>   A discovered consumer to check, on the compose path; repeatable
 
 Exit codes:
   0  check: every consumer passed and the gates held
@@ -68,10 +66,12 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stdout, version.String())
 
 		return 0
-	case "check":
-		return runCheck(ctx, args[1:], stdout, stderr, command{name: "check"})
-	case "gate":
-		return runCheck(ctx, args[1:], stdout, stderr, command{name: "gate", gatesOnly: true})
+	case commandCheck:
+		return runCheck(ctx, args[1:], stdout, stderr, command{name: commandCheck})
+	case commandGate:
+		return runCheck(ctx, args[1:], stdout, stderr, command{name: commandGate, gatesOnly: true})
+	case commandClean:
+		return cleanCommand(ctx, args[1:], stdout, stderr)
 	case "help", "-h", "--help":
 		fmt.Fprint(stdout, usage)
 
@@ -84,33 +84,6 @@ func Run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 
 		return exitUsage
 	}
-}
-
-type settings struct {
-	postgres string
-	consumer string
-	maxRuns  int
-}
-
-func parse(args []string, stderr io.Writer, name string) (settings, error) {
-	set := flag.NewFlagSet(name, flag.ContinueOnError)
-	set.SetOutput(stderr)
-
-	var parsed settings
-
-	set.StringVar(&parsed.postgres, "postgres", "", "reachable Postgres connection string")
-	set.StringVar(&parsed.consumer, "consumer", defaultConsumer, "name findings attribute to")
-	set.IntVar(&parsed.maxRuns, "max-runs", defaultMaxRuns, "cap on mutated runs, 0 for no cap")
-
-	if err := set.Parse(args); err != nil {
-		return settings{}, fmt.Errorf("parse %s flags: %w", name, err)
-	}
-
-	if parsed.postgres == "" {
-		return settings{}, errNoDatabase
-	}
-
-	return parsed, nil
 }
 
 // command distinguishes check from gate. It is a value rather than a bool parameter so the call
@@ -126,6 +99,17 @@ func runCheck(ctx context.Context, args []string, stdout, stderr io.Writer, run 
 		fmt.Fprintf(stderr, "stutter %s: %v\n", run.name, err)
 
 		return exitUsage
+	}
+
+	if len(parsed.compose) > 0 {
+		composing, composeErr := parsed.composeRun(run.gatesOnly)
+		if composeErr != nil {
+			fmt.Fprintf(stderr, "stutter %s: %v\n", run.name, composeErr)
+
+			return exitUsage
+		}
+
+		return runCompose(ctx, composing, stdout, stderr)
 	}
 
 	result, err := execute(ctx, parsed, run.gatesOnly)

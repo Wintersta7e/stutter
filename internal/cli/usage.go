@@ -46,6 +46,11 @@ func unnamedReason(refusals []string, closedAfterInfo int) string {
 }
 
 // interruptedSetup names an interrupt that came before any consumer check could run.
-//
-//nolint:unused // the compose check names an interrupt with it once the command line is wired.
 const interruptedSetup = "interrupted before the first consumer check"
+
+// nothingToCheck names both paths a check can take.
+const nothingToCheck = "name --compose <file> --service <name> --stream <name> --corpus <dir> to check your " +
+	"own service, or --postgres <dsn> to check the built-in reference consumer"
+
+// gateInjectsNothing follows gate's refusal of --max-runs.
+const gateInjectsNothing = "gate injects nothing, so it has no run budget"
