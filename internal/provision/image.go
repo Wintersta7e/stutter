@@ -66,6 +66,13 @@ func (e *Engine) inspectImage(ctx context.Context, ref string) (compose.Image, b
 	return report.image(), true, nil
 }
 
+// LocalImage reads the image ref names as the engine holds it now, and neither pulls nor pins it: what
+// classification reads before anything is resolved, and how `pull_policy: never` learns an image is
+// absent. Not found on an engine that answers is absent; an engine that does not answer is an error.
+func (e *Engine) LocalImage(ctx context.Context, ref string) (compose.Image, bool, error) {
+	return e.inspectImage(ctx, ref)
+}
+
 // ResolveImage pins the image ref names: present, its ID is pinned; absent — told apart from an
 // engine that does not answer — it is pulled once, in the user's environment, then pinned. A
 // reference already resolved returns what was pinned, whatever it names now. Nothing is resolved

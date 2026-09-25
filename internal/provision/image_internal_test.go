@@ -12,16 +12,19 @@ import (
 	"github.com/Wintersta7e/stutter/internal/provision/rules"
 )
 
+// dbRef is the reference of the image these tests hold locally.
+const dbRef = "db:1"
+
 // A present image is pinned without a pull; an absent one is pulled once, then pinned; a reference
 // moved afterwards still resolves to the pinned ID; and nothing is pulled once a container exists.
 func TestAnImageIsPinnedOnceAndNeverPulledAgain(t *testing.T) {
 	t.Parallel()
 
 	engine, fake := openFakeEngine(t)
-	present := fake.add(ResourceImage, &fakeObject{tags: []string{"db:1"}, labels: map[string]string{}})
+	present := fake.add(ResourceImage, &fakeObject{tags: []string{dbRef}, labels: map[string]string{}})
 	fake.registry = map[string]*fakeObject{"app:2": {id: "sha256:" + strings.Repeat("2", 64), labels: nil}}
 
-	pinned, err := engine.ResolveImage(t.Context(), "db:1", "")
+	pinned, err := engine.ResolveImage(t.Context(), dbRef, "")
 	if err != nil || pinned.ID != present {
 		t.Fatalf("ResolveImage(db:1) = (%s, %v), want %s", pinned.ID, err, present)
 	}
@@ -41,9 +44,9 @@ func TestAnImageIsPinnedOnceAndNeverPulledAgain(t *testing.T) {
 
 	// Someone moves the tag: the check keeps running what it pinned.
 	fake.find(ResourceImage, present).tags = nil
-	fake.add(ResourceImage, &fakeObject{tags: []string{"db:1"}, labels: map[string]string{}})
+	fake.add(ResourceImage, &fakeObject{tags: []string{dbRef}, labels: map[string]string{}})
 
-	again, err := engine.ResolveImage(t.Context(), "db:1", "")
+	again, err := engine.ResolveImage(t.Context(), dbRef, "")
 	if err != nil || again.ID != present {
 		t.Errorf("ResolveImage after a retag = (%s, %v), want the pinned %s", again.ID, err, present)
 	}
@@ -67,13 +70,52 @@ func TestAbsentAndUnreadableAreToldApart(t *testing.T) {
 	engine, fake := openFakeEngine(t)
 	fake.unreachable = true
 
-	_, err := engine.ResolveImage(t.Context(), "db:1", "")
+	_, err := engine.ResolveImage(t.Context(), dbRef, "")
 	if err == nil || errors.Is(err, ErrImage) {
 		t.Errorf("ResolveImage on an unreachable engine = %v, want an engine failure", err)
 	}
 
 	if pulls := fake.verbCalls("pull"); len(pulls) != 0 {
 		t.Errorf("an unreadable image was pulled: %v", pulls)
+	}
+}
+
+// A local read finds a present image without pulling or pinning it, reports one only a registry holds
+// as absent without pulling it, and fails on an engine that does not answer.
+func TestALocalImageReadNeitherPullsNorPins(t *testing.T) {
+	t.Parallel()
+
+	engine, fake := openFakeEngine(t)
+	present := fake.add(ResourceImage, &fakeObject{tags: []string{dbRef}, labels: map[string]string{}})
+	fake.registry = map[string]*fakeObject{"app:2": {id: "sha256:" + strings.Repeat("2", 64), labels: nil}}
+
+	image, found, err := engine.LocalImage(t.Context(), dbRef)
+	if err != nil || !found || image.ID != present {
+		t.Fatalf("LocalImage(db:1) = (%s, %v, %v), want %s", image.ID, found, err, present)
+	}
+
+	_, registryOnly, registryErr := engine.LocalImage(t.Context(), "app:2")
+	if registryErr != nil || registryOnly {
+		t.Errorf("LocalImage(app:2) = (%v, %v), want absent: only the registry holds it", registryOnly, registryErr)
+	}
+
+	if pulls := fake.verbCalls("pull"); len(pulls) != 0 {
+		t.Errorf("a local read pulled: %v", pulls)
+	}
+
+	// The tag moves: had the read pinned db:1, resolving it would still return the old ID.
+	fake.find(ResourceImage, present).tags = nil
+	moved := fake.add(ResourceImage, &fakeObject{tags: []string{dbRef}, labels: map[string]string{}})
+
+	resolved, resolveErr := engine.ResolveImage(t.Context(), dbRef, "")
+	if resolveErr != nil || resolved.ID != moved {
+		t.Errorf("ResolveImage after a local read and a retag = (%s, %v), want %s", resolved.ID, resolveErr, moved)
+	}
+
+	fake.unreachable = true
+
+	if _, unreadable, readErr := engine.LocalImage(t.Context(), dbRef); readErr == nil || unreadable {
+		t.Errorf("LocalImage on an unreachable engine = (%v, %v), want an engine failure", unreadable, readErr)
 	}
 }
 
