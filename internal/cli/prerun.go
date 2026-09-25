@@ -159,6 +159,7 @@ func (c *composeCheck) prerunSteps() []step {
 		{name: "open", run: c.open},
 		{name: "corpus", run: c.loadCorpus},
 		{name: "model", run: c.parseModel},
+		{name: "target-refusals", run: c.refuseTarget},
 		{name: "classify", run: c.classifyLocal},
 		{name: "fingerprint", run: c.fingerprint},
 		{name: "refusals", run: c.refuse},
@@ -356,6 +357,20 @@ func (c *composeCheck) fingerprint(ctx context.Context) error {
 	c.header.Prints = &c.prints
 
 	return nil
+}
+
+// refuseTarget judges the service under test's own keys before classification: it is started whatever
+// classification decides, and a key that takes it off Stutter's network (`network_mode`) also leaves
+// every name it dials resolving nowhere, so classification would otherwise refuse it for that symptom.
+func (c *composeCheck) refuseTarget(ctx context.Context) error {
+	target := []string{c.run.service}
+
+	prints, err := compose.Fingerprint(ctx, c.model.BindSources(target))
+	if err != nil {
+		return err //nolint:wrapcheck // named with its step by prepare.
+	}
+
+	return c.model.Refusals(target, rules.Namespace, prints) //nolint:wrapcheck // named with its step by prepare.
 }
 
 func (c *composeCheck) refuse(context.Context) error {

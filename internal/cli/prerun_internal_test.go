@@ -28,7 +28,8 @@ import (
 // networks and the classification containers, the frozen endpoint split, then the listeners, the
 // verified address, the CA file, the relays and the bus.
 var preRunOrder = []string{
-	"preconditions", "static-self", "host-networking", "open", "corpus", "model", "classify", stepFingerprint,
+	"preconditions", "static-self", "host-networking", "open", "corpus", "model", stepTargetRefusals, "classify",
+	stepFingerprint,
 	"refusals", "images", "reclassify", "bus-urls", "relay-image", "networks", stepClassificationContainers,
 	stepDependencies, stepLayout, "listeners", "verify", "ca-file", "relays", stepBus, "seed", stepJobs, stepSnapshot,
 	stepCheckpointB0, stepProbe, stepCheckpointB1, "discovery",
@@ -43,6 +44,7 @@ const (
 	stepCheckpointB1             = "checkpoint-b1"
 	stepProbe                    = "probe"
 	stepFingerprint              = "fingerprint"
+	stepTargetRefusals           = "target-refusals"
 	stepJobs                     = "jobs"
 	stepSnapshot                 = "snapshot"
 	stepBus                      = "bus"
@@ -85,6 +87,9 @@ func TestThePreRunOrderIsTheSpecOrder(t *testing.T) {
 		{"every host refusal precedes the engine and its ledger", []string{
 			"preconditions", "static-self", "host-networking",
 		}, []string{"open"}},
+		{"the service under test's own refusals precede classification", []string{stepTargetRefusals}, []string{
+			"classify",
+		}},
 		{"the start walk and the key refusals precede the first mutation", []string{
 			stepFingerprint, "refusals",
 		}, []string{"images"}},
@@ -117,6 +122,40 @@ func TestThePreRunOrderIsTheSpecOrder(t *testing.T) {
 		}
 
 		t.Logf("checked: %s", rule.why)
+	}
+}
+
+// TestTheServiceUnderTestIsRefusedByItsOwnKey: a `network_mode` takes the service off Stutter's network,
+// so the datastore it dials resolves nowhere and classification would refuse it for that symptom. Its
+// own keys are judged first, and the refusal names the key.
+func TestTheServiceUnderTestIsRefusedByItsOwnKey(t *testing.T) {
+	t.Parallel()
+
+	file := filepath.Join(t.TempDir(), "compose.yaml")
+	if err := os.WriteFile(file, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := func(_ context.Context, _ string, _ []string, read compose.ConfigRead) ([]byte, int, error) {
+		if read.Environment {
+			return nil, 0, nil
+		}
+
+		return []byte(`{"name":"shop","services":{"orders":{"image":"orders:1","network_mode":"host",` +
+			`"environment":{"DATABASE_URL":"postgres://u:p@db:5432/shop"}},"db":{"image":"postgres:18"}}}`), 0, nil
+	}
+
+	model, err := compose.Parse(t.Context(), run, compose.Inputs{Service: testService, Files: []string{file}})
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	check := newComposeCheck(composeRun{service: testService}, nil)
+	check.model = model
+
+	err = check.refuseTarget(t.Context())
+	if !errors.Is(err, compose.ErrRefused) || !strings.Contains(err.Error(), "network_mode") {
+		t.Errorf("refuseTarget = %v, want a refusal naming network_mode", err)
 	}
 }
 
